@@ -1,0 +1,126 @@
+name: CI
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build-and-test:
+    name: 构建与测试
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: gptcdk
+          POSTGRES_PASSWORD: gptcdk_test
+          POSTGRES_DB: gptcdk
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U gptcdk -d gptcdk"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      DATABASE_URL: postgresql://gptcdk:gptcdk_test@localhost:5432/gptcdk?schema=public
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: 安装依赖
+        run: npm ci --no-audit --no-fund
+
+      - name: 生成 Prisma Client
+        run: npx prisma generate --schema apps/server/prisma/schema.prisma
+
+      - name: 编译后端
+        run: npm run build --workspace @gptcdk/server
+
+      - name: 格式转换回归测试
+        run: npm run test:convert --workspace @gptcdk/server
+
+      - name: 安全与数据一致性回归测试
+        run: npm run test:security
+
+      - name: Team 规则回归测试
+        run: npm run test:team
+
+      - name: 独立数据库接口联调（模拟外部服务）
+        run: npm run test:smoke:local
+
+      - name: 前端类型检查
+        run: npm run typecheck --workspace @gptcdk/web
+
+      - name: 构建前端
+        run: npm run build --workspace @gptcdk/web
+
+  docker:
+    name: Docker 镜像构建并推送 GHCR
+    runs-on: ubuntu-latest
+    needs: build-and-test
+
+    permissions:
+      contents: read
+      packages: write
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: server
+            dockerfile: docker/Dockerfile.server
+          - name: web
+            dockerfile: docker/Dockerfile.web
+          - name: protocol
+            dockerfile: docker/Dockerfile.protocol
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 设置 Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # PR 来自 fork 时 GITHUB_TOKEN 没有 packages:write，跳过登录，只做构建验证
+      - name: 登录 GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 计算镜像标签
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/biubiubiu125/gptcdk-${{ matrix.name }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=ref,event=branch
+            type=ref,event=tag
+            type=semver,pattern={{version}}
+            type=sha,format=short
+          labels: |
+            org.opencontainers.image.source=https://github.com/biubiubiu125/gptcdk
+
+      - name: 构建 gptcdk-${{ matrix.name }} 镜像
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=${{ matrix.name }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.name }}
