@@ -718,8 +718,8 @@ export class ConvertService {
     return list.length === 1 ? list[0] : list;
   }
 
-  /** 邮箱 TXT 的附加登录信息；原始 notes 独立于邮箱取件凭据保存。 */
-  private readEmailLoginFields(account: NormalizedAccount): { password?: string; twoFactorSecret?: string } {
+  /** ChatGPT 账密；只读原始 notes 的 gpt.password / two_factor.secret，不读邮箱密码。 */
+  readChatGptLogin(account: NormalizedAccount): { password?: string; twoFactorSecret?: string } {
     for (const value of [account.raw?.notes, account.raw?.note]) {
       let notes = value;
       if (typeof notes === 'string') {
@@ -739,7 +739,7 @@ export class ConvertService {
     return {};
   }
 
-  /** 邮箱 TXT：有 ChatGPT 密码或 2FA 时输出六段，否则保留四段。 */
+  /** 邮箱 TXT：有 ChatGPT 密码或 2FA 时输出六段，否则保留四段。更长的库存行在追加前收成四段；token 自身含分隔符时不截断。 */
   toEmailLines(accounts: NormalizedAccount[]): string[] {
     return accounts
       .map((account) => {
@@ -757,8 +757,19 @@ export class ConvertService {
           ].join('----');
         }
 
-        const { password, twoFactorSecret } = this.readEmailLoginFields(account);
+        const { password, twoFactorSecret } = this.readChatGptLogin(account);
         if (password || twoFactorSecret) {
+          const baseParts = line.split('----');
+          const storedToken = mailbox?.refreshToken || '';
+          const segmentToken = baseParts[3] || '';
+          // 第四段已是完整邮箱 token 时，后面不是 token 续段。先收成四段再追加备注，避免拼成八段。
+          if (
+            baseParts.length > 4 &&
+            looksRefreshToken(segmentToken) &&
+            (!storedToken || storedToken === segmentToken)
+          ) {
+            line = baseParts.slice(0, 4).join('----');
+          }
           return [line, password || '', twoFactorSecret || ''].join('----');
         }
         return line;

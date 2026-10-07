@@ -36,6 +36,13 @@ export interface WorkerResponse {
   rateLimited?: boolean;
   willRenew?: boolean | null;
   activeUntil?: string | null;
+  subscriptionRead?: boolean;
+  sessionUpdate?: {
+    accessToken?: string;
+    sessionToken?: string;
+    deviceId?: string;
+    cookies?: Array<{ name?: string; value?: string; domain?: string }>;
+  };
 }
 
 export function workerConfigured(): boolean {

@@ -23,6 +23,8 @@ import { FORMAT_META, isDeliverFormat, type DeliverFormat } from '../common/erro
 import { withReclaimLock } from '../public/reclaim-lock';
 import { serializeStagedCredential, stagedExpiresAt, stagedForAccount } from '../public/staged-credential';
 import { expiresAtFromJwt } from '../common/jwt-expiry';
+import { formatLoginLine } from '../common/login-line';
+import { decryptSecret, teamSecretReady } from '../team/team-crypto';
 import { zipStored } from '../common/zip-store';
 import type { Account } from '@prisma/client';
 
@@ -822,6 +824,14 @@ export class AccountsService {
         })
       : rows;
 
+    if (format === 'login') {
+      const stem = safeFilename(payload?.filename || 'accounts-login', 'accounts-login');
+      return {
+        content: await this.buildLoginExport(fresh),
+        filename: `${stem}.txt`,
+        contentType: 'text/plain; charset=utf-8',
+      };
+    }
     const sessionFiles = new Set(['cockpit', 'ninerouter', 'codex', 'axonhub', 'codex-manager']);
     if (sessionFiles.has(format) && fresh.length > 1) {
       const normalized = fresh.map((row) => this.toNormalizedAccount(row));
@@ -845,6 +855,43 @@ export class AccountsService {
       ...base,
       filename: `${safeFilename(payload?.filename || `accounts-${format}`, `accounts-${format}`)}.${FORMAT_META[format].ext}`,
     };
+  }
+
+  private async buildLoginExport(rows: Array<Account & { mailbox?: any }>): Promise<string> {
+    const teamRows = rows.filter((row) => row.stockKind === 'team' && row.teamStatus !== 'kicked');
+    if (teamRows.length && !teamSecretReady()) {
+      bizError('BAD_INPUT', 'GPTCDK_SECRET 缺失或短于 32 字符，Team 功能已停用');
+    }
+    const secrets = teamRows.length
+      ? await this.prisma.teamSecret.findMany({ where: { accountId: { in: teamRows.map((row) => row.id) } } })
+      : [];
+    const byAccount = new Map(secrets.map((item) => [item.accountId, item]));
+    const lines: string[] = [];
+    for (const row of rows) {
+      if (row.stockKind === 'team') {
+        if (row.teamStatus === 'kicked') continue;
+        const secret = byAccount.get(row.id);
+        if (!secret) continue;
+        let password = '';
+        let totp = '';
+        try {
+          password = decryptSecret(secret.passwordCipher);
+          totp = decryptSecret(secret.totpCipher);
+        } catch (error) {
+          if (error instanceof Error && error.message.includes('GPTCDK_SECRET')) {
+            bizError('BAD_INPUT', 'GPTCDK_SECRET 缺失或短于 32 字符，Team 功能已停用');
+          }
+          bizError('BAD_INPUT', '账密解密失败');
+        }
+        const line = formatLoginLine(row.email || '', password, totp);
+        if (line) lines.push(line);
+        continue;
+      }
+      const login = this.convert.readChatGptLogin(this.toNormalizedAccount(row));
+      const line = formatLoginLine(row.email || '', login.password || '', login.twoFactorSecret);
+      if (line) lines.push(line);
+    }
+    return lines.length ? `${lines.join('\n')}\n` : '';
   }
 
   // -------------------------------------------------------------------------

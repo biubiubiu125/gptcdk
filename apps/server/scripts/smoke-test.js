@@ -224,24 +224,25 @@ async function main() {
   assert(copy.json?.copyCount >= 1, '复制次数已记录', `copyCount=${copy.json?.copyCount}`);
 
   // -------------------------------------------------------------------------
-  console.log('\n[6] 前台兑换（三种交付格式）');
+  console.log('\n[6] 前台兑换');
   let expectedEmailParts;
-  for (const format of ['sub2api', 'cpa', 'email']) {
+  let mailboxRefresh = '';
+  for (const format of ['sub2api', 'cpa', 'login']) {
     const redeem = await call('POST', '/public/redeem', { cards: [first.cardKey], format, limit: 1 });
     const result = redeem.json?.results?.[0];
     assert(result?.ok === true, `兑换成功（${format}）`, result?.message);
     assert(Boolean(result?.content), `返回交付内容（${format}）`, `${result?.filename} ${result?.content?.length} 字节`);
     assert(
-      result?.filename === (format === 'email' ? `${first.cardKey}.txt` : `${first.cardKey}.${format}.json`),
+      result?.filename === `${first.cardKey}.${format}.${format === 'login' ? 'txt' : 'json'}`,
       `交付文件名带格式（${format}）`,
       result?.filename,
     );
 
-    if (format === 'email') {
-      const lines = String(result.content).trim().split('\n');
-      const parts = lines[0].split('----');
-      assert(parts.length === 6, '带账密 / 2FA 的邮箱 TXT 为六段');
-      assert(JSON.stringify(parts) === JSON.stringify(expectedEmailParts), '六段字段顺序正确且账密 / 2FA 内容完整');
+    if (format === 'login') {
+      const parts = String(result.content).trim().split('----');
+      assert(parts.length === 2 || parts.length === 3, '账密是两段或三段', String(result.content));
+      assert(!String(result.content).includes(mailboxRefresh), '账密不含邮箱 refresh token');
+      assert(!String(result.content).includes('access_token'), '账密不是 OpenAI JSON');
     } else {
       const parsed = JSON.parse(result.content);
       if (format === 'sub2api') {
@@ -250,11 +251,12 @@ async function main() {
         assert(Boolean(account.credentials?.access_token), 'sub2api credentials.access_token 存在');
         assert(Boolean(account.notes), 'sub2api notes 保留了邮箱取件凭据');
         const notes = JSON.parse(account.notes);
+        mailboxRefresh = notes.mailbox?.refresh_token || '';
         expectedEmailParts = [
           notes.mailbox?.bind_email || notes.mailbox?.primary_email,
           notes.mailbox?.password || '',
           notes.mailbox?.client_id || '',
-          notes.mailbox?.refresh_token || '',
+          mailboxRefresh,
           notes.gpt?.password || '',
           notes.two_factor?.secret || '',
         ];
@@ -324,9 +326,10 @@ async function main() {
 
   // -------------------------------------------------------------------------
   console.log('\n[7] 前台取件：解析');
-  const redeemEmail = await call('POST', '/public/redeem', { cards: [first.cardKey], format: 'email' });
-  const emailLine = String(redeemEmail.json.results[0].content).trim().split('\n')[0];
-  assert(emailLine.split('----').length >= 4, '兑换得到的邮箱凭据行可用');
+  const publicEmail = await call('POST', '/public/redeem', { cards: [first.cardKey], format: 'email' }, { allowFailure: true });
+  assert(publicEmail.status === 400 && publicEmail.text.includes('不支持邮箱 TXT'), '前台邮箱 TXT 被拒绝', publicEmail.text.slice(0, 160));
+  const emailLine = expectedEmailParts.join('----');
+  assert(emailLine.split('----').length === 6, '后台对照用的邮箱凭据为六段');
 
   const resolved = await call('POST', '/public/pickup/resolve', {
     input: `${emailLine}\nnobody@example.com\nnot-a-key`,
@@ -431,7 +434,7 @@ async function main() {
 
   // -------------------------------------------------------------------------
   console.log('\n[10] 后台导出');
-  for (const format of ['sub2api', 'cpa', 'cockpit', 'ninerouter', 'codex', 'axonhub', 'codex-manager', 'email']) {
+  for (const format of ['sub2api', 'cpa', 'cockpit', 'ninerouter', 'codex', 'axonhub', 'codex-manager', 'email', 'login']) {
     const exported = await call('POST', '/admin/accounts/export', {
       format,
       filter: { credits: [CREDITS] },
@@ -442,7 +445,10 @@ async function main() {
     const disposition = String(exported.headers.get('content-disposition') || '');
     const contentType = String(exported.headers.get('content-type') || '');
     if (format === 'email') {
-      assert(exported.text.trim().split('\n').includes(emailLine), '后台邮箱 TXT 与兑换交付的六段内容一致');
+      assert(exported.text.trim().split('\n').includes(emailLine), '后台邮箱 TXT 仍是六段');
+    } else if (format === 'login') {
+      assert(exported.text.includes('----') && !exported.text.trim().startsWith('{'), '后台账密导出是分段文本');
+      assert(!exported.text.includes(mailboxRefresh), '后台账密导出不含邮箱 refresh token');
     } else if (contentType.includes('zip') || exported.text.startsWith('PK')) {
       assert(exported.text.startsWith('PK'), `导出 ${format} 是 zip`);
       assert(disposition.includes('.zip'), `导出 ${format} 文件名是 zip`, disposition);

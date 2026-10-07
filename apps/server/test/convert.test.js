@@ -9,6 +9,7 @@ const path = require('node:path');
 const fs = require('node:fs');
 
 const { ConvertService } = require(path.join(__dirname, '..', 'dist', 'convert', 'convert.service.js'));
+const { formatLoginLine } = require(path.join(__dirname, '..', 'dist', 'common', 'login-line.js'));
 const { readSub2ApiPassthrough } = require(path.join(
   __dirname,
   '..',
@@ -265,6 +266,27 @@ test('邮箱 TXT 交付：合并四段和六段时保持顺序及邮箱 token �
   const password = JSON.parse(withLogin.raw.notes).gpt.password;
   assert.equal(service.buildDeliverContent('email', [withoutLogin, withLogin]), `${line}\n${line}----${password}----\n`);
   assert.equal(withLogin.mailbox.refreshToken, token);
+});
+
+test('邮箱 TXT 交付：库存六段行再追加备注账密时仍只出六段', () => {
+  const token = 'M'.repeat(80);
+  const clientId = '00000000-0000-0000-0000-000000000001';
+  const account = {
+    email: 'a@b.com',
+    mailbox: {
+      email: 'a@b.com',
+      password: 'mb',
+      clientId,
+      refreshToken: token,
+      line: `a@b.com----mb----${clientId}----${token}----old-pass----OLDOTP`,
+    },
+    raw: { notes: { gpt: { password: 'new-pass' }, two_factor: { secret: 'NEWTOTP' } } },
+  };
+  const line = service.toEmailLines([account])[0];
+  assert.equal(line, `a@b.com----mb----${clientId}----${token}----new-pass----NEWTOTP`);
+  assert.equal(line.split('----').length, 6);
+  assert.equal(line.includes('old-pass'), false);
+  assert.equal(line.includes('OLDOTP'), false);
 });
 
 test('多账号：CPA 输出数组，sub2api 输出整包', () => {
@@ -628,4 +650,16 @@ test('新增五种交付格式走 convertSession，旧三种仍走原实现', ()
   const oldCpa = JSON.parse(service.buildDeliverContent('cpa', [account]));
   assert.equal(oldCpa.type, 'codex');
   assert.equal(service.buildDeliverContent('email', [account]), '\n');
+});
+
+test('账密行按实际内容输出两段或三段，空密码不出行', () => {
+  assert.equal(formatLoginLine('user@example.com', 'pass with  ----  tail ', 'JBSWY3DPEHPK3PXP'), 'user@example.com----pass with  ----  tail ----JBSWY3DPEHPK3PXP');
+  assert.equal(formatLoginLine('user@example.com', 'only-pass', '   '), 'user@example.com----only-pass');
+  assert.equal(formatLoginLine('user@example.com', '   ', 'JBSWY3DPEHPK3PXP'), null);
+  assert.equal(formatLoginLine('', 'only-pass', ''), null);
+  const login = service.readChatGptLogin({
+    email: 'mailbox@example.com',
+    raw: { notes: { gpt: { password: 'chatgpt-pass' }, two_factor: { secret: 'SECRET' } } },
+  });
+  assert.deepEqual(login, { password: 'chatgpt-pass', twoFactorSecret: 'SECRET' });
 });

@@ -9,8 +9,10 @@ import {
   getTeamStatus,
   importTeamLines,
   kickAllTeam,
+  kickSelectedTeam,
   previewKickAllTeam,
   kickTeamMember,
+  listRemoteMembers,
   listTeamJobs,
   listTeamMembers,
   listTeamWaiting,
@@ -18,10 +20,12 @@ import {
   patchChildProxy,
   previewTeamSession,
   probeTeam,
+  refreshTeam,
   revealChildSecret,
   revealTeamSession,
   revokeTeamInvites,
   updateTeamWorkspace,
+  type RemoteMemberRow,
   type TeamMemberRow,
   type TeamWorkspaceRow,
 } from '../../api/client';
@@ -40,11 +44,48 @@ function detachedNames(saved: unknown): string[] {
   return Array.isArray(names) ? names.map((item) => String(item || '')).filter(Boolean) : [];
 }
 
+function expiryText(value?: string | null, willRenew?: boolean | null) {
+  const text = String(value || '').trim();
+  if (!text) return '未知';
+  const hasZone = /(?:Z|[+-]\d{2}:?\d{2})$/i.test(text);
+  let shown = text;
+  if (hasZone) {
+    const date = new Date(text);
+    if (Number.isNaN(date.getTime())) return '未知';
+    const parts = new Intl.DateTimeFormat('en-CA', {
+      timeZone: 'Asia/Shanghai',
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+      hourCycle: 'h23',
+    }).formatToParts(date);
+    const pick = (type: string) => parts.find((item) => item.type === type)?.value || '';
+    shown = `${pick('year')}-${pick('month')}-${pick('day')} ${pick('hour')}:${pick('minute')}:${pick('second')}`;
+  } else {
+    shown = `${text}（时区不明）`;
+  }
+  return willRenew === false ? `${shown} 不续费` : shown;
+}
+
+function jobMessage(result: unknown): string {
+  if (!result || typeof result !== 'object' || !('message' in result)) return '';
+  return String((result as { message?: string }).message || '');
+}
+
 function resetText(value?: number | null) {
   if (value == null) return '—';
   const ms = value > 10_000_000_000 ? value : value * 1000;
   const date = new Date(ms);
   return Number.isNaN(date.getTime()) ? String(value) : date.toLocaleString();
+}
+
+function keptSession(error: unknown): string {
+  if (!(error instanceof ApiError) || !error.details || typeof error.details !== 'object') return '';
+  const session = (error.details as { session?: unknown }).session;
+  return typeof session === 'string' && session.trim() ? session : '';
 }
 
 function workspaceChoices(error: unknown): Array<{ id: string; name: string }> {
@@ -71,6 +112,8 @@ export default function TeamPage() {
   const [notice, setNotice] = useState('');
   const [workspaces, setWorkspaces] = useState<TeamWorkspaceRow[]>([]);
   const [members, setMembers] = useState<TeamMemberRow[]>([]);
+  const [remoteMembers, setRemoteMembers] = useState<RemoteMemberRow[]>([]);
+  const [picked, setPicked] = useState<Record<number, string[]>>({});
   const [waiting, setWaiting] = useState<Array<{ id: number; cardKey: string | null; email: string | null; teamStatus: string | null }>>([]);
   const [jobs, setJobs] = useState<Array<{ id: number; workspaceRowId: number; kind: string; status: string; message: string; createdAt: string }>>([]);
   const [sessionOpen, setSessionOpen] = useState(false);
@@ -84,10 +127,11 @@ export default function TeamPage() {
   const [busy, setBusy] = useState(false);
 
   const load = useCallback(async () => {
-    const [status, mothers, people, queue, history] = await Promise.all([
+    const [status, mothers, people, remote, queue, history] = await Promise.all([
       getTeamStatus(),
       listTeamWorkspaces(),
       listTeamMembers(),
+      listRemoteMembers(),
       listTeamWaiting(),
       listTeamJobs(),
     ]);
@@ -98,6 +142,7 @@ export default function TeamPage() {
     setNotice(missing.join('；'));
     setWorkspaces(mothers.items || []);
     setMembers(people.items || []);
+    setRemoteMembers(remote.items || []);
     setWaiting(queue.items || []);
     setJobs(history.items || []);
   }, []);
@@ -109,11 +154,12 @@ export default function TeamPage() {
   const run = async (work: () => Promise<unknown>, done: string) => {
     setBusy(true);
     try {
-      await work();
-      void message.success(done);
+      const result = await work();
+      void message.success(jobMessage(result) || done);
       await load();
     } catch (error) {
       void message.error(errorMessage(error));
+      await load().catch(() => undefined);
     } finally {
       setBusy(false);
     }
@@ -200,12 +246,15 @@ export default function TeamPage() {
       void message.success('母号已保存');
       await load();
     } catch (error) {
+      const kept = keptSession(error);
+      if (kept) setSessionText(kept);
       const next = workspaceChoices(error);
       if (next.length) {
         setChoices(next);
-        void message.warning('这份 session 有多个 Team 空间，请点选一个');
+        void message.warning(kept ? '这次检查换过 session，已放回输入框。请点选空间后再保存' : '这份 session 有多个 Team 空间，请点选一个');
         return;
       }
+      if (kept) void message.warning('这次检查换过 session，已放回输入框。请再保存一次，不要重新登录');
       void message.error(errorMessage(error));
     } finally {
       setBusy(false);
@@ -233,8 +282,11 @@ export default function TeamPage() {
                     { title: '邮箱', dataIndex: 'email' },
                     { title: '空间', dataIndex: 'displayName' },
                     { title: '空位', dataIndex: 'emptySeats', render: (value) => value ?? '未知' },
-                    { title: '状态', render: (_, row) => row.inviteHold === 'seat_full' ? '席位已满已停止' : row.inviteHold === 'stopped' ? '空间不可用已停止' : row.sessionStatus },
-                    { title: '续期', render: (_, row) => row.canAutoRenew === false ? '不能自动续期' : '可续期' },
+                    { title: '状态', render: (_, row) => {
+                      const hold = row.inviteHold === 'seat_full' ? '席位已满已停止' : row.inviteHold === 'stopped' ? '空间不可用已停止' : row.sessionStatus;
+                      return row.canAutoRenew === false ? `${hold}（不能自动续期）` : hold;
+                    } },
+                    { title: '到期', render: (_, row) => expiryText(row.activeUntil, row.willRenew) },
                     { title: '最近成功', dataIndex: 'lastSuccessAt', render: (value) => value || '—' },
                     { title: '最近错误', dataIndex: 'lastError', render: (value) => value || '—' },
                     {
@@ -246,6 +298,7 @@ export default function TeamPage() {
                           }).catch((error) => message.error(errorMessage(error)))}>查看</Button>
                           <Button size="small" onClick={() => openMother(row.id, row.workspaceId || '')}>更换</Button>
                           <Button size="small" loading={busy} onClick={() => void run(() => assignTeam(row.id), '分配已执行')}>分配</Button>
+                          <Button size="small" loading={busy} onClick={() => void run(() => refreshTeam(row.id), '空间已刷新')}>刷新空间</Button>
                           <Button size="small" loading={busy} onClick={() => void run(() => probeTeam(row.id), '探测已完成')}>探测</Button>
                           <Button size="small" loading={busy} onClick={() => void run(() => revokeTeamInvites(row.id), '撤回已执行')}>撤回邀请</Button>
                           <Button size="small" danger disabled={!row.snapshotComplete} title={row.snapshotComplete ? undefined : '成员快照不完整'} onClick={() => {
@@ -309,12 +362,92 @@ export default function TeamPage() {
             ),
           },
           {
+            key: 'roster',
+            label: '空间成员',
+            children: remoteMembers.length === 0 ? (
+              <Card size="small">还没有空间成员。先在母号上点「刷新空间」。</Card>
+            ) : (
+              <Space direction="vertical" style={{ width: '100%' }}>
+                {[...new Set(remoteMembers.map((item) => item.workspaceRowId))].map((workspaceId) => {
+                  const rows = remoteMembers.filter((item) => item.workspaceRowId === workspaceId);
+                  const mother = rows[0];
+                  const selected = picked[workspaceId] || [];
+                  return (
+                    <Card
+                      key={workspaceId}
+                      size="small"
+                      title={`${mother?.workspaceName || '空间'} / ${mother?.motherEmail || ''}`}
+                      extra={
+                        <Button
+                          size="small"
+                          danger
+                          disabled={!mother?.snapshotComplete || selected.length === 0}
+                          title={mother?.snapshotComplete ? undefined : '成员快照不完整'}
+                          onClick={() => {
+                            let typed = '';
+                            modal.confirm({
+                              title: '踢出选中的普通成员',
+                              content: (
+                                <div>
+                                  <Paragraph>只踢勾选的普通成员，不会自动分配空位。所有者不会被踢。</Paragraph>
+                                  <Input placeholder="请输入踢出选中" onChange={(event) => { typed = event.target.value; }} />
+                                </div>
+                              ),
+                              okText: '踢出选中',
+                              onOk: () => {
+                                if (typed.trim() !== '踢出选中') {
+                                  message.error('请输入「踢出选中」');
+                                  return Promise.reject(new Error('confirm'));
+                                }
+                                return kickSelectedTeam(workspaceId, selected).then((job) => {
+                                  const warning = rateLimitText(job);
+                                  if (warning) void message.warning(warning);
+                                  else if (jobMessage(job)) void message.success(jobMessage(job));
+                                  setPicked((current) => ({ ...current, [workspaceId]: [] }));
+                                  return load();
+                                }).catch((error) => {
+                                  void message.error(errorMessage(error));
+                                  return load();
+                                });
+                              },
+                            });
+                          }}
+                        >踢出选中</Button>
+                      }
+                    >
+                      {!mother?.snapshotComplete ? <Paragraph type="warning">名单不完整，下面仍是上次完整刷新的成员，现在不能踢人。</Paragraph> : null}
+                      <Table
+                        rowKey="key"
+                        dataSource={rows}
+                        pagination={false}
+                        rowSelection={{
+                          selectedRowKeys: rows.filter((row) => selected.includes(row.id)).map((row) => row.key),
+                          getCheckboxProps: (row) => ({ disabled: row.role !== 'standard-user' || !mother?.snapshotComplete }),
+                          onChange: (keys) => {
+                            const ids = rows.filter((row) => keys.map(String).includes(row.key)).map((row) => row.id);
+                            setPicked((current) => ({ ...current, [workspaceId]: ids }));
+                          },
+                        }}
+                        columns={[
+                          { title: '邮箱', dataIndex: 'email', render: (value: string) => value || '—' },
+                          { title: '角色', dataIndex: 'role', render: (value: string) => value || '—' },
+                          { title: '成员编号', dataIndex: 'id' },
+                          { title: '卡密', dataIndex: 'cardKey', render: (value: string) => value || '—' },
+                        ]}
+                      />
+                    </Card>
+                  );
+                })}
+              </Space>
+            ),
+          },
+          {
             key: 'waiting',
             label: '待分配',
             children: (
               <Space direction="vertical" style={{ width: '100%' }}>
                 <Card size="small" title="导入免费子号">
-                  <TextArea rows={6} value={importText} onChange={(event) => setImportText(event.target.value)} placeholder="邮箱----ChatGPT密码----2FA" />
+                  <TextArea rows={6} value={importText} onChange={(event) => setImportText(event.target.value)} placeholder="邮箱----ChatGPT密码----2FA密钥" />
                   <Button style={{ marginTop: 12 }} type="primary" loading={busy} onClick={() => void run(async () => {
                     const result = await importTeamLines(importText);
                     setImportText('');

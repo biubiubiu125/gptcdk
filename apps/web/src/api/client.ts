@@ -631,8 +631,34 @@ export function previewTeamSession(id: number): Promise<{ id: number; email: str
   return request(`/admin/team/workspaces/${id}/session-preview`);
 }
 
+export interface RemoteMemberRow {
+  key: string;
+  workspaceRowId: number;
+  workspaceName: string;
+  motherEmail: string;
+  snapshotComplete: boolean;
+  id: string;
+  email: string;
+  role: string;
+  cardKey: string;
+  redeemStatus: string;
+  local: boolean;
+}
+
 export function listTeamMembers(): Promise<{ items: TeamMemberRow[] }> {
   return request('/admin/team/members');
+}
+
+export function listRemoteMembers(): Promise<{ items: RemoteMemberRow[] }> {
+  return request('/admin/team/remote-members');
+}
+
+export function refreshTeam(workspaceId: number): Promise<{ ok?: boolean; message?: string }> {
+  return request(`/admin/team/workspaces/${workspaceId}/refresh`, { method: 'POST' });
+}
+
+export function kickSelectedTeam(workspaceId: number, userIds: string[]): Promise<{ ok?: boolean; message?: string }> {
+  return request(`/admin/team/workspaces/${workspaceId}/kick-selected`, { method: 'POST', body: { confirm: '踢出选中', userIds } });
 }
 
 export function listTeamWaiting(): Promise<{ items: Array<{ id: number; cardKey: string | null; email: string | null; teamStatus: string | null }> }> {

@@ -60,6 +60,7 @@ export class MailboxService {
   /**
    * 把各种形态的凭据行/对象解析成 MailboxCredential。
    * 支持 "邮箱----密码----clientid----refresh_token" 与对象形式。
+   * 对象上的 line 只补缺失字段，交出去的 line 始终是四段，不回放第五段以后的内容。
    */
   parseCredential(
     input: string | Partial<MailboxCredential> | undefined,
@@ -74,21 +75,38 @@ export class MailboxService {
     if (typeof input === 'object') {
       const email = firstNonEmpty(input.email, fallbackEmail);
       if (!email || !looksEmail(email)) return null;
+      let password = input.password || undefined;
+      let clientId = input.clientId || undefined;
+      let refreshToken = input.refreshToken || undefined;
+      // 库存里的旧 line 可能是六段邮箱 TXT。字段优先，缺的才从行里补，不能把原行原样交出去。
+      if (
+        (!password || !clientId || !refreshToken) &&
+        typeof input.line === 'string' &&
+        input.line.includes('----')
+      ) {
+        const parsed = this.parseCredential(input.line, email);
+        if (parsed) {
+          password = password || parsed.password;
+          clientId = clientId || parsed.clientId;
+          refreshToken = refreshToken || parsed.refreshToken;
+        }
+      }
       const credential: MailboxCredential = {
         email: email.toLowerCase(),
         provider: input.provider || 'outlook',
         authType: input.authType || 'oauth2',
-        password: input.password || undefined,
-        clientId: input.clientId || undefined,
-        refreshToken: input.refreshToken || undefined,
+        password,
+        clientId,
+        refreshToken,
         imapHost: input.imapHost || 'outlook.office365.com',
         imapPort: input.imapPort || 993,
       };
-      credential.line =
-        input.line ||
-        [credential.email, credential.password || '', credential.clientId || '', credential.refreshToken || ''].join(
-          '----',
-        );
+      credential.line = [
+        credential.email,
+        credential.password || '',
+        credential.clientId || '',
+        credential.refreshToken || '',
+      ].join('----');
       return credential;
     }
 

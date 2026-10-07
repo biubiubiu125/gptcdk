@@ -1,6 +1,6 @@
 {
   "name": "@gptcdk/web",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "private": true,
   "type": "module",
   "description": "卡密兑换系统前端（前台 + 后台）",

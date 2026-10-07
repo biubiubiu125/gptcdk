@@ -1,4 +1,4 @@
-import { Link, Navigate, Route, Routes } from 'react-router-dom';
+import { Link, Navigate, Route, Routes, useLocation } from 'react-router-dom';
 import { Button, Result } from 'antd';
 
 import SiteFooter from './components/SiteFooter';
@@ -15,6 +15,12 @@ import LoginPage from './pages/admin/LoginPage';
 import SettingsPage from './pages/admin/SettingsPage';
 import TeamPage from './pages/admin/TeamPage';
 import TiersPage from './pages/admin/TiersPage';
+
+function LegacyAdminRedirect() {
+  const location = useLocation();
+  const next = `${location.pathname.replace(/^\/admin(?=\/|$)/, '/biubiubiu')}${location.search}${location.hash}`;
+  return <Navigate to={next} replace />;
+}
 
 function NotFoundPage() {
   return (
@@ -51,9 +57,9 @@ export default function App() {
         <Route path="/pickup" element={<PickupPage />} />
       </Route>
 
-      <Route path="/admin/login" element={<LoginPage />} />
-      <Route path="/admin" element={<AdminLayout />}>
-        <Route index element={<Navigate to="/admin/accounts" replace />} />
+      <Route path="/biubiubiu/login" element={<LoginPage />} />
+      <Route path="/biubiubiu" element={<AdminLayout />}>
+        <Route index element={<Navigate to="/biubiubiu/accounts" replace />} />
         <Route path="dashboard" element={<DashboardPage />} />
         <Route path="accounts" element={<AccountsPage />} />
         <Route path="team" element={<TeamPage />} />
@@ -61,6 +67,9 @@ export default function App() {
         <Route path="tiers" element={<TiersPage />} />
         <Route path="settings" element={<SettingsPage />} />
       </Route>
+      <Route path="/admin" element={<LegacyAdminRedirect />} />
+      <Route path="/admin/login" element={<LegacyAdminRedirect />} />
+      <Route path="/admin/*" element={<LegacyAdminRedirect />} />
 
       <Route path="*" element={<NotFoundPage />} />
     </Routes>

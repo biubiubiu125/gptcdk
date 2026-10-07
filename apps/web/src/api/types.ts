@@ -38,8 +38,14 @@ export const DELIVER_FORMAT_OPTIONS: Array<{
   { value: 'axonhub', label: 'AxonHub', ext: 'json', bundle: 'zip', hint: 'AxonHub auth.json' },
   { value: 'codex-manager', label: 'Codex-Manager', ext: 'json', bundle: 'zip', hint: 'Codex-Manager JSON' },
   { value: 'email', label: '邮箱 TXT', ext: 'txt', bundle: 'document', hint: '邮箱凭据文本' },
-  { value: 'login', label: '账密', ext: 'txt', bundle: 'document', hint: 'Team 子号邮箱、密码和 2FA' },
+  { value: 'login', label: '账密', ext: 'txt', bundle: 'document', hint: '有 2FA 时为账号----密码----2FA，否则为账号----密码' },
 ];
+
+/** 前台兑换和找回不提供邮箱 TXT。后台导出仍保留。 */
+export function publicDeliverFormats<T extends { value: string }>(formats?: T[]): T[] {
+  const source = formats?.length ? formats : (DELIVER_FORMAT_OPTIONS as unknown as T[]);
+  return source.filter((item) => item.value !== 'email');
+}
 
 export function selectDeliverFormat(
   formats: Array<{ value: string }> | undefined,

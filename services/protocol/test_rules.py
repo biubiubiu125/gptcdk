@@ -57,7 +57,7 @@ class TeamFlowTest(unittest.TestCase):
         people = worker.member_page(data)
         self.assertEqual(people[0]["id"], "user-1")
 
-    def test_missing_total_is_complete_when_pages_end(self):
+    def test_missing_total_is_not_complete(self):
         urls = []
 
         def fake_retry(http, method, url, headers=None, payload=None, form=None):
@@ -78,8 +78,32 @@ class TeamFlowTest(unittest.TestCase):
             result = worker.snapshot(object(), "token", "ws-1")
         finally:
             worker.request_with_retry = original
-        self.assertTrue(result["complete"])
+        self.assertFalse(result["complete"])
         self.assertTrue(any("/users/seat_type_counts" in url for url in urls))
+
+    def test_numeric_string_total_can_complete_but_junk_cannot(self):
+        def run(total):
+            def fake_retry(http, method, url, headers=None, payload=None, form=None):
+                if "/users?" in url:
+                    return FakeResponse(200, {"items": [{"id": "u1", "email": "a@b.c", "role": "account-owner"}], "total": total})
+                if "/invites" in url:
+                    return FakeResponse(200, {"items": []})
+                if "seat_type_counts" in url:
+                    return FakeResponse(200, {})
+                if "/subscriptions" in url:
+                    return FakeResponse(200, {"seats_entitled": 5})
+                raise AssertionError(url)
+
+            original = worker.request_with_retry
+            worker.request_with_retry = fake_retry
+            try:
+                return worker.snapshot(object(), "token", "ws-1")
+            finally:
+                worker.request_with_retry = original
+
+        self.assertTrue(run("1")["complete"])
+        self.assertFalse(run("many")["complete"])
+        self.assertFalse(run(True)["complete"])
 
     def test_total_mismatch_is_not_complete(self):
         def fake_retry(http, method, url, headers=None, payload=None, form=None):
@@ -142,6 +166,7 @@ class TeamFlowTest(unittest.TestCase):
             worker.request_with_retry = original
         self.assertTrue(result["complete"])
         self.assertIsNone(result["seatsEntitled"])
+        self.assertFalse(result["subscriptionRead"])
         self.assertTrue(result["invitesTruncated"])
 
     def test_invites_are_paged(self):
@@ -1122,6 +1147,128 @@ class TeamFlowTest(unittest.TestCase):
         self.assertIn("/internal/team/usage", log)
         self.assertNotIn("secret-body-token", log)
 
+    def test_active_until_keeps_seconds_and_ambiguous_text(self):
+        self.assertEqual(worker.normalize_active_until("2026-10-08T11:12:01Z"), "2026-10-08T11:12:01Z")
+        self.assertEqual(worker.normalize_active_until("2026-10-08T11:12:01.900Z"), "2026-10-08T11:12:01Z")
+        self.assertEqual(worker.normalize_active_until(1760000000), "2025-10-09T08:53:20Z")
+        self.assertEqual(worker.normalize_active_until(1760000000000), "2025-10-09T08:53:20Z")
+        self.assertEqual(worker.normalize_active_until("2026-10-08 11:12:01"), "2026-10-08 11:12:01")
+        self.assertIsNone(worker.normalize_active_until(None))
+
+    def test_cookie_replay_json_401_is_session_expired_not_egress(self):
+        response = FakeResponse(401, {"error": "unauthorized"})
+        response.headers["set-cookie"] = "__Secure-next-auth.session-token=from-401; Path=/; HttpOnly"
+        http = SimpleNamespace(oai_device_id="dev", headers={}, cookies=SimpleNamespace(set=lambda *args, **kwargs: None))
+        original = worker.request_with_retry
+        worker.request_with_retry = lambda *args, **kwargs: response
+        try:
+            with self.assertRaises(TeamCallError) as caught:
+                worker.session_payload(http, "", "ws")
+            self.assertEqual(caught.exception.code, "SESSION_EXPIRED")
+            update = worker.session_update_from(http)
+            self.assertEqual(update.get("sessionToken"), "from-401")
+        finally:
+            worker.request_with_retry = original
+
+    def test_empty_401_cookie_is_not_a_rotation(self):
+        response = FakeResponse(401, {"error": "unauthorized"})
+        response.headers["set-cookie"] = "__Secure-next-auth.session-token=; Max-Age=0; Path=/"
+        http = SimpleNamespace(oai_device_id="dev", headers={}, cookies=SimpleNamespace(set=lambda *args, **kwargs: None))
+        original = worker.request_with_retry
+        worker.request_with_retry = lambda *args, **kwargs: response
+        try:
+            with self.assertRaises(TeamCallError):
+                worker.session_payload(http, "", "ws")
+            update = worker.session_update_from(http) or {}
+            self.assertNotIn("sessionToken", update)
+            self.assertFalse(update.get("cookies"))
+        finally:
+            worker.request_with_retry = original
+
+    def test_later_non_session_cookie_keeps_earlier_session_cookie(self):
+        http = SimpleNamespace(oai_device_id="dev-1", headers={}, cookies=SimpleNamespace(set=lambda *args, **kwargs: None))
+        first = FakeResponse(200, {"accessToken": "personal-at", "sessionToken": "rotated-session"})
+        first.headers["set-cookie"] = "__Secure-next-auth.session-token=rotated-session; Path=/; HttpOnly"
+        worker.remember_refresh(http, {"accessToken": "personal-at", "sessionToken": "rotated-session"}, first)
+        second = FakeResponse(200, {"accessToken": "workspace-at"})
+        second.headers["set-cookie"] = "__cf_bm=bm-1; Path=/; HttpOnly"
+        worker.remember_refresh(http, {"accessToken": "workspace-at"}, second, keep_access=False)
+        update = worker.session_update_from(http)
+        names = {item["name"]: item["value"] for item in update.get("cookies") or []}
+        self.assertEqual(names.get("__Secure-next-auth.session-token"), "rotated-session")
+        self.assertEqual(names.get("__cf_bm"), "bm-1")
+        self.assertEqual(update.get("sessionToken"), "rotated-session")
+        self.assertEqual(update.get("accessToken"), "personal-at")
+
+    def test_replay_replaces_stale_session_cookie_with_session_token(self):
+        seen = {}
+        http = SimpleNamespace(cookies=SimpleNamespace(set=lambda name, value, domain=None: seen.__setitem__(name, value)))
+        worker.attach_living_session(http, {
+            "sessionToken": "newer-session",
+            "cookies": [{"name": "__Secure-next-auth.session-token", "value": "stale-session", "domain": ".chatgpt.com"}],
+        })
+        self.assertEqual(seen.get("__Secure-next-auth.session-token"), "newer-session")
+
+    def test_exchange_workspace_token_does_not_replace_personal_access(self):
+        http = SimpleNamespace(headers={}, oai_device_id="dev-1", cookies=SimpleNamespace(set=lambda *args, **kwargs: None))
+
+        def fake_retry(http, method, url, headers=None, payload=None, form=None):
+            if url.endswith("/api/auth/session") and "exchange_workspace_token" not in url:
+                return FakeResponse(200, {"accessToken": "personal-at", "sessionToken": "same-session"})
+            if "exchange_workspace_token" in url:
+                return FakeResponse(200, {"accessToken": "workspace-at", "sessionToken": "same-session"})
+            if "/users?" in url:
+                return FakeResponse(401, {"error": "unauthorized"})
+            raise AssertionError(url)
+
+        originals = (worker.open_session, worker.precheck, worker.request_with_retry)
+        worker.open_session = lambda proxy: http
+        worker.precheck = lambda proxy: None
+        worker.request_with_retry = fake_retry
+        try:
+            with self.assertRaises(TeamCallError) as caught:
+                worker.team_snapshot({
+                    "session": {"accessToken": "old-at", "sessionToken": "same-session"},
+                    "workspaceId": "ws-1",
+                    "proxy": "socks5://127.0.0.1:1080",
+                })
+        finally:
+            worker.open_session, worker.precheck, worker.request_with_retry = originals
+        self.assertEqual(caught.exception.code, "SESSION_EXPIRED")
+        update = worker.session_update_from(http) or {}
+        self.assertEqual(update.get("accessToken"), "personal-at")
+        self.assertNotEqual(update.get("accessToken"), "workspace-at")
+        self.assertEqual(update.get("sessionToken"), "same-session")
+
+    def test_cookie_replay_html_401_stays_egress(self):
+        original = worker.request_with_retry
+        worker.request_with_retry = lambda *args, **kwargs: FakeResponse(401, "<html>blocked</html>")
+        try:
+            with self.assertRaises(TeamCallError) as caught:
+                worker.session_payload(SimpleNamespace(oai_device_id="dev", headers={}), "", "ws")
+            self.assertEqual(caught.exception.code, "EGRESS_BLOCKED")
+        finally:
+            worker.request_with_retry = original
+
+    def test_same_device_id_is_reused(self):
+        http = SimpleNamespace(oai_device_id="old", headers={})
+        worker.bind_device(http, {"deviceId": "device-1"}, {})
+        first = worker.browser_headers("token", "ws", "/api/auth/session", "https://chatgpt.com/", http)
+        second = worker.browser_headers("token", "ws", "/backend-api/me", "https://chatgpt.com/", http)
+        self.assertEqual(first["oai-device-id"], "device-1")
+        self.assertEqual(second["oai-device-id"], "device-1")
+
+    def test_session_replay_keeps_rotated_cookie(self):
+        response = FakeResponse(200, {"accessToken": "fresh-at"})
+        response.headers["set-cookie"] = "__Secure-next-auth.session-token=rotated-session; Path=/; HttpOnly"
+        http = SimpleNamespace(oai_device_id="dev-1", headers={}, cookies=SimpleNamespace(set=lambda *args, **kwargs: None))
+        worker.remember_refresh(http, response.json(), response)
+        update = worker.session_update_from(http)
+        self.assertEqual(update["accessToken"], "fresh-at")
+        self.assertEqual(update["sessionToken"], "rotated-session")
+        self.assertEqual(update["deviceId"], "dev-1")
+        self.assertTrue(any(item["name"] == "__Secure-next-auth.session-token" and item["value"] == "rotated-session" for item in update["cookies"]))
+
 
 def stub_protocol_imports():
     import sys
@@ -1165,6 +1312,110 @@ def jwt_with_account(account_id, user_id, plan):
     }
     raw = base64.urlsafe_b64encode(json.dumps(payload).encode()).decode().rstrip("=")
     return f"h.{raw}.s"
+
+
+class WritebackFixTest(unittest.TestCase):
+    def test_post_returns_cookie_rotated_by_bound_mother(self):
+        import io
+
+        original_route = worker.ROUTES["/internal/team/snapshot"]
+        original_token = worker.TOKEN
+        worker.TOKEN = "team-token"
+        worker._bound.http = None
+
+        def route(_body):
+            http = SimpleNamespace(
+                oai_device_id="",
+                headers={},
+                cookies=SimpleNamespace(set=lambda *args, **kwargs: None),
+            )
+            worker.bind_device(http, {"deviceId": "device-kept"}, {})
+            response = FakeResponse(200, {"accessToken": "fresh-at"})
+            response.headers["set-cookie"] = "__Secure-next-auth.session-token=rotated-session; Path=/; HttpOnly"
+            worker.remember_refresh(http, response.json(), response)
+            return 200, {"ok": True, "complete": True, "members": []}
+
+        worker.ROUTES["/internal/team/snapshot"] = route
+        sent = {}
+        handler = worker.Handler.__new__(worker.Handler)
+        handler.path = "/internal/team/snapshot"
+        body = b'{"workspaceId":"ws-1"}'
+        handler.headers = {"Authorization": "Bearer team-token", "Content-Length": str(len(body))}
+        handler.rfile = io.BytesIO(body)
+        handler._send = lambda status, payload: sent.update(status=status, payload=payload)
+        try:
+            handler.do_POST()
+        finally:
+            worker.ROUTES["/internal/team/snapshot"] = original_route
+            worker.TOKEN = original_token
+            worker._bound.http = None
+        update = (sent.get("payload") or {}).get("sessionUpdate") or {}
+        self.assertEqual(update.get("sessionToken"), "rotated-session")
+        self.assertEqual(update.get("accessToken"), "fresh-at")
+        self.assertIsNone(getattr(worker._bound, "http", None))
+
+    def test_open_session_and_child_kick_do_not_bind_http(self):
+        stub_protocol_imports()
+        import vendor.lib.http_client as http_client
+
+        original_create = http_client.create_http_session
+        original_precheck = worker.precheck
+        original_delete = worker.delete_member
+        http_client.create_http_session = lambda *args, **kwargs: SimpleNamespace(oai_device_id="", headers={})
+        worker.precheck = lambda http: None
+        worker.delete_member = lambda *args, **kwargs: 200
+        worker._bound.http = None
+        try:
+            worker.open_session("socks5://127.0.0.1:1080")
+            self.assertIsNone(getattr(worker._bound, "http", None))
+            _status, payload = worker.team_kick({
+                "workspaceId": "ws-1",
+                "userId": "user-1",
+                "accessToken": "child-at",
+                "proxy": "socks5://127.0.0.1:1080",
+            })
+        finally:
+            http_client.create_http_session = original_create
+            worker.precheck = original_precheck
+            worker.delete_member = original_delete
+            worker._bound.http = None
+        self.assertTrue(payload["ok"])
+        self.assertIsNone(getattr(worker._bound, "http", None))
+
+    def test_cookie_items_keeps_every_set_cookie(self):
+        class MultiHeaders:
+            def get_list(self, name):
+                if str(name).lower() == "set-cookie":
+                    return [
+                        "__Secure-next-auth.session-token=rotated; Path=/",
+                        "oai-did=device-cookie; Path=/",
+                    ]
+                return []
+
+            def get(self, name, default=None):
+                if str(name).lower() == "set-cookie":
+                    return "__Secure-next-auth.session-token=rotated; Path=/"
+                return default
+
+        class RawOnly:
+            def get(self, name, default=None):
+                if str(name).lower() == "set-cookie":
+                    return "__Secure-next-auth.session-token=first; Path=/"
+                return default
+
+        class RawHeaders:
+            def getlist(self, name):
+                if str(name).lower() == "set-cookie":
+                    return [
+                        "__Secure-next-auth.session-token=first; Path=/",
+                        "__Host-next-auth.csrf-token=second; Path=/",
+                    ]
+                return []
+
+        listed = worker.cookie_items(SimpleNamespace(headers=MultiHeaders()))
+        self.assertEqual([item["name"] for item in listed], ["__Secure-next-auth.session-token", "oai-did"])
+        raw = worker.cookie_items(SimpleNamespace(headers=RawOnly(), raw=SimpleNamespace(headers=RawHeaders())))
+        self.assertEqual([item["name"] for item in raw], ["__Secure-next-auth.session-token", "__Host-next-auth.csrf-token"])
 
 
 if __name__ == "__main__":

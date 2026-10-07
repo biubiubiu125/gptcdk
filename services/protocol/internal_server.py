@@ -6,8 +6,11 @@ from __future__ import annotations
 import hmac
 import json
 import os
+import re
+import threading
 import time
 import uuid
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlencode
@@ -21,6 +24,7 @@ PORT = int(os.environ.get("PROTOCOL_WORKER_PORT", "8080"))
 CHATGPT = "https://chatgpt.com"
 AUTH = "https://auth.openai.com"
 MAX_BODY = 2_000_000
+_bound = threading.local()
 
 
 def fail(code: str, message: str, status: int = 400, **extra):
@@ -97,16 +101,13 @@ def set_cookie(http, name: str, value: str, domain: str = "chatgpt.com") -> None
 
 
 def attach_living_session(http, session: dict) -> None:
-    names = set()
     raw = session.get("cookies") if isinstance(session, dict) else None
     if isinstance(raw, list):
         for item in raw:
             if isinstance(item, dict) and item.get("name") and item.get("value"):
-                name = str(item["name"])
-                names.add(name)
-                set_cookie(http, name, str(item["value"]), str(item.get("domain") or "chatgpt.com"))
+                set_cookie(http, str(item["name"]), str(item["value"]), str(item.get("domain") or "chatgpt.com"))
     token = session_token_value(session)
-    if token and SESSION_COOKIE not in names:
+    if token:
         set_cookie(http, SESSION_COOKIE, token, ".chatgpt.com")
     if isinstance(session, dict):
         remember_client_headers(http, session.get("headers"))
@@ -121,8 +122,9 @@ def living_access(http, session: dict, workspace_id: str) -> str:
             token = str(refreshed.get("accessToken") or refreshed.get("access_token") or "")
             if token:
                 return token
-        except TeamCallError:
-            pass
+        except TeamCallError as error:
+            if error.code in ("SESSION_EXPIRED", "EGRESS_BLOCKED"):
+                raise
     return session_access(session)
 
 
@@ -243,6 +245,198 @@ def open_session(proxy: str):
     return http
 
 
+def bind_device(http, body, session=None) -> None:
+    device = str((body or {}).get("deviceId") or "").strip()
+    if not device and isinstance(session, dict):
+        device = str(session.get("oaiDeviceId") or session.get("oai_device_id") or "").strip()
+    if device:
+        try:
+            http.oai_device_id = device
+        except Exception:
+            pass
+    try:
+        _bound.http = http
+    except Exception:
+        pass
+
+
+def normalize_active_until(value):
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return _active_until_unix(float(value))
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    if re.fullmatch(r"\d{10,13}", text):
+        return _active_until_unix(float(text))
+    if re.search(r"(?:Z|[+-]\d{2}:?\d{2})$", text, re.IGNORECASE):
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        return parsed.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return text
+
+
+def _active_until_unix(value: float):
+    if value <= 0:
+        return None
+    seconds = value / 1000 if value > 10_000_000_000 else value
+    return datetime.fromtimestamp(seconds, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def header_values(headers, name: str) -> list:
+    if headers is None:
+        return []
+    for method in ("get_list", "getlist"):
+        getter = getattr(headers, method, None)
+        if not callable(getter):
+            continue
+        try:
+            found = getter(name)
+        except Exception:
+            continue
+        if found:
+            return [str(item) for item in found if str(item).strip()]
+    if hasattr(headers, "get"):
+        found = headers.get(name) or headers.get(name.title()) or ""
+        if isinstance(found, list):
+            return [str(item) for item in found if str(item).strip()]
+        if found:
+            return [str(found)]
+    return []
+
+
+def cookie_items(response):
+    if response is None:
+        return []
+    headers = getattr(response, "headers", None)
+    raw_headers = getattr(getattr(response, "raw", None), "headers", None)
+    collected = []
+    for source in (headers, raw_headers):
+        for method in ("get_list", "getlist"):
+            getter = getattr(source, method, None) if source is not None else None
+            if not callable(getter):
+                continue
+            try:
+                found = getter("set-cookie")
+            except Exception:
+                continue
+            if found:
+                collected.append([str(item) for item in found if str(item).strip()])
+    raw = max(collected, key=len) if collected else (header_values(headers, "set-cookie") or header_values(raw_headers, "set-cookie"))
+    items = []
+    for line in raw:
+        part = str(line).split(";", 1)[0]
+        if "=" not in part:
+            continue
+        name, value = part.split("=", 1)
+        name = name.strip()
+        value = value.strip()
+        if name and value:
+            items.append({"name": name, "value": value, "domain": ".chatgpt.com"})
+    return items
+
+
+def merge_cookie_items(existing, harvested):
+    merged = []
+    index = {}
+    for item in existing if isinstance(existing, list) else []:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "").strip()
+        value = str(item.get("value") or "").strip()
+        if not name or not value:
+            continue
+        index[name] = len(merged)
+        merged.append({"name": name, "value": value, "domain": str(item.get("domain") or ".chatgpt.com")})
+    for item in harvested:
+        name = str(item.get("name") or "").strip()
+        value = str(item.get("value") or "").strip()
+        if not name or not value:
+            continue
+        stored = {"name": name, "value": value, "domain": str(item.get("domain") or ".chatgpt.com")}
+        if name in index:
+            merged[index[name]] = stored
+        else:
+            index[name] = len(merged)
+            merged.append(stored)
+    return merged
+
+
+def remember_refresh(http, data, response=None, *, keep_access=True) -> None:
+    if http is None:
+        return
+    current = getattr(http, "session_refresh", None)
+    if not isinstance(current, dict):
+        current = {}
+    if isinstance(data, dict):
+        token = str(data.get("accessToken") or data.get("access_token") or "").strip()
+        session_token = str(data.get("sessionToken") or data.get("session_token") or "").strip()
+        if keep_access and token:
+            current["accessToken"] = token
+        if session_token:
+            current["sessionToken"] = session_token
+    harvested = cookie_items(response)
+    for item in harvested:
+        if item["name"] == SESSION_COOKIE and item["value"]:
+            current["sessionToken"] = item["value"]
+        try:
+            set_cookie(http, item["name"], item["value"], item.get("domain") or ".chatgpt.com")
+        except Exception:
+            pass
+    if harvested:
+        current["cookies"] = merge_cookie_items(current.get("cookies"), harvested)
+    device = str(getattr(http, "oai_device_id", "") or "").strip()
+    if device:
+        current["deviceId"] = device
+    try:
+        setattr(http, "session_refresh", current)
+    except Exception:
+        pass
+
+
+def session_update_from(http):
+    if http is None:
+        return None
+    data = getattr(http, "session_refresh", None)
+    if not isinstance(data, dict):
+        data = {}
+    update = {}
+    token = str(data.get("accessToken") or "").strip()
+    session_token = str(data.get("sessionToken") or "").strip()
+    if token:
+        update["accessToken"] = token
+    if session_token:
+        update["sessionToken"] = session_token
+    cookies = data.get("cookies") if isinstance(data.get("cookies"), list) else []
+    clean = []
+    for item in cookies:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "").strip()
+        value = str(item.get("value") or "").strip()
+        if name and value:
+            clean.append({"name": name, "value": value, "domain": str(item.get("domain") or ".chatgpt.com")})
+    if clean:
+        update["cookies"] = clean
+    device = str(data.get("deviceId") or "").strip()
+    if device:
+        update["deviceId"] = device
+    return update or None
+
+
+def attach_session_update(http, payload):
+    if not isinstance(payload, dict):
+        return payload
+    update = session_update_from(http)
+    if not update:
+        return payload
+    copied = dict(payload)
+    copied["sessionUpdate"] = update
+    return copied
+
+
 def login_child(email: str, password: str, totp: str, proxy: str, workspace_id: str = ""):
     from app.engine import open_login_session
     client, tokens = open_login_session(email, password, totp, proxy, workspace_id=workspace_id)
@@ -295,13 +489,13 @@ def exchange_workspace(http, personal_token: str, workspace_id: str) -> dict:
         "reason": "setCurrentAccountWithoutRedirect",
     })
     headers = browser_headers(personal_token, workspace_id, path, f"{CHATGPT}/", http)
-    response = classify(
-        request_with_retry(http, "GET", f"{CHATGPT}{path}?{query}", headers=headers),
-        session_call=True,
-    )
+    response = request_with_retry(http, "GET", f"{CHATGPT}{path}?{query}", headers=headers)
+    remember_refresh(http, {}, response, keep_access=False)
+    response = classify(response, session_call=True)
     data = read_json(response)
     if not isinstance(data, dict) or not (data.get("accessToken") or data.get("access_token")):
         raise TeamCallError("SESSION_EXPIRED", "母号 session 已失效，请重新贴一次")
+    remember_refresh(http, data, response, keep_access=False)
     return data
 
 
@@ -455,8 +649,17 @@ def member_of(row: dict) -> dict:
 
 
 def page_total(data):
-    if isinstance(data, dict) and isinstance(data.get("total"), int):
-        return data["total"]
+    if not isinstance(data, dict) or "total" not in data:
+        return None
+    total = data.get("total")
+    if isinstance(total, bool) or total is None:
+        return None
+    if isinstance(total, int):
+        return total
+    if isinstance(total, str):
+        text = total.strip()
+        if text.isdigit() or (text.startswith("-") and text[1:].isdigit()):
+            return int(text)
     return None
 
 
@@ -525,7 +728,11 @@ def snapshot(http, token: str, workspace_id: str) -> dict:
         request_with_retry(http, "GET", f"{CHATGPT}{sub_path}?account_id={workspace_id}", headers=sub_headers),
         session_call=True,
     )
-    sub_data = {} if sub.status_code >= 400 else read_json(sub)
+    subscription_read = sub.status_code < 400
+    sub_data = read_json(sub) if subscription_read else {}
+    if not isinstance(sub_data, (dict, list)):
+        sub_data = {}
+        subscription_read = False
     seats = None
     will_renew = None
     active_until = None
@@ -534,8 +741,8 @@ def snapshot(http, token: str, workspace_id: str) -> dict:
             seats = node["seats_entitled"]
         if will_renew is None and isinstance(node.get("will_renew"), bool):
             will_renew = node["will_renew"]
-        if active_until is None and isinstance(node.get("active_until"), str):
-            active_until = node["active_until"]
+        if active_until is None and node.get("active_until") is not None:
+            active_until = normalize_active_until(node.get("active_until"))
     seat_path = f"/backend-api/accounts/{workspace_id}/users/seat_type_counts"
     try:
         classify(
@@ -549,7 +756,7 @@ def snapshot(http, token: str, workspace_id: str) -> dict:
         )
     except TeamCallError:
         pass
-    complete = (not page_failed) and (not truncated) and (not unparsed) and (total is None or len(members) == total)
+    complete = (not page_failed) and (not truncated) and (not unparsed) and total is not None and len(members) == total
     return {
         "complete": complete,
         "members": list(members.values()),
@@ -558,6 +765,7 @@ def snapshot(http, token: str, workspace_id: str) -> dict:
         "seatsEntitled": seats,
         "willRenew": will_renew,
         "activeUntil": active_until,
+        "subscriptionRead": subscription_read,
     }
 
 
@@ -688,6 +896,7 @@ def inspect_session(body: dict):
         return fail("BAD_INPUT", "session 不是 JSON")
     proxy = body.get("proxy") or ""
     http = open_session(proxy)
+    bind_device(http, body, session)
     precheck(http)
     token = living_access(http, session, "")
     me = classify(request_with_retry(http, "GET", f"{CHATGPT}/backend-api/me", headers=browser_headers(token, "", "/backend-api/me", f"{CHATGPT}/", http)), session_call=True)
@@ -729,6 +938,7 @@ def team_snapshot(body: dict):
     if not isinstance(session, dict) or not workspace_id:
         return fail("BAD_INPUT", "缺少母号 session 或空间")
     http = open_session(body.get("proxy") or "")
+    bind_device(http, body, session)
     precheck(http)
     exchanged = exchange_workspace(http, living_access(http, session, workspace_id), workspace_id)
     token = exchanged.get("accessToken") or exchanged.get("access_token")
@@ -744,6 +954,7 @@ def team_invite(body: dict):
         session = json.loads(session)
     workspace_id = str(body.get("workspaceId") or "")
     http = open_session(body.get("proxy") or "")
+    bind_device(http, body, session)
     precheck(http)
     exchanged = exchange_workspace(http, living_access(http, session, workspace_id), workspace_id)
     token = exchanged.get("accessToken") or exchanged.get("access_token")
@@ -785,11 +996,15 @@ def session_payload(http, token: str, workspace_id: str) -> dict:
         f"{CHATGPT}/api/auth/session",
         headers=browser_headers(token, workspace_id, "/api/auth/session", f"{CHATGPT}/", http),
     )
-    if is_html(response) or response.status_code in (401, 403):
+    if response.status_code in (401, 403) or is_html(response):
+        remember_refresh(http, {}, response)
+        if response.status_code in (401, 403) and not is_html(response):
+            raise TeamCallError("SESSION_EXPIRED", "母号 session 已失效，请重新贴一次", response.status_code)
         raise TeamCallError("EGRESS_BLOCKED", "出口被拦截，已停止", response.status_code)
     data = read_json(response)
     if not isinstance(data, dict):
         raise TeamCallError("AUTH", "登录后没有拿到 ChatGPT session")
+    remember_refresh(http, data, response)
     return data
 
 
@@ -1040,6 +1255,7 @@ def team_kick(body: dict):
                     raise
         session = mother_session(body.get("session"))
         if session:
+            bind_device(http, body, session)
             try:
                 exchanged = exchange_workspace(http, living_access(http, session, workspace_id), workspace_id)
                 token = str(exchanged.get("accessToken") or exchanged.get("access_token") or "")
@@ -1063,6 +1279,7 @@ def team_revoke(body: dict):
     if not email or not workspace_id or not isinstance(session, dict):
         return fail("BAD_INPUT", "缺少要撤回的邀请")
     http = open_session(body.get("proxy") or "")
+    bind_device(http, body, session)
     precheck(http)
     exchanged = exchange_workspace(http, living_access(http, session, workspace_id), workspace_id)
     token = exchanged.get("accessToken") or exchanged.get("access_token")
@@ -1127,12 +1344,22 @@ class Handler(BaseHTTPRequestHandler):
             self._send(400, {"ok": False, "code": "BAD_INPUT", "message": "请求不是 JSON"})
             return
         try:
+            _bound.http = None
+        except Exception:
+            pass
+        try:
             status, payload = ROUTES[path](body)
         except TeamCallError as error:
             status, payload = error_payload(error)
         except Exception as error:
             print(f"[gptcdk-protocol] {type(error).__name__} {path}", flush=True)
             status, payload = fail("UPSTREAM", "协议服务处理失败")
+        http = getattr(_bound, "http", None)
+        try:
+            _bound.http = None
+        except Exception:
+            pass
+        payload = attach_session_update(http, payload)
         self._send(status if status < 500 else 200, payload)
 
 

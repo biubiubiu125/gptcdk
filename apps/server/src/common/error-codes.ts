@@ -117,7 +117,7 @@ export const FORMAT_META: Record<
     label: '账密',
     ext: 'txt',
     title: '账密',
-    hint: 'Team 子号的邮箱、ChatGPT 密码和 2FA 密钥',
+    hint: '有 2FA 时为账号----密码----2FA，否则为账号----密码',
     bundle: 'document',
   },
 };

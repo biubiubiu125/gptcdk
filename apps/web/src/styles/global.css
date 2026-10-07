@@ -281,40 +281,6 @@ a:hover {
   outline-offset: 2px;
 }
 
-.ghost-button {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  height: 34px;
-  padding: 0 14px;
-  border: 1px solid var(--line);
-  border-radius: 8px;
-  background: var(--surface);
-  color: var(--ink-soft);
-  font-family: inherit;
-  font-size: 13px;
-  font-weight: 500;
-  cursor: pointer;
-  white-space: nowrap;
-  transition: border-color 0.16s ease, color 0.16s ease, box-shadow 0.16s ease;
-}
-
-.ghost-button:hover {
-  border-color: #c6ccc6;
-  color: var(--ink);
-}
-
-.ghost-button:focus-visible {
-  outline: 2px solid rgba(31, 74, 60, 0.28);
-  outline-offset: 1px;
-}
-
-.ghost-button__glyph {
-  font-size: 13px;
-  color: var(--brand);
-  line-height: 1;
-}
-
 /* --------------------------------------------------------------------------
    公共站点页脚
    -------------------------------------------------------------------------- */

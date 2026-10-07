@@ -46,7 +46,7 @@ HTTP 4xx/5xx，body：
 | `creditStatus` | `pending` 待定档 / `ready` 已定档（= `credits > 0`） |
 | `banStatus` | `unknown` 未知 / `normal` 正常 / `banned` 已封禁 / `invalid` 凭据失效 |
 | `redeemStatus` | `unredeemed` 未兑换 / `redeemed` 已兑换 |
-| `deliverFormat` | `sub2api` / `cpa` / `cockpit` / `ninerouter` / `codex` / `axonhub` / `codex-manager` / `email` |
+| `deliverFormat` | `sub2api` / `cpa` / `cockpit` / `ninerouter` / `codex` / `axonhub` / `codex-manager` / `email` / `login`。前台兑换和找回不接受 `email`；`email` 只用于后台导出和取件 |
 | `pickupStatus` | `ok` / `failed` |
 | `importSource` | `paste` / `upload` |
 
@@ -67,7 +67,7 @@ HTTP 4xx/5xx，body：
   "formats": [
     { "value": "sub2api", "label": "sub2api", "ext": "json", "hint": "sub2api 导入 JSON" },
     { "value": "cpa", "label": "CPA", "ext": "json", "hint": "Codex CPA auth JSON" },
-    { "value": "email", "label": "邮箱 TXT", "ext": "txt", "hint": "四段邮箱凭据；有 ChatGPT 密码或 2FA 时导出六段" }
+    { "value": "login", "label": "账密", "ext": "txt", "hint": "有 2FA 时为账号----密码----2FA，否则为账号----密码" }
   ],
   "creditTiers": [10, 20, 40],
   "stats": {
@@ -101,9 +101,9 @@ HTTP 4xx/5xx，body：
 | --- | --- | --- | --- |
 | `cards` | string[] | 是 | 卡密数组，服务端会按换行/空格/逗号/分号二次切分并去重。超过 500 张直接拒绝，不再截断 |
 | `format` | `deliverFormat` | 是 | 交付格式 |
-| `limit` | number | 否 | 默认使用后台 `redeemLimitPerCard`（初始值 1），请求值不得超过该配置，配置最大 20；仅影响首次兑换 |
+| `limit` | number | 否 | 默认使用后台 `redeemLimitPerCard`（初始值 1），请求值不得超过该配置，配置最大 20；只影响文件格式的首次兑换。账密忽略该值 |
 
-首次兑换在同一事务中占用主账号和同档位附加账号，全部写入 `redeemedByCard`；交付转换失败会回滚占用。重复兑换按归属返回同一集合。附加账号自己的卡密不能再次兑换或读取该账号邮箱。已交付账号禁止重置为未兑换或重新生成卡密；管理员物理删除账号会影响后续重复下载。旧数据归属恢复限制见 [升级说明](UPGRADE.md)。
+文件格式首次兑换在同一事务中占用主账号和同档位附加账号，全部写入 `redeemedByCard`；交付转换失败会回滚占用。账密首次兑换只交付本卡账号，不占附加库存。重复兑换按归属返回同一集合；账密重复导出时，归属里任一账号停用、封禁或凭据失效，整卡失败，不输出密码。附加账号自己的卡密不能再次兑换或读取该账号邮箱。已交付账号禁止重置为未兑换或重新生成卡密；管理员物理删除账号会影响后续重复下载。旧数据归属恢复限制见 [升级说明](UPGRADE.md)。
 
 响应：
 
@@ -164,7 +164,7 @@ HTTP 4xx/5xx，body：
 | 格式 | 合并文件结构 |
 | --- | --- |
 | `sub2api` | `{ type: "sub2api-data", version, exported_at, proxies: [], accounts: [所有账号] }` |
-| `email` | 所有卡密的四段或六段凭据行直接拼接，不带任何分隔标题；每个账号独立判断是否附带账密 / 2FA。成功交付不附带 OpenAI JSON |
+| `login` | 成功卡的账密行按提交顺序拼接。有 2FA 为三段，没有为两段，不留空段。失败卡不写入 |
 | `cpa` | **恒为 `null`** —— CPA 没有「合并成一份」的形态，下游要的是一个个独立的 Codex auth 文件；前台改为把各卡 `content` 打包成 zip（每张卡一个 `<卡密>.cpa.json`） |
 
 合并文件可被本服务原样再导入（`POST /api/admin/accounts/import`）。
@@ -185,7 +185,11 @@ HTTP 4xx/5xx，body：
 
 `extra` 的空串字段（如 `two_factor_error: ""`）按原样保留，保证交付文件与导入文件逐字段一致。来源没有 `extra` 时产物不写该键；CPA 的 `extra` 键集合与来源完全一致（含来源里本来就有的 `mailbox_*`）。
 
-邮箱 TXT 的格式根据每个账号的登录信息决定：
+前台显式传 `format=email` 时，整次兑换或找回直接拒绝，不占库存，也不刷新凭据。未传格式且后台默认仍是 `email` 时，前台改用 `sub2api`。
+
+账密 `login`：普通库存只读 `notes.gpt.password` 和 `notes.two_factor.secret`，账号只用账号邮箱，不用邮箱取件地址顶替。Team 子号只读已保存密文。没有 ChatGPT 密码时返回「该卡密没有账密交付」。有 2FA 输出 `账号----密码----2FA`，没有则输出 `账号----密码`。首次兑换忽略 `limit`。重复导出或找回时，归属账号停用、封禁或失效则整卡失败。公开兑换和找回账密都不调用 OpenAI。
+
+邮箱 TXT 只用于后台导出和取件，格式根据每个账号的登录信息决定：
 
 ```text
 邮箱----邮箱密码----client_id----邮箱refresh_token
@@ -194,7 +198,7 @@ HTTP 4xx/5xx，body：
 
 第五段读取原始 JSON 的 `notes` 内部 `gpt.password`，第六段读取 `two_factor.secret`。支持 `notes` 为 JSON 字符串或对象，也兼容单数 `note`；不要求该备注同时包含 `mailbox`。这两项至少一项为非空字符串时输出六段，缺失的一项留空；两项都没有时保持四段。仅有 `extra.two_factor_enabled` 等标记不视为提供了密钥。密码中的特殊字符按原文保留。
 
-该规则适用于单卡 / 批量兑换及后台账号导出，已有账号从 `rawJson` 读取，无需数据库迁移或重新导入。`POST /api/public/pickup/export` 的 `kind: "line"` 仍只输出四段邮箱取件凭据。
+邮箱 TXT 规则适用于后台账号导出，已有账号从 `rawJson` 读取，无需数据库迁移或重新导入。`POST /api/public/pickup/export` 的 `kind: "line"` 仍只输出四段邮箱取件凭据。库存里更长的 `mailbox.line` 不会原样导出，公开文件的 `source_line` 也只保留这四段，不带出第五段以后的 ChatGPT 密码或 2FA。
 
 ### 1.2.1 `POST /api/public/reclaim`
 
@@ -209,7 +213,7 @@ HTTP 4xx/5xx，body：
 }
 ```
 
-响应形状与兑换相同。成功时 `firstRedeem` 为 `false`，`code` 为 `OK`。邮箱格式成功时只返回四段或六段 TXT。写库失败或只写进一部分时，失败卡自己的文件会在邮箱行后面另附 sub2api JSON，避免新凭据只留在内存里。同一次批量里已经成功的卡仍只保留四段或六段，合并文件不会带上它们的 OpenAI 凭据。
+响应形状与兑换相同。成功时 `firstRedeem` 为 `false`，`code` 为 `OK`。文件格式会刷新原账号凭据；响应写完才解除持有，连接提前断开不解除。账密只重新导出已保存的账号和密码，不调用 OpenAI，成功也不解除已有持有。显式 `format=email` 直接拒绝。
 
 失败 `code`：
 
@@ -702,9 +706,9 @@ HTTP 4xx/5xx，body：
 }
 ```
 
-响应 `text/plain`（`email` 格式）或 `application/json`（`sub2api` / `cpa`），带 `Content-Disposition`。
+响应 `text/plain`（`email` / `login`）或 `application/json`（`sub2api` / `cpa`），带 `Content-Disposition`。
 
-`email` 使用与卡密兑换相同的四段 / 六段规则：包含 ChatGPT 密码或 2FA 密钥时追加第五、六段，缺失项留空。
+后台 `email` 仍是四段或六段：包含 ChatGPT 密码或 2FA 密钥时追加第五、六段，缺失项留空。库存里更长的 `mailbox.line` 在第四段已是完整邮箱 token 时先收成四段再追加，不会把行尾旧账密再拼成八段；token 自身含 `----` 时不截断。`login` 有 2FA 时三段，没有时两段；没有账密的账号跳过，结果为空时返回空文本。
 
 ### 3.10 `GET /api/admin/stats/overview`
 

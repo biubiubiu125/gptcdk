@@ -20,7 +20,7 @@ export default function LoginPage() {
   const [loading, setLoading] = useState(false);
 
   useEffect(() => {
-    if (ready && token) navigate('/admin/accounts', { replace: true });
+    if (ready && token) navigate('/biubiubiu/accounts', { replace: true });
   }, [navigate, ready, token]);
 
   const handleSubmit = async () => {
@@ -35,7 +35,7 @@ export default function LoginPage() {
     try {
       await login(values);
       void message.success('登录成功');
-      navigate('/admin/accounts', { replace: true });
+      navigate('/biubiubiu/accounts', { replace: true });
     } catch (error) {
       void message.error(errorMessage(error));
     } finally {

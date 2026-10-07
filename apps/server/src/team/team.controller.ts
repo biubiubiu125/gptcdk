@@ -47,6 +47,11 @@ export class TeamController {
     return this.team.probe(id);
   }
 
+  @Post('workspaces/:id/refresh')
+  refresh(@Param('id', ParseIntPipe) id: number) {
+    return this.team.refresh(id);
+  }
+
   @Get('workspaces/:id/kick-preview')
   previewKick(@Param('id', ParseIntPipe) id: number) {
     return this.team.previewKickAll(id);
@@ -55,6 +60,11 @@ export class TeamController {
   @Post('workspaces/:id/kick-all')
   kickAll(@Param('id', ParseIntPipe) id: number, @Body() body: { confirm?: string; userIds?: string[] }) {
     return this.team.kickAll(id, String(body?.confirm || ''), Array.isArray(body?.userIds) ? body.userIds : []);
+  }
+
+  @Post('workspaces/:id/kick-selected')
+  kickSelected(@Param('id', ParseIntPipe) id: number, @Body() body: { confirm?: string; userIds?: string[] }) {
+    return this.team.kickSelected(id, String(body?.confirm || ''), Array.isArray(body?.userIds) ? body.userIds : []);
   }
 
   @Post('workspaces/:id/revoke-invites')
@@ -66,6 +76,11 @@ export class TeamController {
   members(@Query('workspaceId') workspaceId?: string) {
     const id = Number(workspaceId);
     return this.team.listMembers(Number.isFinite(id) && id > 0 ? id : undefined);
+  }
+
+  @Get('remote-members')
+  remoteMembers() {
+    return this.team.listRemoteMembers();
   }
 
   @Get('waiting')

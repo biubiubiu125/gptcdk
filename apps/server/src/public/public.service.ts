@@ -16,6 +16,7 @@ import {
 import type { NormalizedAccount } from '../convert/convert.types';
 import type { MailboxCredential, PickupResult } from '../mailbox/mailbox.types';
 import type { Account, Prisma } from '@prisma/client';
+import { formatLoginLine } from '../common/login-line';
 import { decryptSecret, teamSecretReady } from '../team/team-crypto';
 import { withReclaimLock as lockReclaim } from './reclaim-lock';
 import { serializeStagedCredential, stagedExpiresAt, stagedForAccount } from './staged-credential';
@@ -41,6 +42,30 @@ function openTeamCredential(cipher: string): string {
 
 function teamDisabled(error: unknown): error is Error {
   return error instanceof Error && error.name === 'TeamDisabled';
+}
+
+const PUBLIC_FORMATS = DELIVER_FORMATS.filter((value) => value !== 'email');
+
+function rejectPublicEmail(requested: unknown): void {
+  if (requested === 'email') bizError('BAD_INPUT', '不支持邮箱 TXT');
+}
+
+function resolvePublicDeliverFormat(requested: unknown, fallback: unknown): string {
+  rejectPublicEmail(requested);
+  const safeFallback = fallback === 'email' ? 'sub2api' : fallback;
+  const resolved = resolveDeliverFormat(requested, safeFallback);
+  return resolved === 'email' ? 'sub2api' : resolved;
+}
+
+function mergedLoginContent(results: Array<{ ok?: unknown; content?: unknown }>): string | null {
+  const lines: string[] = [];
+  for (const item of results) {
+    if (!item.ok || typeof item.content !== 'string') continue;
+    for (const line of item.content.split(/\r?\n/)) {
+      if (line) lines.push(line);
+    }
+  }
+  return lines.length ? `${lines.join('\n')}\n` : null;
 }
 
 /**
@@ -290,7 +315,7 @@ export class RedeemService {
       siteName: settings.siteName,
       siteSubtitle: settings.siteSubtitle,
       announcement: settings.announcement,
-      formats: DELIVER_FORMATS.map((value) => ({
+      formats: PUBLIC_FORMATS.map((value) => ({
         value,
         label: FORMAT_META[value].label,
         ext: FORMAT_META[value].ext,
@@ -299,7 +324,7 @@ export class RedeemService {
       })),
       /** 在售档位（= 账号实际额度，由邮箱取件命中关键字自动定档，非手工维护） */
       creditTiers: byCredits.filter((item) => item.available > 0).map((item) => item.credits),
-      defaultFormat: settings.defaultFormat,
+      defaultFormat: settings.defaultFormat === 'email' ? 'sub2api' : settings.defaultFormat,
       redeemLimitPerCard: settings.redeemLimitPerCard,
       stats: {
         total,
@@ -328,7 +353,7 @@ export class RedeemService {
     userAgent?: string;
   }) {
     const settings = await this.settings.getAll();
-    const format = resolveDeliverFormat(payload?.format, settings.defaultFormat);
+    const format = resolvePublicDeliverFormat(payload?.format, settings.defaultFormat);
 
     const cards = collectCardKeys(payload?.cards);
 
@@ -392,7 +417,10 @@ export class RedeemService {
       format,
       results,
       // document 格式合并成一份；zip 格式由前台按卡打包，这里不并文件。
-      mergedContent: mergedDeliverContent(this.convert, format, delivered),
+      mergedContent:
+        format === 'login'
+          ? mergedLoginContent(results)
+          : mergedDeliverContent(this.convert, format, delivered),
       summary: {
         total: cards.length,
         success: successCount,
@@ -416,7 +444,7 @@ export class RedeemService {
     shouldStop?: () => boolean;
   }) {
     const settings = await this.settings.getAll();
-    const format = resolveDeliverFormat(payload?.format, settings.defaultFormat);
+    const format = resolvePublicDeliverFormat(payload?.format, settings.defaultFormat);
     const cards = collectCardKeys(payload?.cards);
     if (!cards.length) {
       return {
@@ -475,9 +503,11 @@ export class RedeemService {
       format,
       results,
       mergedContent:
-        format === 'email' && exposed.length
-          ? mergeEmailDownload(this.convert, saved, exposed)
-          : mergedDeliverContent(this.convert, format, delivered),
+        format === 'login'
+          ? mergedLoginContent(results)
+          : format === 'email' && exposed.length
+            ? mergeEmailDownload(this.convert, saved, exposed)
+            : mergedDeliverContent(this.convert, format, delivered),
       summary: {
         total: cards.length,
         success: successCount,
@@ -570,13 +600,15 @@ export class RedeemService {
     if (account.redeemStatus !== 'redeemed') {
       return this.reclaimFailure(cardKey, 'CARD_NOT_REDEEMED', '该卡密尚未兑换，不能找回', account.id, account.credits);
     }
+    // Team 找回不能提前返回。封禁或失效时账密和文件都不应交出去。
+    if (account.banStatus === 'banned' || account.banStatus === 'invalid') {
+      return this.reclaimFailure(cardKey, 'NO_STOCK', '交付账号已封禁或凭据失效，请联系管理员', account.id, account.credits);
+    }
     if (account.stockKind === 'team') return this.reclaimTeam(cardKey, format, account);
     if (account.redeemedByCard && account.redeemedByCard !== cardKey) {
       return this.reclaimFailure(cardKey, 'CARD_ALLOCATED', '卡密归属不一致', account.id, account.credits);
     }
-    if (account.banStatus === 'banned' || account.banStatus === 'invalid') {
-      return this.reclaimFailure(cardKey, 'NO_STOCK', '交付账号已封禁或凭据失效，请联系管理员', account.id, account.credits);
-    }
+    if (format === 'login') return this.reclaimStandardLogin(cardKey, account);
     if (!account.redeemedByCard) {
       await this.prisma.account.update({ where: { id: account.id }, data: { redeemedByCard: cardKey } });
     }
@@ -1052,7 +1084,6 @@ export class RedeemService {
       if (account.stockKind === 'team') {
         return this.deliverTeam(tx, account, cardKey, format, claimedTeam.count === 1, redeemedAt);
       }
-      if (format === 'login') return fail('BAD_INPUT', '该卡密没有账密交付');
       if (isPendingTier(account.credits)) {
         return fail('CREDITS_PENDING', '该卡密账号额度待定，请稍后重试');
       }
@@ -1061,6 +1092,9 @@ export class RedeemService {
       }
 
       const isFirstRedeem = claimed.count === 1;
+      if (format === 'login') {
+        return this.deliverStandardLogin(tx, account, cardKey, isFirstRedeem, redeemedAt);
+      }
       if (!account.redeemedByCard) {
         // 兼容管理员标记为已兑换、但尚未建立交付归属的单账号。
         await tx.account.update({ where: { id: account.id }, data: { redeemedByCard: cardKey } });
@@ -1154,6 +1188,150 @@ export class RedeemService {
     return { ...result, stagedDelivery: stagedWrites.length > 0 };
   }
 
+  private standardLoginLine(account: AccountWithMailbox): string | null {
+    const fields = this.convert.readChatGptLogin(this.toNormalized(account));
+    return formatLoginLine(account.email || '', fields.password || '', fields.twoFactorSecret);
+  }
+
+  private async deliverStandardLogin(
+    tx: Prisma.TransactionClient,
+    account: AccountWithMailbox,
+    cardKey: string,
+    isFirstRedeem: boolean,
+    redeemedAt: Date,
+  ) {
+    const owned = isFirstRedeem
+      ? [account]
+      : await tx.account.findMany({
+          where: { redeemedByCard: cardKey },
+          include: { mailbox: true },
+          orderBy: { id: 'asc' },
+        });
+    const targets = owned.length ? owned : [account];
+    if (targets.some((item) => item.cardDisabled || item.banStatus === 'banned' || item.banStatus === 'invalid')) {
+      if (isFirstRedeem) {
+        await tx.account.update({
+          where: { id: account.id },
+          data: { redeemStatus: 'unredeemed', redeemedByCard: null, redeemedAt: null },
+        });
+      }
+      return {
+        normalized: [] as NormalizedAccount[],
+        record: {
+          card: cardKey,
+          ok: false,
+          code: 'NO_STOCK',
+          message: '交付账号已停用、封禁或凭据失效，请联系管理员',
+          credits: null,
+          accountCount: 0,
+          redeemedAt: null,
+          firstRedeem: false,
+          filename: null,
+          content: null,
+          accounts: [],
+        },
+      };
+    }
+    const lines = targets.map((item) => this.standardLoginLine(item));
+    const ready = lines.filter((line): line is string => Boolean(line));
+    if (ready.length !== targets.length) {
+      if (isFirstRedeem) {
+        await tx.account.update({
+          where: { id: account.id },
+          data: { redeemStatus: 'unredeemed', redeemedByCard: null, redeemedAt: null },
+        });
+      }
+      return {
+        normalized: [] as NormalizedAccount[],
+        record: {
+          card: cardKey,
+          ok: false,
+          code: 'BAD_INPUT',
+          message: '该卡密没有账密交付',
+          credits: null,
+          accountCount: 0,
+          redeemedAt: null,
+          firstRedeem: false,
+          filename: null,
+          content: null,
+          accounts: [],
+        },
+      };
+    }
+    if (!isFirstRedeem && !account.redeemedByCard) {
+      await tx.account.update({ where: { id: account.id }, data: { redeemedByCard: cardKey } });
+    }
+    await tx.account.update({ where: { id: account.id }, data: { redeemCount: { increment: 1 } } });
+    return {
+      normalized: [] as NormalizedAccount[],
+      record: {
+        card: cardKey,
+        ok: true,
+        code: 'OK',
+        message: isFirstRedeem ? '兑换成功' : '已兑换过，本次为同批账号重新导出',
+        credits: account.credits,
+        accountCount: targets.length,
+        redeemedAt: (account.redeemedAt || redeemedAt).toISOString(),
+        firstRedeem: isFirstRedeem,
+        filename: deliverFilename(cardKey, 'login'),
+        content: `${ready.join('\n')}\n`,
+        accounts: targets.map((item) => ({
+          id: item.id,
+          name: item.name,
+          credits: item.credits,
+          planType: item.planType,
+          email: item.email,
+        })),
+      },
+    };
+  }
+
+  private async reclaimStandardLogin(cardKey: string, account: AccountWithMailbox) {
+    const owned = account.redeemedByCard
+      ? await this.prisma.account.findMany({
+          where: { redeemedByCard: cardKey },
+          include: { mailbox: true },
+          orderBy: { id: 'asc' },
+        })
+      : [account];
+    const targets = owned.length ? owned : [account];
+    if (targets.some((item) => item.cardDisabled || item.banStatus === 'banned' || item.banStatus === 'invalid')) {
+      return this.reclaimFailure(cardKey, 'NO_STOCK', '交付账号已停用、封禁或凭据失效，请联系管理员', account.id, account.credits);
+    }
+    const ready = targets
+      .map((item) => this.standardLoginLine(item))
+      .filter((line): line is string => Boolean(line));
+    if (ready.length !== targets.length) {
+      return this.reclaimFailure(cardKey, 'BAD_INPUT', '该卡密没有账密交付', account.id, account.credits);
+    }
+    if (!account.redeemedByCard) {
+      await this.prisma.account.update({ where: { id: account.id }, data: { redeemedByCard: cardKey } });
+    }
+    return {
+      accountId: account.id,
+      credits: account.credits,
+      normalized: [] as NormalizedAccount[],
+      record: {
+        card: cardKey,
+        ok: true,
+        code: 'OK',
+        message: '已重新导出',
+        credits: account.credits,
+        accountCount: targets.length,
+        firstRedeem: false,
+        filename: deliverFilename(cardKey, 'login'),
+        content: `${ready.join('\n')}\n`,
+        accounts: targets.map((item) => ({
+          id: item.id,
+          name: item.name,
+          credits: item.credits,
+          planType: item.planType,
+          email: item.email,
+        })),
+      },
+    };
+  }
+
   private async deliverTeam(
     tx: Prisma.TransactionClient,
     account: AccountWithMailbox,
@@ -1183,9 +1361,11 @@ export class RedeemService {
         if (teamDisabled(error)) return failFirst('TEAM_DISABLED', error.message);
         throw error;
       }
+      const line = formatLoginLine(account.email || '', password, totp);
+      if (!line) return failFirst('BAD_INPUT', '该卡密没有账密交付');
       packed = {
         filename: deliverFilename(cardKey, 'login'),
-        content: `${account.email}----${password}----${totp}\n`,
+        content: `${line}\n`,
       };
     } else if (account.teamStatus === 'file_ready' && account.rawJson && account.accessToken) {
       normalized = [this.toNormalized(teamFileAccount(account))];
@@ -1267,7 +1447,9 @@ export class RedeemService {
         if (teamDisabled(error)) return this.reclaimFailure(cardKey, 'TEAM_DISABLED', error.message, account.id, 0);
         throw error;
       }
-      const content = `${account.email}----${password}----${totp}\n`;
+      const line = formatLoginLine(account.email || '', password, totp);
+      if (!line) return this.reclaimFailure(cardKey, 'BAD_INPUT', '该卡密没有账密交付', account.id, 0);
+      const content = `${line}\n`;
       return {
         accountId: account.id,
         credits: 0,
@@ -1331,14 +1513,17 @@ export class RedeemService {
           refreshToken: account.mailbox.refreshToken || undefined,
           imapHost: account.mailbox.imapHost || 'outlook.office365.com',
           imapPort: account.mailbox.imapPort || 993,
-          line:
-            account.mailbox.line ||
-            [
-              account.mailbox.email,
-              account.mailbox.password || '',
-              account.mailbox.clientId || '',
-              account.mailbox.refreshToken || '',
-            ].join('----'),
+          line: this.mailbox.parseCredential({
+            email: account.mailbox.email,
+            provider: account.mailbox.provider,
+            authType: account.mailbox.authType,
+            password: account.mailbox.password || undefined,
+            clientId: account.mailbox.clientId || undefined,
+            refreshToken: account.mailbox.refreshToken || undefined,
+            imapHost: account.mailbox.imapHost || undefined,
+            imapPort: account.mailbox.imapPort || undefined,
+            line: account.mailbox.line || undefined,
+          })?.line,
         }
       : account.stockKind === 'team'
         ? undefined
@@ -1719,14 +1904,14 @@ export class RedeemService {
       if (!this.mailbox.isComplete(credential)) {
         bizError('UNAUTHORIZED', '导出凭据需要有效卡密或用户自行提供的完整凭据', 403);
       }
+      // 取件导出只出四段邮箱凭据。不回放库存里更长的 line，避免带出第五段以后的 ChatGPT 密码或 2FA。
       lines.push(
-        credential.line ||
-          [
-            credential.email,
-            credential.password || '',
-            credential.clientId || '',
-            credential.refreshToken || '',
-          ].join('----'),
+        [
+          credential.email,
+          credential.password || '',
+          credential.clientId || '',
+          credential.refreshToken || '',
+        ].join('----'),
       );
     }
 

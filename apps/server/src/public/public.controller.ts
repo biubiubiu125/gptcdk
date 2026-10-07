@@ -48,7 +48,8 @@ export class PublicController {
         userAgent: request.headers['user-agent'],
         shouldStop: () => aborted,
       });
-      if (!aborted) {
+      // 账密不刷新凭据。成功也不能解除文件找回留下的持有，否则下一次文件找回会把没送到的凭据再轮换掉。
+      if (!aborted && result?.format !== 'login') {
         const cards: string[] = [];
         if (Array.isArray(result?.results)) {
           for (const item of result.results) {

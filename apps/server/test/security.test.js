@@ -26,6 +26,10 @@ global.fetch = async () => { throw new Error('回归测试禁止外部网络请�
 const CLIENT_ID = '00000000-0000-0000-0000-000000000001';
 const MS_TOKEN = 'M'.repeat(64);
 
+function stableDeliver(content) {
+  return String(content || '').replace(/\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z/g, '<time>');
+}
+
 function postgresUrl() {
   const url = process.env.DATABASE_URL || '';
   if (!/^postgres(ql)?:\/\//i.test(url)) {
@@ -89,6 +93,16 @@ async function createAccount(prisma, index = 1, extra = {}) {
 function pickupResult(email, overrides = {}) {
   return { key: email, email, ok: true, error: null, banned: false, banReason: null, banKeywords: [],
     credits: null, creditsBalance: null, latestCode: null, messages: [], fetchedAt: new Date().toISOString(), ...overrides };
+}
+
+function errorText(error) {
+  const body = typeof error.getResponse === 'function' ? error.getResponse() : null;
+  if (body && typeof body === 'object') return String(body.message || '');
+  return String(error.message || error);
+}
+
+async function rejectsPublicEmail(run) {
+  await assert.rejects(run, (error) => /不支持邮箱 TXT/.test(errorText(error)));
 }
 
 test('旧库迁移保留账号与密码，回填历史主账号归属，重复执行幂等', async (t) => {
@@ -165,7 +179,7 @@ test('上传 JSON 自带凭据可以解析、继续取件和导出，无需存�
   assert((await f.redeem.exportPickup({ records: resolved.records, kind: 'line' })).content.includes(MS_TOKEN));
 });
 
-test('邮箱 TXT：JSON 导入落库后，后台导出和兑换均保留账密与 2FA', async (t) => {
+test('后台邮箱 TXT 保持四段或六段，前台兑换不再接受邮箱 TXT', async (t) => {
   const f = await fixture(t);
   const password = '@Demo$pa*ss!';
   const secret = 'JBSWY3DPEHPK3PXP';
@@ -188,34 +202,52 @@ test('邮箱 TXT：JSON 导入落库后，后台导出和兑换均保留账密�
   const expected = `${expectedLines.join('\n')}\n`;
   assert.equal((await f.accounts.exportAccounts({ format: 'email', ids: rows.map((row) => row.id) })).content, expected);
 
-  await f.prisma.account.updateMany({ data: { credits: 40, banStatus: 'normal' } });
-  const request = { cards: rows.map((row) => row.cardKey), format: 'email' };
-  const delivered = await f.redeem.redeem(request);
-  assert.equal(delivered.mergedContent, expected);
-  for (const [index, result] of delivered.results.entries()) {
-    assert.equal(result.ok, true);
-    assert.equal(result.content, `${expectedLines[index]}\n`);
-  }
-  assert.equal((await f.redeem.redeem(request)).mergedContent, expected, '重复兑换保持同样的交付内容');
+  await rejectsPublicEmail(() => f.redeem.redeem({ cards: rows.map((row) => row.cardKey), format: 'email' }));
+  assert.equal(await f.prisma.account.count({ where: { redeemStatus: 'redeemed' } }), 0);
   const pickup = await f.redeem.exportPickup({
     records: [{ key: rows[0].email, fromCard: rows[0].cardKey }], kind: 'line',
   });
   assert.equal(pickup.content.trim(), baseLines[0], '邮箱取件的凭据导出仍只包含邮箱四段');
 });
 
+test('历史六段取件行导出时不带出 ChatGPT 密码和 2FA', async (t) => {
+  const f = await fixture(t);
+  const account = await createAccount(f.prisma, 1);
+  const gptPassword = 'chatgpt-pass';
+  const totp = 'JBSWY3DPEHPK3PXP';
+  const legacy = `${account.email}----placeholder-password----${CLIENT_ID}----${MS_TOKEN}----${gptPassword}----${totp}`;
+  await f.prisma.mailCredential.update({ where: { accountId: account.id }, data: { line: legacy } });
+  const expected = `${account.email}----placeholder-password----${CLIENT_ID}----${MS_TOKEN}`;
+
+  const pickup = await f.redeem.exportPickup({
+    records: [{ key: account.email, fromCard: account.cardKey }],
+    kind: 'line',
+  });
+  assert.equal(pickup.content.trim(), expected);
+  assert.equal(pickup.content.includes(gptPassword), false);
+  assert.equal(pickup.content.includes(totp), false);
+
+  const redeemed = await f.redeem.redeem({ cards: [account.cardKey], format: 'sub2api' });
+  assert.equal(redeemed.results[0].ok, true);
+  assert.equal(String(redeemed.results[0].content).includes(gptPassword), false);
+  assert.equal(String(redeemed.results[0].content).includes(totp), false);
+  assert.match(String(redeemed.results[0].content), /source_line/);
+  assert.equal(String(redeemed.results[0].content).includes(expected), true);
+});
+
 test('服务端限制每卡数量，多账号全部占用，重试不增发且附加卡不能重复领取', async (t) => {
   const f = await fixture(t, { limit: 2 });
   const [a, b, c] = await Promise.all([1, 2, 3].map((index) => createAccount(f.prisma, index)));
-  const first = await f.redeem.redeem({ cards: [a.cardKey], format: 'email', limit: 20 });
+  const first = await f.redeem.redeem({ cards: [a.cardKey], format: 'sub2api', limit: 20 });
   assert.equal(first.results[0].accountCount, 2);
   const owned = await f.prisma.account.findMany({ where: { redeemedByCard: a.cardKey } });
   assert.equal(owned.length, 2);
   assert(owned.every((row) => row.redeemStatus === 'redeemed'));
-  const retry = await f.redeem.redeem({ cards: [a.cardKey], format: 'email', limit: 1 });
-  assert.equal(retry.results[0].content, first.results[0].content);
+  const retry = await f.redeem.redeem({ cards: [a.cardKey], format: 'sub2api', limit: 1 });
+  assert.equal(stableDeliver(retry.results[0].content), stableDeliver(first.results[0].content));
   assert.equal(retry.results[0].firstRedeem, false);
   const extra = owned.find((row) => row.id !== a.id);
-  const duplicate = await f.redeem.redeem({ cards: [extra.cardKey], format: 'email' });
+  const duplicate = await f.redeem.redeem({ cards: [extra.cardKey], format: 'sub2api' });
   assert.equal(duplicate.results[0].code, 'CARD_ALLOCATED');
   assert.equal(await f.prisma.account.count({ where: { redeemStatus: 'unredeemed' } }), 1);
   assert.equal((await f.redeem.resolvePickup({ input: a.cardKey })).records.length, 2);
@@ -227,11 +259,11 @@ test('并发重复兑换返回同一集合，另一张卡不会重复占用同�
   const accounts = [];
   for (let index = 1; index <= 4; index++) accounts.push(await createAccount(f.prisma, index));
   const [first, retry, other] = await Promise.all([
-    f.redeem.redeem({ cards: [accounts[0].cardKey], format: 'email', limit: 2 }),
-    f.redeem.redeem({ cards: [accounts[0].cardKey], format: 'email', limit: 2 }),
-    f.redeem.redeem({ cards: [accounts[3].cardKey], format: 'email', limit: 2 }),
+    f.redeem.redeem({ cards: [accounts[0].cardKey], format: 'sub2api', limit: 2 }),
+    f.redeem.redeem({ cards: [accounts[0].cardKey], format: 'sub2api', limit: 2 }),
+    f.redeem.redeem({ cards: [accounts[3].cardKey], format: 'sub2api', limit: 2 }),
   ]);
-  assert.equal(first.results[0].content, retry.results[0].content);
+  assert.equal(stableDeliver(first.results[0].content), stableDeliver(retry.results[0].content));
   assert.equal(other.results[0].ok, true);
   const firstIds = new Set(first.results[0].accounts.map((row) => row.id));
   assert(other.results[0].accounts.every((row) => !firstIds.has(row.id)));
@@ -242,7 +274,7 @@ test('转换异常回滚全部库存占用', async (t) => {
   const first = await createAccount(f.prisma);
   await createAccount(f.prisma, 2);
   f.redeem.convert.buildDeliverContent = () => { throw new Error('synthetic conversion failure'); };
-  const result = await f.redeem.redeem({ cards: [first.cardKey], format: 'email', limit: 2 });
+  const result = await f.redeem.redeem({ cards: [first.cardKey], format: 'sub2api', limit: 2 });
   assert.equal(result.results[0].code, 'INTERNAL');
   assert.equal(result.results[0].content, null);
   assert.equal(await f.prisma.account.count({ where: { redeemStatus: 'unredeemed', redeemedByCard: null } }), 2);
@@ -450,7 +482,7 @@ test('一张卡后面的账号刷新失败时，前面已经换到的凭据仍�
     if (token === 'synthetic-openai-refresh' && calls.length > 1) return { ok: false, error: 'second failed' };
     return { ok: true, credentials: { accessToken: 'new-access-1', refreshToken: 'new-refresh-1' } };
   });
-  const result = await service.reclaim({ cards: [primary.cardKey], format: 'email' });
+  const result = await service.reclaim({ cards: [primary.cardKey], format: 'sub2api' });
   assert.equal(result.results[0].code, 'REFRESH_FAILED');
   assert.match(result.results[0].message, /保存/);
   assert.match(result.results[0].content, /new-access-1/);
@@ -512,7 +544,7 @@ test('邮箱格式写库失败时，结果文件仍包含新的 OpenAI 凭据', 
     ok: true,
     credentials: { accessToken: 'brand-new-access', refreshToken: 'brand-new-refresh' },
   }));
-  const failed = await service.reclaim({ cards: [account.cardKey], format: 'email' });
+  const failed = await service.reclaim({ cards: [account.cardKey], format: 'sub2api' });
   assert.equal(failed.results[0].code, 'PERSIST_FAILED');
   assert.match(failed.results[0].content, /brand-new-access/);
   assert.match(failed.results[0].content, /brand-new-refresh/);
@@ -824,27 +856,18 @@ test('部分刷新失败后再次找回，不轮换已经落库的凭据', async
   assert.equal(savedExtra.refreshToken, 'refresh-3');
 });
 
-test('邮箱格式找回成功后始终是四段或六段，不再附上 OpenAI JSON', async (t) => {
+test('前台邮箱格式兑换和找回直接拒绝，不会刷新凭据', async (t) => {
   const f = await fixture(t);
   const account = await createAccount(f.prisma);
   await markRedeemed(f.prisma, account);
-  const service = reclaimService(f.prisma, f.mailbox, async () => ({
-    ok: true,
-    credentials: { accessToken: 'email-new-access', refreshToken: 'email-new-refresh' },
-  }));
-  const result = await service.reclaim({ cards: [account.cardKey], format: 'email' });
-  assert.equal(result.results[0].code, 'OK');
-  assert.match(result.results[0].content, new RegExp(account.email));
-  assert.equal(result.results[0].content.includes('email-new-access'), false);
-  assert.equal(result.results[0].content.includes('email-new-refresh'), false);
-  assert.equal(result.mergedContent.includes('email-new-refresh'), false);
+  const service = reclaimService(f.prisma, f.mailbox, async () => {
+    throw new Error('不应刷新');
+  });
+  await rejectsPublicEmail(() => service.reclaim({ cards: [account.cardKey], format: 'email' }));
+  await rejectsPublicEmail(() => service.redeem({ cards: [account.cardKey], format: 'email' }));
   const saved = await f.prisma.account.findUnique({ where: { id: account.id } });
-  assert.equal(saved.refreshToken, 'email-new-refresh');
-  const again = await f.redeem.redeem({ cards: [account.cardKey], format: 'email' });
-  assert.equal(again.results[0].ok, true);
-  assert.equal(again.results[0].content.includes('email-new-access'), false);
-  assert.equal(again.results[0].content.includes('email-new-refresh'), false);
-  assert.match(again.results[0].content, new RegExp(account.email));
+  assert.equal(saved.refreshToken, 'synthetic-openai-refresh');
+  assert.equal(saved.redeemStatus, 'redeemed');
 });
 
 test('后台刷新写不进去时不算成功，有暂存时不再用旧凭据刷新', async (t) => {
@@ -1000,7 +1023,7 @@ test('后台提交暂存后，下一轮找回不会只轮换刚写入的凭据',
   assert.equal(finalExtra.refreshToken, 'admin-staged-refresh');
 });
 
-test('邮箱格式兑换重导出只保留邮箱行，新凭据写入数据库', async (t) => {
+test('兑换重导出先提交暂存凭据，再按文件格式交付', async (t) => {
   const f = await fixture(t);
   const account = await createAccount(f.prisma);
   await markRedeemed(f.prisma, account);
@@ -1019,12 +1042,10 @@ test('邮箱格式兑换重导出只保留邮箱行，新凭据写入数据库',
   const service = reclaimService(f.prisma, f.mailbox, async () => {
     throw new Error('不应再刷新');
   });
-  const exported = await service.redeem({ cards: [account.cardKey], format: 'email' });
+  const exported = await service.redeem({ cards: [account.cardKey], format: 'sub2api' });
   assert.equal(exported.results[0].ok, true);
-  assert.equal(exported.results[0].content.includes('mail-new-refresh'), false);
-  assert.equal(exported.results[0].content.includes('mail-new-access'), false);
-  assert.match(exported.results[0].content, new RegExp(account.email));
-  assert.equal(exported.mergedContent.includes('mail-new-refresh'), false);
+  assert.match(exported.results[0].content, /mail-new-refresh/);
+  assert.match(exported.results[0].content, /mail-new-access/);
   const saved = await f.prisma.account.findUnique({ where: { id: account.id } });
   assert.equal(saved.refreshToken, 'mail-new-refresh');
   assert.equal(saved.stagedCredential, null);
@@ -1223,7 +1244,7 @@ test('后台刷新没有过期时间时不沿用旧的 expiresAt', async (t) => 
   assert.equal(jwtSaved.expiresAt.toISOString(), new Date(exp * 1000).toISOString());
 });
 
-test('批量邮箱找回时，失败卡的凭据不会带上同批已成功卡', async (t) => {
+test('前台批量邮箱找回整次拒绝，不会刷新任何卡', async (t) => {
   const f = await fixture(t);
   const okCard = await createAccount(f.prisma, 1);
   const lostCard = await createAccount(f.prisma, 2);
@@ -1231,55 +1252,12 @@ test('批量邮箱找回时，失败卡的凭据不会带上同批已成功卡',
   await markRedeemed(f.prisma, lostCard);
   await f.prisma.account.update({ where: { id: okCard.id }, data: { refreshToken: 'ok-old' } });
   await f.prisma.account.update({ where: { id: lostCard.id }, data: { refreshToken: 'lost-old' } });
-  const original = f.prisma.$transaction.bind(f.prisma);
-  let transactions = 0;
-  f.prisma.$transaction = async (fn, options) => {
-    transactions += 1;
-    if (transactions >= 2) throw new Error('database write failed');
-    return original(fn, options);
-  };
-  const service = reclaimService(f.prisma, f.mailbox, async (token) => {
-    if (token === 'ok-old') {
-      return { ok: true, credentials: { accessToken: 'ok-access-token', refreshToken: 'ok-refresh-token' } };
-    }
-    return { ok: true, credentials: { accessToken: 'lost-access-token', refreshToken: 'lost-refresh-token' } };
+  const service = reclaimService(f.prisma, f.mailbox, async () => {
+    throw new Error('不应刷新');
   });
-  const result = await service.reclaim({ cards: [okCard.cardKey, lostCard.cardKey], format: 'email' });
-  assert.equal(result.results[0].ok, true);
-  assert.equal(result.results[0].content.includes('ok-access-token'), false);
-  assert.equal(result.results[1].code, 'PERSIST_FAILED');
-  assert.match(result.results[1].content, /lost-access-token/);
-  assert.match(result.mergedContent, /lost-access-token/);
-  assert.match(result.mergedContent, /lost-refresh-token/);
-  assert.match(result.mergedContent, /account1@example.com/);
-  assert.match(result.mergedContent, /account2@example.com/);
-  assert.equal(result.mergedContent.includes('ok-access-token'), false);
-  assert.equal(result.mergedContent.includes('ok-refresh-token'), false);
-
-  f.prisma.$transaction = original;
-  const kept = await createAccount(f.prisma, 5);
-  const partial = await createAccount(f.prisma, 3);
-  const extra = await createAccount(f.prisma, 4);
-  await markRedeemed(f.prisma, kept);
-  await markRedeemed(f.prisma, partial);
-  await f.prisma.account.update({ where: { id: kept.id }, data: { refreshToken: 'kept-old' } });
-  await f.prisma.account.update({
-    where: { id: extra.id },
-    data: { redeemStatus: 'redeemed', redeemedByCard: partial.cardKey, redeemedAt: new Date('2026-01-01T00:00:00Z'), refreshToken: 'extra-old' },
-  });
-  await f.prisma.account.update({ where: { id: partial.id }, data: { refreshToken: 'partial-old' } });
-  const mixed = reclaimService(f.prisma, f.mailbox, async (token) => {
-    if (token === 'kept-old') return { ok: true, credentials: { accessToken: 'kept-access-token', refreshToken: 'kept-refresh-token' } };
-    if (token === 'partial-old') return { ok: true, credentials: { accessToken: 'partial-access-token', refreshToken: 'partial-refresh-token' } };
-    return { ok: false, error: 'second failed' };
-  });
-  const partialResult = await mixed.reclaim({ cards: [kept.cardKey, partial.cardKey], format: 'email' });
-  assert.equal(partialResult.results[0].ok, true);
-  assert.equal(partialResult.results[1].code, 'REFRESH_FAILED');
-  assert.match(partialResult.mergedContent, /partial-refresh-token/);
-  assert.match(partialResult.mergedContent, /account5@example.com/);
-  assert.equal(partialResult.mergedContent.includes('kept-access-token'), false);
-  assert.equal(partialResult.mergedContent.includes('kept-refresh-token'), false);
+  await rejectsPublicEmail(() => service.reclaim({ cards: [okCard.cardKey, lostCard.cardKey], format: 'email' }));
+  assert.equal((await f.prisma.account.findUnique({ where: { id: okCard.id } })).refreshToken, 'ok-old');
+  assert.equal((await f.prisma.account.findUnique({ where: { id: lostCard.id } })).refreshToken, 'lost-old');
 });
 
 test('后台刷新写库抛错时先暂存，下次不再用旧凭据刷新', async (t) => {
@@ -1756,4 +1734,223 @@ test('同一条长连接上连续找回不会堆积 close 监听', async () => {
   );
   assert.equal(socket.listenerCount('close'), 0);
   assert.equal(failed.listenerCount('close'), 0);
+});
+
+test('公开 meta 不含邮箱 TXT，默认 email 会改成 sub2api', async (t) => {
+  const f = await fixture(t);
+  const meta = await f.redeem.publicMeta();
+  assert.equal(meta.formats.some((item) => item.value === 'email'), false);
+  assert.equal(meta.formats.some((item) => item.value === 'login'), true);
+  const emailDefault = new RedeemService(
+    f.prisma,
+    new ConvertService(),
+    f.mailbox,
+    { getAll: async () => ({ ...DEFAULT_SETTINGS, defaultFormat: 'email' }) },
+  );
+  assert.equal((await emailDefault.publicMeta()).defaultFormat, 'sub2api');
+});
+
+test('账密兑换按实际内容输出两段或三段，不用邮箱地址和邮箱密码', async (t) => {
+  const f = await fixture(t);
+  const withFactor = await createAccount(f.prisma, 1, {
+    email: 'chatgpt-user@example.com',
+    rawJson: JSON.stringify({
+      email: 'chatgpt-user@example.com',
+      notes: { gpt: { password: 'pass with  ----  tail ' }, two_factor: { secret: 'JBSWY3DPEHPK3PXP' } },
+    }),
+  });
+  const plain = await createAccount(f.prisma, 2, {
+    email: 'plain-user@example.com',
+    rawJson: JSON.stringify({ email: 'plain-user@example.com', notes: { gpt: { password: 'only-pass' } } }),
+  });
+  const delivered = await f.redeem.redeem({ cards: [withFactor.cardKey, plain.cardKey], format: 'login' });
+  assert.equal(delivered.results[0].content, 'chatgpt-user@example.com----pass with  ----  tail ----JBSWY3DPEHPK3PXP\n');
+  assert.equal(delivered.results[1].content, 'plain-user@example.com----only-pass\n');
+  assert.equal(
+    delivered.mergedContent,
+    'chatgpt-user@example.com----pass with  ----  tail ----JBSWY3DPEHPK3PXP\nplain-user@example.com----only-pass\n',
+  );
+  assert.equal(JSON.stringify(delivered).includes('placeholder-password'), false);
+  assert.equal(JSON.stringify(delivered).includes(MS_TOKEN), false);
+  assert.equal(JSON.stringify(delivered).includes('synthetic-access-token'), false);
+});
+
+test('没有 ChatGPT 密码或只有 2FA 时不占库存', async (t) => {
+  const f = await fixture(t);
+  const missing = await createAccount(f.prisma, 1, { rawJson: JSON.stringify({ email: 'account1@example.com' }) });
+  const factorOnly = await createAccount(f.prisma, 2, {
+    rawJson: JSON.stringify({ notes: { two_factor: { secret: 'ONLY2FA' } } }),
+  });
+  assert.equal((await f.redeem.redeem({ cards: [missing.cardKey], format: 'login' })).results[0].message, '该卡密没有账密交付');
+  assert.equal((await f.redeem.redeem({ cards: [factorOnly.cardKey], format: 'login' })).results[0].message, '该卡密没有账密交付');
+  assert.equal(await f.prisma.account.count({ where: { redeemStatus: 'redeemed' } }), 0);
+});
+
+test('额度待定的账密兑换不占库存', async (t) => {
+  const f = await fixture(t);
+  const pending = await createAccount(f.prisma, 1, {
+    credits: 0,
+    rawJson: JSON.stringify({ notes: { gpt: { password: 'pending-pass' } } }),
+  });
+  const result = await f.redeem.redeem({ cards: [pending.cardKey], format: 'login' });
+  assert.equal(result.results[0].code, 'CREDITS_PENDING');
+  assert.equal((await f.prisma.account.findUnique({ where: { id: pending.id } })).redeemStatus, 'unredeemed');
+});
+
+test('首次账密兑换忽略 limit，重新导出要求每张账号都有账密', async (t) => {
+  const f = await fixture(t);
+  const primary = await createAccount(f.prisma, 1, {
+    rawJson: JSON.stringify({ notes: { gpt: { password: 'primary-pass' } } }),
+  });
+  const extra = await createAccount(f.prisma, 2);
+  const first = await f.redeem.redeem({ cards: [primary.cardKey], format: 'login', limit: 5 });
+  assert.equal(first.results[0].ok, true);
+  assert.equal(first.results[0].accountCount, 1);
+  assert.equal((await f.prisma.account.findUnique({ where: { id: extra.id } })).redeemStatus, 'unredeemed');
+  await f.prisma.account.update({
+    where: { id: extra.id },
+    data: { redeemStatus: 'redeemed', redeemedByCard: primary.cardKey, redeemedAt: new Date() },
+  });
+  const again = await f.redeem.redeem({ cards: [primary.cardKey], format: 'login' });
+  assert.equal(again.results[0].ok, false);
+  assert.equal(again.results[0].message, '该卡密没有账密交付');
+  assert.equal((await f.prisma.account.findUnique({ where: { id: primary.id } })).redeemStatus, 'redeemed');
+  assert.equal((await f.prisma.account.findUnique({ where: { id: extra.id } })).redeemStatus, 'redeemed');
+});
+
+test('账密找回不刷新，空 refresh token 也能导出', async (t) => {
+  const f = await fixture(t);
+  const account = await createAccount(f.prisma, 1, {
+    refreshToken: '',
+    rawJson: JSON.stringify({ notes: { gpt: { password: 'kept-pass' } } }),
+  });
+  await markRedeemed(f.prisma, account);
+  const service = reclaimService(f.prisma, f.mailbox, async () => {
+    throw new Error('不应刷新');
+  });
+  const result = await service.reclaim({ cards: [account.cardKey], format: 'login' });
+  assert.equal(result.results[0].content, 'account1@example.com----kept-pass\n');
+  assert.equal((await f.prisma.account.findUnique({ where: { id: account.id } })).refreshToken, '');
+});
+
+test('未传格式且默认是邮箱时按 sub2api 兑换', async (t) => {
+  const f = await fixture(t);
+  const account = await createAccount(f.prisma);
+  const service = new RedeemService(
+    f.prisma,
+    new ConvertService(),
+    f.mailbox,
+    { getAll: async () => ({ ...DEFAULT_SETTINGS, defaultFormat: 'email' }) },
+  );
+  const result = await service.redeem({ cards: [account.cardKey] });
+  assert.equal(result.results[0].ok, true);
+  assert.match(result.results[0].filename, /\.sub2api\.json$/);
+  assert.match(result.results[0].content, /synthetic-access-token/);
+});
+
+test('账密找回写完也不解除持有', async () => {
+  const { EventEmitter } = require('node:events');
+  const { PublicController } = require('../dist/public/public.controller');
+  const released = [];
+  const service = {
+    reclaim: async () => ({ format: 'login', results: [{ ok: true, card: 'CARD-LOGIN' }] }),
+    releaseDeliveredHolds: async (cards) => { released.push(...cards); },
+  };
+  const controller = new PublicController(service);
+  const response = new EventEmitter();
+  response.writableFinished = false;
+  await controller.reclaim(
+    { cards: ['CARD-LOGIN'], format: 'login' },
+    { headers: {}, ip: '127.0.0.1', socket: new EventEmitter() },
+    response,
+  );
+  response.writableFinished = true;
+  response.emit('finish');
+  assert.deepEqual(released, []);
+
+  const omitted = new EventEmitter();
+  omitted.writableFinished = false;
+  await controller.reclaim(
+    { cards: ['CARD-LOGIN'] },
+    { headers: {}, ip: '127.0.0.1', socket: new EventEmitter() },
+    omitted,
+  );
+  omitted.writableFinished = true;
+  omitted.emit('finish');
+  assert.deepEqual(released, []);
+});
+
+test('账密找回成功后仍保留文件找回留下的持有', async (t) => {
+  const f = await fixture(t);
+  const account = await createAccount(f.prisma, 1, {
+    refreshHeld: true,
+    rawJson: JSON.stringify({ notes: { gpt: { password: 'held-pass' } } }),
+  });
+  await markRedeemed(f.prisma, account);
+  const { EventEmitter } = require('node:events');
+  const { PublicController } = require('../dist/public/public.controller');
+  const controller = new PublicController(f.redeem);
+  const response = new EventEmitter();
+  response.writableFinished = false;
+  const result = await controller.reclaim(
+    { cards: [account.cardKey], format: 'login' },
+    { headers: {}, ip: '127.0.0.1', socket: new EventEmitter() },
+    response,
+  );
+  assert.equal(result.results[0].ok, true);
+  assert.equal(result.results[0].content, 'account1@example.com----held-pass\n');
+  response.writableFinished = true;
+  response.emit('finish');
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  const saved = await f.prisma.account.findUnique({ where: { id: account.id } });
+  assert.equal(saved.refreshHeld, true);
+  assert.equal(saved.refreshToken, 'synthetic-openai-refresh');
+});
+
+test('账密重导遇到停用、封禁或失效的附加账号时整卡失败', async (t) => {
+  const f = await fixture(t, { limit: 2 });
+  const cases = [
+    { index: 1, patch: { banStatus: 'banned' } },
+    { index: 2, patch: { cardDisabled: true } },
+    { index: 3, patch: { banStatus: 'invalid' } },
+  ];
+  for (const item of cases) {
+    const primary = await createAccount(f.prisma, item.index, {
+      rawJson: JSON.stringify({ notes: { gpt: { password: `primary-${item.index}` } } }),
+    });
+    const extra = await createAccount(f.prisma, item.index + 10, {
+      rawJson: JSON.stringify({ notes: { gpt: { password: `extra-${item.index}` } } }),
+    });
+    const claimed = await f.redeem.redeem({ cards: [primary.cardKey], format: 'sub2api', limit: 2 });
+    assert.equal(claimed.results[0].ok, true);
+    await f.prisma.account.update({ where: { id: extra.id }, data: item.patch });
+    const before = await f.prisma.account.findUnique({ where: { id: primary.id } });
+    const again = await f.redeem.redeem({ cards: [primary.cardKey], format: 'login' });
+    assert.equal(again.results[0].ok, false);
+    assert.equal(again.results[0].code, 'NO_STOCK');
+    assert.equal(again.results[0].content, null);
+    assert.equal(again.mergedContent, null);
+    const text = JSON.stringify(again);
+    assert.equal(text.includes(`primary-${item.index}`), false);
+    assert.equal(text.includes(`extra-${item.index}`), false);
+    const savedPrimary = await f.prisma.account.findUnique({ where: { id: primary.id } });
+    const savedExtra = await f.prisma.account.findUnique({ where: { id: extra.id } });
+    assert.equal(savedPrimary.redeemStatus, 'redeemed');
+    assert.equal(savedPrimary.redeemedByCard, primary.cardKey);
+    assert.equal(savedPrimary.redeemCount, before.redeemCount);
+    assert.equal(savedExtra.redeemedByCard, primary.cardKey);
+  }
+});
+
+test('后台账密导出跳过没有密码的账号，空结果是空文本', async (t) => {
+  const f = await fixture(t);
+  const ready = await createAccount(f.prisma, 1, {
+    rawJson: JSON.stringify({ notes: { gpt: { password: 'export-pass' } } }),
+  });
+  const skipped = await createAccount(f.prisma, 2);
+  const exported = await f.accounts.exportAccounts({ format: 'login', ids: [ready.id, skipped.id] });
+  assert.equal(exported.content, 'account1@example.com----export-pass\n');
+  assert.equal(exported.filename.endsWith('.txt'), true);
+  const empty = await f.accounts.exportAccounts({ format: 'login', ids: [skipped.id] });
+  assert.equal(empty.content, '');
 });

@@ -1,25 +1,32 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { HttpException, Injectable, Logger, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
 import { Prisma } from '@prisma/client';
 import { Client } from 'pg';
 import { PrismaService } from '../prisma/prisma.service';
 import { SettingsService } from '../settings/settings.service';
 import { bizError } from '../common/utils';
 import { generateCardKey } from '../common/utils';
+import type { ErrorCode } from '../common/error-codes';
 import { decryptSecret, encryptSecret, teamSecretReady } from './team-crypto';
 import {
   confirmedAbsent,
+  deviceIdOf,
   emailsMatch,
   countedMembers,
   emptySeats,
   inviteAllowed,
   inviteSlots,
   kickTargets,
+  mergeSession,
+  normalizeActiveUntil,
+  normalizeRemoteMembers,
   normalizeSocks,
+  parseRemoteMembers,
   sameMemberIds,
   orderMothers,
   parseTeamLines,
   resolveSocks,
   sessionAccessAndEmail,
+  stampDevice,
 } from './team-rules';
 import { workerConfigured, workerPost, type WorkerResponse } from './team-worker';
 
@@ -56,13 +63,26 @@ function jobText(error: unknown): string {
 }
 
 @Injectable()
-export class TeamService {
+export class TeamService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(TeamService.name);
+  private keepAliveTimer: ReturnType<typeof setInterval> | null = null;
 
   constructor(
     private readonly prisma: PrismaService,
     private readonly settings: SettingsService,
   ) {}
+
+  onModuleInit() {
+    this.keepAliveTimer = setInterval(() => {
+      void this.keepAlive();
+    }, 6 * 60 * 60 * 1000);
+    this.keepAliveTimer.unref?.();
+  }
+
+  onModuleDestroy() {
+    if (this.keepAliveTimer) clearInterval(this.keepAliveTimer);
+    this.keepAliveTimer = null;
+  }
 
   status() {
     return {
@@ -94,32 +114,36 @@ export class TeamService {
 
   async createWorkspace(body: { session?: string; socks?: string; workspaceId?: string }) {
     this.requireSecret();
-    const session = String(body?.session || '');
-    const parsed = this.readSession(session);
+    const rawSession = String(body?.session || '');
+    const parsed = this.readSession(rawSession);
+    const session = stampDevice(rawSession);
     const explicit = this.optionalSocks(body?.socks);
     const socks = explicit || await this.globalSocks();
     const inspected = await this.inspect(session, socks);
-    const email = inspected.email || parsed.email;
-    if (!email) bizError('BAD_INPUT', 'session 里读不出母号邮箱');
-    const chosen = this.chooseWorkspace(inspected.workspaces || [], body?.workspaceId);
-    if (chosen?.id) await this.assertRemoteWorkspaceFree(String(chosen.id));
     try {
+      if (!inspected.ok) this.failWithSession(inspected, 'UPSTREAM_ERROR', inspected.message || '母号 session 已失效，请重新贴一次');
+      const storedSession = inspected.session || session;
+      const email = inspected.email || parsed.email;
+      if (!email) this.failWithSession(inspected, 'BAD_INPUT', 'session 里读不出母号邮箱');
+      const chosen = this.chooseWorkspace(inspected.workspaces || [], body?.workspaceId);
+      if (chosen?.id) await this.assertRemoteWorkspaceFree(String(chosen.id));
       const row = await this.prisma.teamWorkspace.create({
         data: {
           motherEmail: email,
           displayName: chosen?.name || email,
           openaiWorkspaceId: chosen?.id || null,
-          sessionCipher: encryptSecret(session),
+          sessionCipher: encryptSecret(storedSession),
           sessionStatus: 'valid',
           socksCipher: explicit ? encryptSecret(explicit) : null,
           lastSuccessAt: new Date(),
           updatedAt: new Date(),
         },
       });
-      return this.workspaceView(row, false);
+      await this.refreshQuiet(row.id);
+      return this.workspaceView(await this.workspaceOrThrow(row.id), false);
     } catch (error) {
-      if (isUniqueViolation(error)) bizError('CONFLICT', '这个 ChatGPT 空间已经绑定过，不能再开一行');
-      throw error;
+      if (isUniqueViolation(error)) this.failWithSession(inspected, 'CONFLICT', '这个 ChatGPT 空间已经绑定过，不能再开一行');
+      this.rethrowWithSession(error, inspected);
     }
   }
 
@@ -127,6 +151,7 @@ export class TeamService {
     this.requireSecret();
     const current = await this.workspaceOrThrow(id);
     const data: Prisma.TeamWorkspaceUpdateInput = { updatedAt: new Date() };
+    let keptInspect: { rotated?: boolean; session?: string } | null = null;
     if (body?.session) {
       const parsed = this.readSession(body.session);
       if (parsed.email && !emailsMatch(current.motherEmail, parsed.email)) {
@@ -135,24 +160,40 @@ export class TeamService {
       const socks = body.clearSocks
         ? await this.globalSocks()
         : (this.optionalSocks(body.socks) || this.readOptional(current.socksCipher) || await this.globalSocks());
-      const inspected = await this.inspect(body.session, socks);
-      const email = inspected.email || parsed.email;
-      if (!email || !emailsMatch(current.motherEmail, email)) {
-        bizError('BAD_INPUT', '新 session 的邮箱和已绑定母号不一致');
+      const inspected = await this.inspect(stampDevice(body.session), socks);
+      keptInspect = inspected;
+      const liveEmail = String(inspected.email || '').trim();
+      const confirmed = Boolean(liveEmail) && emailsMatch(current.motherEmail, liveEmail);
+      const foreign = Boolean(liveEmail) && !confirmed;
+      if (confirmed && inspected.rotated && inspected.session) await this.persistRotated(id, inspected);
+      else if (!foreign && !inspected.ok && !inspected.rotated && (confirmed || this.samePastedSession(current.sessionCipher, body.session))) {
+        await this.markSession(id, inspected, body.session);
       }
-      const stillThere = (inspected.workspaces || []).some((item) => item.id === current.openaiWorkspaceId);
-      data.sessionCipher = encryptSecret(body.session);
-      data.sessionStatus = 'valid';
-      data.lastSuccessAt = new Date();
-      data.lastError = null;
-      if (!stillThere) {
-        const requested = String(body.workspaceId || '').trim();
-        if (!requested) bizError('BAD_INPUT', '原空间不在这份 session 里，请选择空间后再保存');
-        const chosen = this.chooseWorkspace(inspected.workspaces || [], requested);
-        data.openaiWorkspaceId = chosen.id;
-        data.displayName = chosen.name || current.displayName;
-      } else if (body.workspaceId && body.workspaceId !== current.openaiWorkspaceId) {
-        bizError('BAD_INPUT', '不能悄悄换成另一个空间');
+      try {
+        if (!inspected.ok) this.failWithSession(inspected, 'UPSTREAM_ERROR', inspected.message || '母号 session 已失效，请重新贴一次');
+        const email = inspected.email || parsed.email;
+        if (!email || !emailsMatch(current.motherEmail, email)) {
+          this.failWithSession(inspected, 'BAD_INPUT', '新 session 的邮箱和已绑定母号不一致');
+        }
+        const currentWorkspace = (inspected.workspaces || []).find((item) => item.id === current.openaiWorkspaceId);
+        const stillThere = Boolean(currentWorkspace);
+        data.sessionCipher = encryptSecret(inspected.session || stampDevice(body.session));
+        data.sessionStatus = 'valid';
+        data.lastSuccessAt = new Date();
+        if (current.lastError && /已失效/.test(current.lastError)) data.lastError = null;
+        if (!stillThere) {
+          const requested = String(body.workspaceId || '').trim();
+          if (!requested) this.failWithSession(inspected, 'BAD_INPUT', '原空间不在这份 session 里，请选择空间后再保存');
+          const chosen = this.chooseWorkspace(inspected.workspaces || [], requested);
+          data.openaiWorkspaceId = chosen.id;
+          data.displayName = chosen.name || current.displayName;
+        } else if (body.workspaceId && body.workspaceId !== current.openaiWorkspaceId) {
+          this.failWithSession(inspected, 'BAD_INPUT', '不能悄悄换成另一个空间');
+        } else if (!this.isOwnerWorkspace(currentWorkspace)) {
+          this.failWithSession(inspected, 'BAD_INPUT', '原空间已不是所有者，不能继续绑定');
+        }
+      } catch (error) {
+        this.rethrowWithSession(error, inspected);
       }
     }
     if (body?.clearSocks) data.socksCipher = null;
@@ -169,9 +210,14 @@ export class TeamService {
         const row = await tx.teamWorkspace.update({ where: { id }, data });
         return { row, detached };
       });
-      return { ...this.workspaceView(saved.row, false), detachedChildren: saved.detached };
+      await this.refreshQuiet(saved.row.id);
+      return { ...this.workspaceView(await this.workspaceOrThrow(id), false), detachedChildren: saved.detached };
     } catch (error) {
-      if (isUniqueViolation(error)) bizError('CONFLICT', '这个 ChatGPT 空间已经绑定过，不能再开一行');
+      if (isUniqueViolation(error)) {
+        if (keptInspect) this.failWithSession(keptInspect, 'CONFLICT', '这个 ChatGPT 空间已经绑定过，不能再开一行');
+        bizError('CONFLICT', '这个 ChatGPT 空间已经绑定过，不能再开一行');
+      }
+      if (keptInspect) this.rethrowWithSession(error, keptInspect);
       throw error;
     }
   }
@@ -334,6 +380,7 @@ export class TeamService {
     const onboardOnly = [];
     for (const mother of mothers) {
       if (mother.sessionStatus === 'expired') {
+        await this.markSnapshotIncomplete(mother.id);
         skipped.push({ id: mother.id, ok: false, message: EXPIRED_SESSION });
         continue;
       }
@@ -374,7 +421,10 @@ export class TeamService {
     const mother = await this.workspaceOrThrow(workspaceId);
     return this.runJob(mother.id, 'probe', async () => {
       const live = await this.workspaceOrThrow(workspaceId);
-      if (live.sessionStatus === 'expired') bizError('UPSTREAM_ERROR', EXPIRED_SESSION);
+      if (live.sessionStatus === 'expired') {
+        await this.markSnapshotIncomplete(live.id);
+        bizError('UPSTREAM_ERROR', EXPIRED_SESSION);
+      }
       const children = await this.prisma.account.findMany({
         where: { workspaceId, stockKind: 'team', teamStatus: { in: ['joined', 'file_ready'] } },
         orderBy: { id: 'asc' },
@@ -439,6 +489,7 @@ export class TeamService {
     this.requireReady();
     const mother = await this.workspaceOrThrow(workspaceId);
     const snapshot = await this.snapshot(mother);
+    if (!snapshot.ok) bizError('UPSTREAM_ERROR', snapshot.message || '空间刷新失败');
     if (!snapshot.complete) bizError('CONFLICT', '成员快照不完整，一个人都不会踢');
     const targets = kickTargets(snapshot.members, mother.motherEmail);
     const locals = await this.prisma.account.findMany({
@@ -480,26 +531,119 @@ export class TeamService {
     return job;
   }
 
+  async refresh(id: number) {
+    this.requireReady();
+    const mother = await this.workspaceOrThrow(id);
+    if (mother.sessionStatus === 'expired') {
+      await this.markSnapshotIncomplete(id);
+      bizError('UPSTREAM_ERROR', EXPIRED_SESSION);
+    }
+    return this.runJob(id, 'refresh', async () => {
+      const snapshot = await this.snapshot(mother);
+      if (!snapshot.ok) bizError('UPSTREAM_ERROR', snapshot.message || '空间刷新失败');
+      if (!snapshot.complete) {
+        await this.prisma.teamWorkspace.update({
+          where: { id },
+          data: { lastError: '成员名单不完整', updatedAt: new Date() },
+        });
+        return '成员名单不完整';
+      }
+      const count = Array.isArray(snapshot.members) ? snapshot.members.length : 0;
+      return `已刷新空间，成员 ${count} 人`;
+    });
+  }
+
+  async kickSelected(workspaceId: number, confirm: string, userIds: string[] = []) {
+    this.requireReady();
+    if (confirm !== '踢出选中') bizError('BAD_INPUT', '请输入「踢出选中」');
+    const requested = [...new Set((userIds || []).map((item) => String(item || '').trim()).filter(Boolean))];
+    if (!requested.length) bizError('BAD_INPUT', '请先选择要踢出的成员');
+    return this.runJob(workspaceId, 'kick-selected', async () => {
+      const mother = await this.workspaceOrThrow(workspaceId);
+      const before = await this.snapshot(mother);
+      if (!before.ok) bizError('UPSTREAM_ERROR', before.message || '空间刷新失败');
+      if (!before.complete) bizError('CONFLICT', '成员快照不完整，一个人都不会踢');
+      const members = before.members || [];
+      const motherEmail = String(mother.motherEmail || '').toLowerCase();
+      const absentSkips: string[] = [];
+      const otherSkips: string[] = [];
+      const allowed: string[] = [];
+      for (const id of requested) {
+        const member = members.find((item) => item.id === id);
+        if (!member) {
+          absentSkips.push(`${id}：已不在名单里，没有踢`);
+          continue;
+        }
+        if (member.role !== 'standard-user' || (member.email && member.email.toLowerCase() === motherEmail)) {
+          otherSkips.push(`${member.email || id}：是所有者或母号，没有踢`);
+          continue;
+        }
+        allowed.push(id);
+      }
+      if (!allowed.length && !absentSkips.length) return ['没有可踢出的成员', ...otherSkips].join('\n');
+      const outcome = await this.kickUsers(workspaceId, allowed, false);
+      const removed = new Set(outcome.removed);
+      const stillAbsent = absentSkips.filter((line) => !removed.has(line.slice(0, line.indexOf('：'))));
+      const head = !allowed.length && !outcome.removed.length ? '没有可踢出的成员' : outcome.message;
+      return [head, ...otherSkips, ...stillAbsent].filter(Boolean).join('\n');
+    });
+  }
+
+  async listRemoteMembers() {
+    const rows = await this.prisma.teamWorkspace.findMany({ orderBy: { id: 'asc' } });
+    const locals = await this.prisma.account.findMany({
+      where: { stockKind: 'team', teamStatus: { not: 'kicked' } },
+      select: { email: true, cardKey: true, redeemStatus: true, userId: true, workspaceId: true },
+    });
+    const items = rows.flatMap((row) => parseRemoteMembers(row.remoteMembersJson).map((member) => {
+      const local = locals.find((item) => item.workspaceId === row.id && (
+        (item.userId && item.userId === member.id)
+        || (item.email && member.email && item.email.toLowerCase() === member.email.toLowerCase())
+      ));
+      return {
+        key: `${row.id}:${member.id}`,
+        workspaceRowId: row.id,
+        workspaceName: row.displayName || row.motherEmail,
+        motherEmail: row.motherEmail,
+        snapshotComplete: row.snapshotComplete,
+        id: member.id,
+        email: member.email,
+        role: member.role,
+        cardKey: local?.cardKey || '',
+        redeemStatus: local?.redeemStatus || '',
+        local: Boolean(local),
+      };
+    }));
+    return { items };
+  }
+
   async revokeInvites(workspaceId: number) {
     this.requireReady();
     const mother = await this.workspaceOrThrow(workspaceId);
     return this.runJob(workspaceId, 'revoke', async () => {
       const proxy = await this.proxyFor(null, mother.id);
       const snapshot = await this.snapshot(mother);
+      if (!snapshot.ok) bizError('UPSTREAM_ERROR', snapshot.message || '空间刷新失败');
       const emails = (snapshot.invites || []).map((item) => item.email).filter(Boolean);
       let cleared = 0;
       let failed = 0;
       const lines: string[] = [];
       for (const email of emails) {
+        const session = await this.ensureDevice(mother.id, decryptSecret((await this.workspaceOrThrow(mother.id)).sessionCipher));
         const result = await workerPost('internal/team/revoke', {
-          session: decryptSecret(mother.sessionCipher),
+          ...this.sessionFields(session),
           workspaceId: mother.openaiWorkspaceId,
           email,
           proxy,
         });
+        await this.persistSession(mother.id, session, result);
         if (!result.ok) {
+          await this.markSession(mother.id, result, session);
           failed += 1;
-          lines.push(`${email}：撤回被拒绝`);
+          const expired = result.code === 'SESSION_EXPIRED' || /session 已失效/.test(result.message || '');
+          const kept = this.rotatedSession(session, result.sessionUpdate);
+          lines.push(expired && !kept ? `${email}：母号 session 已失效，请重新贴一次` : `${email}：撤回被拒绝`);
+          if (expired && !kept) break;
           continue;
         }
         await this.prisma.account.updateMany({
@@ -535,6 +679,11 @@ export class TeamService {
         if (pending.length) bizError('UPSTREAM_ERROR', withPending(held));
         return held;
       }
+      if (!snapshot.ok) {
+        const reason = snapshot.message || '空间刷新失败';
+        if (pending.length) bizError('UPSTREAM_ERROR', withPending(reason));
+        bizError('UPSTREAM_ERROR', reason);
+      }
       if (!snapshot.complete) {
         if (pending.length) bizError('UPSTREAM_ERROR', withPending('成员快照不完整，没有发送邀请'));
         return '成员快照不完整，没有发送邀请';
@@ -562,13 +711,15 @@ export class TeamService {
         }
         let settled = false;
         try {
+          const session = await this.ensureDevice(mother.id, decryptSecret((await this.workspaceOrThrow(mother.id)).sessionCipher));
           const invited = await workerPost('internal/team/invite', {
-            session: decryptSecret(mother.sessionCipher),
+            ...this.sessionFields(session),
             workspaceId: mother.openaiWorkspaceId,
             emails: claimed.map((item) => item.email).filter((item): item is string => Boolean(item)),
             proxy,
           });
-          await this.markSession(mother.id, invited);
+          await this.persistSession(mother.id, session, invited);
+          await this.markSession(mother.id, invited, session);
           const successes = await this.persistInvite(mother.id, claimed, invited);
           const inviteSent = invited.inviteSent === true;
           const inviteHold = invited.stopped ? 'stopped' : invited.seatFull ? 'seat_full' : null;
@@ -679,11 +830,12 @@ export class TeamService {
   private async kickUsers(workspaceId: number, userIds: string[], exact = false) {
     const mother = await this.workspaceOrThrow(workspaceId);
     const before = await this.snapshot(mother);
+    if (!before.ok) bizError('UPSTREAM_ERROR', before.message || '空间刷新失败');
     if (!before.complete) bizError('CONFLICT', '成员快照不完整，一个人都不会踢');
     const members = before.members || [];
-    const repaired = await this.wipeConfirmedMissing(mother, members.map((item) => item.id));
     const liveIds = kickTargets(members, mother.motherEmail).map((item) => item.id);
     if (exact && !sameMemberIds(userIds, liveIds)) bizError('CONFLICT', '要退出的成员和当前空间不一致，一个人都不会踢');
+    const repaired = await this.wipeConfirmedMissing(mother, members.map((item) => item.id));
     const safeTargets = userIds.filter((id) => liveIds.includes(id));
     const limited = new Set<string>();
     for (const userId of safeTargets) {
@@ -691,9 +843,10 @@ export class TeamService {
       const child = await this.localChild(workspaceId, userId, member?.email);
       const secret = child ? await this.prisma.teamSecret.findUnique({ where: { accountId: child.id } }) : null;
       const proxy = await this.proxyFor(child?.id ?? null, mother.id);
+      const session = await this.ensureDevice(mother.id, decryptSecret((await this.workspaceOrThrow(mother.id)).sessionCipher));
       const kicked = await workerPost('internal/team/kick', {
         accessToken: this.childAccess(secret?.tokenCipher) || '',
-        session: decryptSecret(mother.sessionCipher),
+        ...this.sessionFields(session),
         password: secret ? decryptSecret(secret.passwordCipher) : '',
         totp: secret ? decryptSecret(secret.totpCipher) : '',
         email: child?.email || member?.email || '',
@@ -701,6 +854,7 @@ export class TeamService {
         userId,
         proxy,
       });
+      await this.persistSession(mother.id, session, kicked);
       if (kicked.rateLimited || /可能被限流/.test(kicked.message || '')) limited.add(userId);
     }
     if (!safeTargets.length) {
@@ -709,9 +863,16 @@ export class TeamService {
       return { removed, message: [`已确认退出 ${removed.length} 人`, ...lines].filter(Boolean).join('\n') };
     }
     const after = await this.snapshot(mother);
+    if (!after.ok) {
+      const extra = repaired.length ? `已删除 ${repaired.length} 个已不在名单里的资料；` : '';
+      bizError('UPSTREAM_ERROR', `${extra}${after.message || '空间刷新失败'}`);
+    }
     if (!after.complete) {
       const extra = repaired.length ? `已删除 ${repaired.length} 个已不在名单里的资料；` : '';
-      bizError('CONFLICT', `${extra}复核快照不完整，没有删除任何账密或文件`);
+      const tail = repaired.length
+        ? '复核快照不完整，这次要踢的人没有删除账密或文件'
+        : '复核快照不完整，没有删除任何账密或文件';
+      bizError('CONFLICT', `${extra}${tail}`);
     }
     const removedNow = confirmedAbsent(members.map((item) => item.id), (after.members || []).map((item) => item.id), safeTargets);
     const removed = [...repaired.map((item) => item.userId), ...removedNow];
@@ -822,49 +983,147 @@ export class TeamService {
     return seatsIncreased || membersDecreased;
   }
 
-  private async snapshot(mother: { id: number; sessionCipher: string; openaiWorkspaceId: string | null; motherEmail?: string | null }) {
+  private async snapshot(mother: { id: number }) {
     const live = await this.workspaceOrThrow(mother.id);
-    if (live.sessionStatus === 'expired') bizError('UPSTREAM_ERROR', EXPIRED_SESSION);
+    if (live.sessionStatus === 'expired') {
+      await this.markSnapshotIncomplete(live.id);
+      bizError('UPSTREAM_ERROR', EXPIRED_SESSION);
+    }
     const proxy = await this.proxyFor(null, mother.id);
-    const result = await workerPost('internal/team/snapshot', {
-      session: decryptSecret(mother.sessionCipher),
-      workspaceId: mother.openaiWorkspaceId,
-      proxy,
-    });
-    await this.markSession(mother.id, result);
-    const members = result.members || [];
-    const complete = Boolean(result.ok && result.complete);
-    const memberCount = complete ? countedMembers(members, mother.motherEmail) : null;
-    const openSeats = emptySeats(result.seatsEntitled ?? null, memberCount, complete);
-    await this.prisma.teamWorkspace.update({
-      where: { id: mother.id },
-      data: {
-        snapshotComplete: complete,
-        snapshotAt: new Date(),
-        seatsEntitled: result.seatsEntitled ?? null,
-        memberCount,
-        willRenew: result.willRenew ?? null,
-        activeUntil: result.activeUntil ?? null,
-        ...(this.seatHoldReleased(live, result.seatsEntitled ?? null, memberCount, openSeats, complete) ? { inviteHold: null } : {}),
-        updatedAt: new Date(),
-      },
-    });
-    return { ...result, complete, members };
+    const session = await this.ensureDevice(live.id, decryptSecret(live.sessionCipher));
+    let result: WorkerResponse;
+    try {
+      result = await workerPost('internal/team/snapshot', {
+        ...this.sessionFields(session),
+        workspaceId: live.openaiWorkspaceId,
+        proxy,
+      });
+    } catch (error) {
+      this.logger.warn(`母号空间快照失败 id=${live.id} ${error instanceof Error ? error.name : 'error'}`);
+      result = { ok: false, code: 'UPSTREAM_ERROR', message: '协议服务调用失败' };
+    }
+    const keptRotation = this.rotatedSession(session, result.sessionUpdate)
+      && (result.code === 'SESSION_EXPIRED' || /session 已失效/.test(result.message || ''));
+    await this.persistSession(live.id, session, result);
+    const complete = Boolean(result.complete);
+    await this.markSession(live.id, result, session, result.ok ? complete : undefined);
+    if (!result.ok) {
+      await this.noteFailure(live.id, result);
+      await this.markSnapshotIncomplete(live.id);
+      return {
+        ...result,
+        complete: false,
+        members: parseRemoteMembers(live.remoteMembersJson),
+        ...(keptRotation ? { message: '这次调用失败，已保留换过的 session，下次会再用' } : {}),
+      };
+    }
+    const members = normalizeRemoteMembers(result.members);
+    const subscriptionMissing = result.subscriptionRead === false;
+    const expiry = subscriptionMissing ? (live.activeUntil ?? null) : normalizeActiveUntil(result.activeUntil);
+    const memberCount = complete ? countedMembers(members, live.motherEmail) : null;
+    const seats = subscriptionMissing
+      ? (typeof live.seatsEntitled === 'number' ? live.seatsEntitled : null)
+      : (result.seatsEntitled ?? null);
+    const willRenew = subscriptionMissing ? (live.willRenew ?? null) : (result.willRenew ?? null);
+    const openSeats = emptySeats(seats, memberCount, complete);
+    const data: Prisma.TeamWorkspaceUpdateInput = {
+      snapshotComplete: complete,
+      snapshotAt: new Date(),
+      updatedAt: new Date(),
+    };
+    if (complete) {
+      data.remoteMembersJson = JSON.stringify(members);
+      data.memberCount = memberCount;
+      data.seatsEntitled = seats;
+      data.activeUntil = expiry;
+      data.willRenew = willRenew;
+      if (this.seatHoldReleased(live, seats, memberCount, openSeats, complete)) data.inviteHold = null;
+    } else if (!subscriptionMissing) {
+      data.memberCount = null;
+      if (typeof result.seatsEntitled === 'number') data.seatsEntitled = result.seatsEntitled;
+      if (expiry) data.activeUntil = expiry;
+      if (result.willRenew != null) data.willRenew = result.willRenew;
+    } else {
+      data.memberCount = null;
+    }
+    await this.prisma.teamWorkspace.update({ where: { id: live.id }, data });
+    return {
+      ...result,
+      complete,
+      seatsEntitled: seats,
+      activeUntil: expiry,
+      willRenew,
+      members: complete ? members : parseRemoteMembers(live.remoteMembersJson),
+    };
   }
 
   private async inspect(session: string, socks: string) {
     if (!workerConfigured()) bizError('UPSTREAM_ERROR', '协议服务未配置，不能检查母号 session', 503);
     if (!socks) bizError('BAD_INPUT', '没有可用的 SOCKS 代理');
-    const result = await workerPost('internal/session/inspect', { session, proxy: socks });
-    if (!result.ok) bizError('UPSTREAM_ERROR', result.message || '母号 session 已失效，请重新贴一次');
-    return result;
+    const stamped = stampDevice(session);
+    const result = await workerPost('internal/session/inspect', { ...this.sessionFields(stamped), proxy: socks });
+    const merged = mergeSession(stamped, result.sessionUpdate);
+    return { ...result, session: merged || stamped, rotated: this.rotatedSession(stamped, result.sessionUpdate) };
+  }
+
+  private failWithSession(
+    inspected: { rotated?: boolean; session?: string },
+    code: ErrorCode,
+    message: string,
+    status = 400,
+    details?: Record<string, unknown>,
+  ): never {
+    const extra = inspected.rotated && inspected.session
+      ? { ...(details || {}), session: inspected.session }
+      : details;
+    bizError(code, message, status, extra);
+  }
+
+  private rethrowWithSession(error: unknown, inspected: { rotated?: boolean; session?: string }): never {
+    if (!inspected.rotated || !inspected.session || !(error instanceof HttpException)) throw error;
+    const body = error.getResponse();
+    if (!body || typeof body !== 'object') throw error;
+    const record = body as { code?: ErrorCode; message?: string; statusCode?: number; details?: Record<string, unknown> };
+    this.failWithSession(
+      inspected,
+      record.code || 'BAD_INPUT',
+      record.message || '保存失败',
+      record.statusCode || error.getStatus(),
+      record.details,
+    );
+  }
+
+  private async persistRotated(id: number, inspected: { session: string; ok?: boolean }) {
+    const data: Prisma.TeamWorkspaceUpdateInput = {
+      sessionCipher: encryptSecret(inspected.session),
+      updatedAt: new Date(),
+    };
+    if (!inspected.ok) {
+      data.sessionStatus = 'valid';
+      data.lastError = '这次调用失败，已保留换过的 session，下次会再用';
+    }
+    try {
+      await this.prisma.teamWorkspace.update({ where: { id }, data });
+    } catch (error) {
+      this.logger.warn(`母号会话回写失败 id=${id} ${error instanceof Error ? error.name : 'error'}`);
+    }
+  }
+
+  private isOwnerWorkspace(item?: { id?: string; role?: string; planType?: string; deactivated?: boolean } | null): boolean {
+    return Boolean(item?.id)
+      && !item?.deactivated
+      && String(item?.planType || '').toLowerCase().includes('team')
+      && String(item?.role || '').trim().toLowerCase() === 'account-owner';
   }
 
   private chooseWorkspace(items: NonNullable<WorkerResponse['workspaces']>, requested?: string) {
-    const usable = items.filter((item) => item.id && !item.deactivated && String(item.planType || '').toLowerCase().includes('team'));
+    const usable = items.filter((item) => this.isOwnerWorkspace(item));
     if (requested) {
-      const found = usable.find((item) => item.id === requested) || items.find((item) => item.id === requested);
+      const found = items.find((item) => item.id === requested);
       if (!found) bizError('BAD_INPUT', '选择的空间不在这份 session 里');
+      if (found.deactivated) bizError('BAD_INPUT', '选择的空间已停用，不能绑定');
+      if (!String(found.planType || '').toLowerCase().includes('team')) bizError('BAD_INPUT', '选择的空间不是 Team，不能绑定');
+      if (String(found.role || '').trim().toLowerCase() !== 'account-owner') bizError('BAD_INPUT', '选择的空间不是所有者，不能绑定');
       return found;
     }
     if (usable.length === 1) return usable[0];
@@ -878,7 +1137,8 @@ export class TeamService {
         })),
       });
     }
-    bizError('BAD_INPUT', '这份 session 里没有可用的 Team 空间');
+    const hasTeam = items.some((item) => item.id && !item.deactivated && String(item.planType || '').toLowerCase().includes('team'));
+    bizError('BAD_INPUT', hasTeam ? '这份 session 不是空间所有者，不能绑定' : '这份 session 里没有可用的 Team 空间');
   }
 
   private async localChild(workspaceId: number, userId: string, email?: string) {
@@ -1030,18 +1290,176 @@ export class TeamService {
     }
   }
 
-  private async markSession(id: number, result: WorkerResponse) {
-    if (result.code === 'SESSION_EXPIRED' || /session 已失效/.test(result.message || '')) {
+  private sessionFields(session: string) {
+    return { session, deviceId: deviceIdOf(session) };
+  }
+
+  private async ensureDevice(id: number, plain: string): Promise<string> {
+    if (deviceIdOf(plain)) return plain;
+    let stamped = plain;
+    try {
+      stamped = stampDevice(plain);
+    } catch {
+      return plain;
+    }
+    if (!deviceIdOf(stamped)) return plain;
+    try {
       await this.prisma.teamWorkspace.update({
         where: { id },
-        data: { sessionStatus: 'expired', lastError: '母号 session 已失效，请重新贴一次', updatedAt: new Date() },
+        data: { sessionCipher: encryptSecret(stamped), updatedAt: new Date() },
+      });
+    } catch (error) {
+      this.logger.warn(`母号设备号回写失败 id=${id} ${error instanceof Error ? error.name : 'error'}`);
+      return plain;
+    }
+    return stamped;
+  }
+
+  private samePastedSession(cipher: string, paste: string): boolean {
+    try {
+      const stored = JSON.parse(decryptSecret(cipher)) as Record<string, unknown>;
+      const pasted = JSON.parse(paste) as Record<string, unknown>;
+      const storedSession = String(stored.sessionToken || stored.session_token || '').trim();
+      const pastedSession = String(pasted.sessionToken || pasted.session_token || '').trim();
+      if (storedSession || pastedSession) return Boolean(storedSession) && storedSession === pastedSession;
+      const storedAccess = String(stored.accessToken || stored.access_token || '').trim();
+      const pastedAccess = String(pasted.accessToken || pasted.access_token || '').trim();
+      return Boolean(storedAccess) && storedAccess === pastedAccess;
+    } catch {
+      return false;
+    }
+  }
+
+  private rotatedSession(plain: string, update?: WorkerResponse['sessionUpdate']): boolean {
+    if (!plain || !update) return false;
+    let parsed: { accessToken?: string; sessionToken?: string; session_token?: string } = {};
+    try {
+      parsed = JSON.parse(plain) as { accessToken?: string; sessionToken?: string; session_token?: string };
+    } catch {
+      return false;
+    }
+    const nextToken = String(update.sessionToken || '').trim();
+    const prevToken = String(parsed.sessionToken || parsed.session_token || '').trim();
+    return Boolean(nextToken && nextToken !== prevToken);
+  }
+
+  private async persistSession(id: number, plain: string, result: WorkerResponse) {
+    const merged = mergeSession(plain, result.sessionUpdate);
+    if (!merged) return;
+    try {
+      await this.prisma.teamWorkspace.update({
+        where: { id },
+        data: { sessionCipher: encryptSecret(merged), updatedAt: new Date() },
+      });
+    } catch (error) {
+      this.logger.warn(`母号会话回写失败 id=${id} ${error instanceof Error ? error.name : 'error'}`);
+    }
+  }
+
+  private async noteFailure(id: number, result: WorkerResponse) {
+    if (result.ok) return;
+    const expired = result.code === 'SESSION_EXPIRED' || /session 已失效/.test(result.message || '');
+    if (expired) return;
+    await this.prisma.teamWorkspace.update({
+      where: { id },
+      data: { lastError: result.message || '空间刷新失败', updatedAt: new Date() },
+    });
+  }
+
+  private async refreshQuiet(id: number) {
+    try {
+      await this.refresh(id);
+    } catch (error) {
+      this.logger.warn(`母号空间刷新失败 id=${id} ${error instanceof Error ? error.name : 'error'}`);
+    }
+  }
+
+  private async keepAlive() {
+    const rows = await this.prisma.teamWorkspace.findMany({
+      where: { sessionStatus: { not: 'expired' } },
+      select: { id: true, sessionCipher: true, socksCipher: true, openaiWorkspaceId: true },
+    });
+    for (const row of rows) {
+      if (!this.canAutoRenew(row.sessionCipher)) continue;
+      if (!row.socksCipher && !await this.globalSocks()) continue;
+      const release = await this.tryWorkspaceLock(row.id, row.openaiWorkspaceId);
+      if (!release) continue;
+      try {
+        await this.snapshot(row);
+      } catch (error) {
+        this.logger.warn(`母号保活失败 id=${row.id} ${error instanceof Error ? error.name : 'error'}`);
+      } finally {
+        await release();
+      }
+    }
+  }
+
+  private async tryWorkspaceLock(id: number, remoteId: string | null): Promise<(() => Promise<void>) | null> {
+    const schemaRows = await this.prisma.$queryRaw<Array<{ schema: string }>>`SELECT current_schema() AS schema`;
+    const schema = schemaRows[0]?.schema;
+    if (!schema) return null;
+    const client = new Client({ connectionString: pgConnectionString(process.env.DATABASE_URL || '') });
+    const lockKey = remoteId ? `ws:${remoteId}` : `row:${id}`;
+    let locked = false;
+    try {
+      await client.connect();
+      await client.query(`SET search_path TO ${quoteIdent(schema)}`);
+      const lockedRow = await client.query<{ locked: boolean }>('SELECT pg_try_advisory_lock(hashtext(current_schema()), hashtext($1)) AS locked', [lockKey]);
+      locked = Boolean(lockedRow.rows[0]?.locked);
+      if (!locked) {
+        await client.end().catch(() => undefined);
+        return null;
+      }
+      return async () => {
+        await client.query('SELECT pg_advisory_unlock(hashtext(current_schema()), hashtext($1))', [lockKey]).catch(() => undefined);
+        await client.end().catch(() => undefined);
+      };
+    } catch (error) {
+      if (locked) {
+        await client.query('SELECT pg_advisory_unlock(hashtext(current_schema()), hashtext($1))', [lockKey]).catch(() => undefined);
+      }
+      await client.end().catch(() => undefined);
+      this.logger.warn(`母号保活锁失败 id=${id} ${error instanceof Error ? error.name : 'error'}`);
+      return null;
+    }
+  }
+
+  private async markSnapshotIncomplete(id: number) {
+    await this.prisma.teamWorkspace.update({
+      where: { id },
+      data: { snapshotComplete: false, updatedAt: new Date() },
+    });
+  }
+
+  private async markSession(id: number, result: WorkerResponse, plain = '', rosterComplete?: boolean) {
+    if (result.code === 'SESSION_EXPIRED' || /session 已失效/.test(result.message || '')) {
+      if (this.rotatedSession(plain, result.sessionUpdate)) {
+        await this.prisma.teamWorkspace.update({
+          where: { id },
+          data: { lastError: '这次调用失败，已保留换过的 session，下次会再用', updatedAt: new Date() },
+        });
+        return;
+      }
+      await this.prisma.teamWorkspace.update({
+        where: { id },
+        data: {
+          sessionStatus: 'expired',
+          lastError: '母号 session 已失效，请重新贴一次',
+          snapshotComplete: false,
+          updatedAt: new Date(),
+        },
       });
       return;
     }
     if (result.ok) {
       await this.prisma.teamWorkspace.update({
         where: { id },
-        data: { sessionStatus: 'valid', lastSuccessAt: new Date(), lastError: null, updatedAt: new Date() },
+        data: {
+          sessionStatus: 'valid',
+          lastSuccessAt: new Date(),
+          lastError: rosterComplete === false ? '成员名单不完整' : null,
+          updatedAt: new Date(),
+        },
       });
     }
   }

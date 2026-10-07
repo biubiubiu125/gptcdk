@@ -4,8 +4,8 @@ import { Input } from 'antd';
 
 import { downloadBlob, downloadText, errorMessage, getPublicMeta, reclaimCards } from '../api/client';
 import {
-  DELIVER_FORMAT_OPTIONS,
   isZipDeliverFormat,
+  publicDeliverFormats,
   selectDeliverFormat,
   type DeliverFormat,
   type PublicMeta,
@@ -49,18 +49,7 @@ export default function ReclaimPage() {
   }, []);
 
   const cards = useMemo(() => parseCards(text), [text]);
-  const formatOptions = useMemo(() => {
-    const formats = meta?.formats ?? [];
-    if (formats.length > 0) {
-      return formats.map((item) => ({
-        value: item.value,
-        label: item.label,
-        ext: item.ext,
-        bundle: item.bundle,
-      }));
-    }
-    return DELIVER_FORMAT_OPTIONS;
-  }, [meta]);
+  const formatOptions = useMemo(() => publicDeliverFormats(meta?.formats), [meta]);
 
   const results: RedeemResult[] = response?.results ?? [];
   const isZipBatch = isZipDeliverFormat(response?.format, formatOptions);
@@ -110,7 +99,7 @@ export default function ReclaimPage() {
             <div className="eyebrow">CREDENTIAL RECLAIM</div>
             <h1 className="redeem-title">401 找回</h1>
             <p className="redeem-lead">
-              只填写已经兑换过的卡密。服务端会刷新原账号凭据并按所选格式重新交付。未兑换的卡密不能在这里找回，原来的交付文件仍在卡密兑换页下载。
+              只填写已经兑换过的卡密。文件格式会刷新原账号后重新交付；账密只导出已保存的账号和密码，不刷新。未兑换的卡密不能在这里找回。
             </p>
             <p className="footnote">
               <span className="footnote__mark">+</span>
@@ -123,7 +112,7 @@ export default function ReclaimPage() {
               <span className="console__eyebrow">RECLAIM</span>
               <span className="console__pill">仅卡密</span>
             </div>
-            <h2 className="console__title">刷新并下载</h2>
+            <h2 className="console__title">{format === 'login' ? '导出并下载' : '刷新并下载'}</h2>
             <p className="console__subtitle">一次最多 {MAX_CARDS} 张。成功与失败分开显示。</p>
             <label className="console__label" htmlFor="gptcdk-reclaim-cards">卡密列表</label>
             <TextArea

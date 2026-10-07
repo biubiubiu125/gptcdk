@@ -10,6 +10,7 @@ process.env.PROTOCOL_WORKER_TOKEN = 'team-test-token';
 const { PrismaClient } = require('@prisma/client');
 const { initializeSchema } = require('../dist/prisma/initialize-schema');
 const { RedeemService } = require('../dist/public/public.service');
+const { AccountsService } = require('../dist/accounts/accounts.service');
 const { ConvertService } = require('../dist/convert/convert.service');
 const { MailboxService } = require('../dist/mailbox/mailbox.service');
 const { MailAnalyzerService } = require('../dist/mailbox/mail-analyzer.service');
@@ -37,6 +38,11 @@ function errorText(error) {
   const body = typeof error.getResponse === 'function' ? error.getResponse() : null;
   if (body && typeof body === 'object') return String(body.message || '');
   return String(error.message || error);
+}
+
+function errorDetails(error) {
+  const body = typeof error.getResponse === 'function' ? error.getResponse() : null;
+  return body && typeof body === 'object' ? body.details : undefined;
 }
 
 function sessionFor(email) {
@@ -204,7 +210,7 @@ test('普通额度 0 仍待定，Team 额度 0 可下账密，文件未生成时
   await prisma.account.create({
     data: { name: '普通', credits: 0, cardKey: 'CARD-STD0', accessToken: 'std', stockKind: 'standard', updatedAt: new Date() },
   });
-  const pending = await redeem.redeem({ cards: ['CARD-STD0'], format: 'email' });
+  const pending = await redeem.redeem({ cards: ['CARD-STD0'], format: 'sub2api' });
   assert.equal(pending.results[0].code, 'CREDITS_PENDING');
   const imported = await team.importChildren('kid@example.com----chatgpt-pass----JBSWY3DPEHPK3PXP');
   const card = imported.created[0].cardKey;
@@ -213,13 +219,57 @@ test('普通额度 0 仍待定，Team 额度 0 可下账密，文件未生成时
   const afterFile = await prisma.account.findUnique({ where: { cardKey: card } });
   assert.equal(afterFile.redeemStatus, 'unredeemed');
   assert.equal(afterFile.redeemedByCard, null);
-  const email = await redeem.redeem({ cards: [card], format: 'email' });
-  assert.match(email.results[0].message, /没有邮箱取件凭据/);
+  await assert.rejects(
+    () => redeem.redeem({ cards: [card], format: 'email' }),
+    (error) => /不支持邮箱 TXT/.test(errorText(error)),
+  );
   const afterEmail = await prisma.account.findUnique({ where: { cardKey: card } });
   assert.equal(afterEmail.redeemStatus, 'unredeemed');
   const login = await redeem.redeem({ cards: [card], format: 'login' });
   assert.equal(login.results[0].ok, true);
-  assert.match(login.results[0].content, /chatgpt-pass/);
+  assert.equal(login.results[0].content, 'kid@example.com----chatgpt-pass----JBSWY3DPEHPK3PXP\n');
+  assert.equal(login.mergedContent, login.results[0].content);
+});
+
+test('封禁或失效的 Team 卡找回不输出账密和文件', async (t) => {
+  const { prisma, team, redeem } = await fixture(t);
+  const imported = await team.importChildren('banned-team@example.com----chatgpt-pass----JBSWY3DPEHPK3PXP');
+  const card = imported.created[0].cardKey;
+  const first = await redeem.redeem({ cards: [card], format: 'login' });
+  assert.equal(first.results[0].ok, true);
+
+  await prisma.account.update({ where: { cardKey: card }, data: { banStatus: 'banned' } });
+  const again = await redeem.redeem({ cards: [card], format: 'login' });
+  assert.equal(again.results[0].ok, false);
+  assert.equal(again.results[0].code, 'NO_STOCK');
+  assert.equal(JSON.stringify(again).includes('chatgpt-pass'), false);
+
+  const banned = await redeem.reclaim({ cards: [card], format: 'login' });
+  assert.equal(banned.results[0].ok, false);
+  assert.equal(banned.results[0].code, 'NO_STOCK');
+  assert.equal(banned.results[0].message, '交付账号已封禁或凭据失效，请联系管理员');
+  assert.equal(JSON.stringify(banned).includes('chatgpt-pass'), false);
+
+  await prisma.account.update({ where: { cardKey: card }, data: { banStatus: 'invalid' } });
+  const invalid = await redeem.reclaim({ cards: [card], format: 'login' });
+  assert.equal(invalid.results[0].ok, false);
+  assert.equal(invalid.results[0].code, 'NO_STOCK');
+  assert.equal(JSON.stringify(invalid).includes('chatgpt-pass'), false);
+
+  await prisma.account.update({
+    where: { cardKey: card },
+    data: {
+      banStatus: 'banned',
+      teamStatus: 'file_ready',
+      accessToken: 'child-at',
+      rawJson: JSON.stringify({ access_token: 'child-at' }),
+    },
+  });
+  const file = await redeem.reclaim({ cards: [card], format: 'sub2api' });
+  assert.equal(file.results[0].ok, false);
+  assert.equal(file.results[0].code, 'NO_STOCK');
+  assert.equal(JSON.stringify(file).includes('child-at'), false);
+  assert.equal(JSON.stringify(file).includes('chatgpt-pass'), false);
 });
 
 test('公开文件兑换不含密码、2FA 和 session', async (t) => {
@@ -455,9 +505,12 @@ test('上车文件写入空间账号编号，邮箱格式不能合成取件行',
   assert.equal(file.results[0].ok, true);
   assert.match(file.results[0].content, /ws-team/);
   assert.equal(JSON.stringify(file).includes('should-not-save'), false);
-  const email = await redeem.redeem({ cards: [card], format: 'email' });
-  assert.equal(email.results[0].ok, false);
-  assert.match(email.results[0].message, /没有邮箱取件凭据/);
+  await assert.rejects(
+    () => redeem.redeem({ cards: [card], format: 'email' }),
+    (error) => /不支持邮箱 TXT/.test(errorText(error)),
+  );
+  const afterEmail = await prisma.account.findUnique({ where: { cardKey: card } });
+  assert.equal(afterEmail.redeemStatus, 'redeemed');
 });
 
 test('踢人优先用子号代理，并在没有本地编号时按邮箱清掉账密', async (t) => {
@@ -941,6 +994,30 @@ test('密钥缺失时公开兑换返回停用说明，不泄露内部异常', as
   } finally {
     process.env.GPTCDK_SECRET = previous;
   }
+});
+
+test('后台账密导出读取 Team 密文，不回退备注', async (t) => {
+  const { prisma, team } = await fixture(t);
+  const settings = { getAll: async () => ({ ...DEFAULT_SETTINGS }) };
+  const accounts = new AccountsService(
+    prisma,
+    new ConvertService(),
+    new MailboxService(new MailAnalyzerService()),
+    settings,
+  );
+  const imported = await team.importChildren('kid@example.com----chatgpt-pass----JBSWY3DPEHPK3PXP');
+  const child = await prisma.account.findUnique({ where: { cardKey: imported.created[0].cardKey } });
+  const kicked = await prisma.account.create({
+    data: {
+      name: 'kicked', email: 'kicked@example.com', credits: 0, cardKey: 'CARD-KICKED', accessToken: '',
+      stockKind: 'team', teamStatus: 'kicked', updatedAt: new Date(),
+      rawJson: JSON.stringify({ notes: { gpt: { password: 'should-not-export' } } }),
+    },
+  });
+  const exported = await accounts.exportAccounts({ format: 'login', ids: [child.id, kicked.id] });
+  assert.equal(exported.content, 'kid@example.com----chatgpt-pass----JBSWY3DPEHPK3PXP\n');
+  assert.equal(exported.content.includes('should-not-export'), false);
+  assert.equal(exported.filename.endsWith('.txt'), true);
 });
 
 test('并发导入同一邮箱只留一张未踢出的卡', async (t) => {
@@ -1534,4 +1611,1159 @@ test('拆开的已上车子号还能从原空间踢出', async (t) => {
   const wiped = await prisma.account.findUnique({ where: { id: readyRow.id } });
   assert.equal(wiped.teamStatus, 'kicked');
   assert.equal(wiped.accessToken, '');
+});
+
+test('刷新空间记下成员邮箱和秒级到期，两次使用同一个设备号', async (t) => {
+  const { team } = await fixture(t);
+  const created = await mother(team);
+  const devices = [];
+  route = (path, body) => {
+    if (path.includes('snapshot')) {
+      devices.push(body.deviceId);
+      return {
+        ok: true,
+        complete: true,
+        seatsEntitled: 5,
+        members: [{ id: 'user-1', email: 'kid@example.com', role: 'standard-user' }],
+        activeUntil: '2026-10-08T03:12:01Z',
+        willRenew: false,
+      };
+    }
+    return { ok: true };
+  };
+  const refreshed = await team.refresh(created.id);
+  assert.match(refreshed.message, /成员 1 人/);
+  await team.refresh(created.id);
+  assert.equal(devices.length, 2);
+  assert.ok(devices[0]);
+  assert.equal(devices[0], devices[1]);
+  const listed = await team.listWorkspaces();
+  const row = listed.items.find((item) => item.id === created.id);
+  assert.equal(row.activeUntil, '2026-10-08T03:12:01Z');
+  assert.equal(row.willRenew, false);
+  const roster = await team.listRemoteMembers();
+  assert.equal(roster.items.some((item) => item.email === 'kid@example.com' && item.id === 'user-1'), true);
+  const revealed = JSON.parse((await team.revealSession(created.id)).session);
+  assert.equal(revealed.oaiDeviceId, devices[0]);
+});
+
+test('名单不完整时保留上次成员，并且一个人都不踢', async (t) => {
+  const { team } = await fixture(t);
+  const created = await mother(team);
+  route = (path) => path.includes('snapshot')
+    ? { ok: true, complete: true, seatsEntitled: 5, members: [{ id: 'user-1', email: 'kid@example.com', role: 'standard-user' }], total: 1 }
+    : { ok: true };
+  await team.refresh(created.id);
+  route = (path) => path.includes('snapshot')
+    ? { ok: true, complete: false, members: [], seatsEntitled: null, activeUntil: null }
+    : { ok: true };
+  const again = await team.refresh(created.id);
+  assert.match(again.message, /不完整/);
+  const roster = await team.listRemoteMembers();
+  assert.equal(roster.items.some((item) => item.email === 'kid@example.com'), true);
+  calls.length = 0;
+  await assert.rejects(
+    () => team.kickSelected(created.id, '踢出选中', ['user-1']),
+    (error) => /一个人都不会踢/.test(errorText(error)),
+  );
+  assert.equal(calls.some((item) => item.path.includes('kick')), false);
+});
+
+test('选中踢出只踢普通成员，所有者跳过，也不自动分配', async (t) => {
+  const { prisma, team } = await fixture(t);
+  const created = await mother(team);
+  const imported = await team.importChildren('kid@example.com----chatgpt-pass----JBSWY3DPEHPK3PXP');
+  const child = await prisma.account.findUnique({ where: { cardKey: imported.created[0].cardKey } });
+  await prisma.account.update({
+    where: { id: child.id },
+    data: { workspaceId: created.id, userId: 'user-1', teamStatus: 'joined', accessToken: 'keep-me' },
+  });
+  let snapshots = 0;
+  route = (path) => {
+    if (!path.includes('snapshot')) return { ok: true };
+    snapshots += 1;
+    const stillThere = snapshots < 3;
+    const extra = stillThere
+      ? [{ id: 'user-1', email: 'kid@example.com', role: 'standard-user' }, { id: 'user-2', email: 'other@example.com', role: 'standard-user' }]
+      : [{ id: 'user-2', email: 'other@example.com', role: 'standard-user' }];
+    return { ok: true, complete: true, seatsEntitled: 5, members: members(extra), total: extra.length + 1 };
+  };
+  calls.length = 0;
+  const job = await team.kickSelected(created.id, '踢出选中', ['owner', 'user-1']);
+  assert.match(job.message, /所有者/);
+  assert.equal(calls.filter((item) => item.path.includes('kick')).map((item) => item.body.userId).join(','), 'user-1');
+  assert.equal(calls.some((item) => item.path.includes('assign')), false);
+  const wiped = await prisma.account.findUnique({ where: { id: child.id } });
+  assert.equal(wiped.teamStatus, 'kicked');
+});
+
+test('踢完仍在名单里时不删除本地账密', async (t) => {
+  const { prisma, team } = await fixture(t);
+  const created = await mother(team);
+  const imported = await team.importChildren('kid@example.com----chatgpt-pass----JBSWY3DPEHPK3PXP');
+  const child = await prisma.account.findUnique({ where: { cardKey: imported.created[0].cardKey } });
+  await prisma.account.update({
+    where: { id: child.id },
+    data: { workspaceId: created.id, userId: 'user-1', teamStatus: 'joined', accessToken: 'keep-me' },
+  });
+  route = (path) => path.includes('snapshot')
+    ? { ok: true, complete: true, seatsEntitled: 5, members: members([{ id: 'user-1', email: 'kid@example.com', role: 'standard-user' }]), total: 2 }
+    : { ok: true };
+  const job = await team.kickSelected(created.id, '踢出选中', ['user-1']);
+  assert.match(job.message, /没有删除资料/);
+  const kept = await prisma.account.findUnique({ where: { id: child.id } });
+  assert.equal(kept.teamStatus, 'joined');
+  assert.equal(kept.accessToken, 'keep-me');
+});
+
+test('空的 session 回写不会清掉母号会话，新 cookie 才会写回', async (t) => {
+  const { team } = await fixture(t);
+  const created = await mother(team);
+  const before = await team.revealSession(created.id);
+  route = (path) => path.includes('snapshot')
+    ? { ok: true, complete: true, seatsEntitled: 5, members: members(), sessionUpdate: {} }
+    : { ok: true };
+  await team.refresh(created.id);
+  const unchanged = await team.revealSession(created.id);
+  assert.equal(unchanged.session, before.session);
+  route = (path) => path.includes('snapshot')
+    ? {
+      ok: true,
+      complete: true,
+      seatsEntitled: 5,
+      members: members(),
+      sessionUpdate: { accessToken: 'fresh-access', sessionToken: 'rotated-session', deviceId: 'device-kept' },
+    }
+    : { ok: true };
+  await team.refresh(created.id);
+  const rotated = JSON.parse((await team.revealSession(created.id)).session);
+  assert.equal(rotated.accessToken, 'fresh-access');
+  assert.equal(rotated.sessionToken, 'rotated-session');
+  assert.equal(rotated.oaiDeviceId, 'device-kept');
+});
+
+test('不是所有者的 Team 空间不能绑定', async (t) => {
+  const { team } = await fixture(t);
+  route = () => ({
+    ok: true,
+    email: 'mother@example.com',
+    workspaces: [{ id: 'ws-member', name: 'Team', planType: 'team', role: 'standard-user' }],
+  });
+  await assert.rejects(
+    () => team.createWorkspace({ session: sessionFor('mother@example.com'), socks: 'socks5://127.0.0.1:1080' }),
+    (error) => /所有者/.test(errorText(error)),
+  );
+});
+
+test('指定停用、非 Team 或非所有者空间不能绕过绑定', async (t) => {
+  const { team } = await fixture(t);
+  route = () => ({
+    ok: true,
+    email: 'mother@example.com',
+    workspaces: [
+      { id: 'ws-dead', name: 'Dead', planType: 'team', role: 'account-owner', deactivated: true },
+      { id: 'ws-plus', name: 'Plus', planType: 'plus', role: 'account-owner' },
+      { id: 'ws-member', name: 'Member', planType: 'team', role: 'standard-user' },
+    ],
+  });
+  await assert.rejects(
+    () => team.createWorkspace({ session: sessionFor('mother@example.com'), socks: 'socks5://127.0.0.1:1080', workspaceId: 'ws-dead' }),
+    (error) => /停用/.test(errorText(error)),
+  );
+  await assert.rejects(
+    () => team.createWorkspace({ session: sessionFor('mother@example.com'), socks: 'socks5://127.0.0.1:1080', workspaceId: 'ws-plus' }),
+    (error) => /不是 Team/.test(errorText(error)),
+  );
+  await assert.rejects(
+    () => team.createWorkspace({ session: sessionFor('mother@example.com'), socks: 'socks5://127.0.0.1:1080', workspaceId: 'ws-member' }),
+    (error) => /不是所有者/.test(errorText(error)),
+  );
+});
+
+test('多个空间里只自动绑定唯一的所有者', async (t) => {
+  const { team } = await fixture(t);
+  route = () => ({
+    ok: true,
+    email: 'mother@example.com',
+    workspaces: [
+      { id: 'ws-member', name: 'Member', planType: 'team', role: 'standard-user' },
+      { id: 'ws-owner', name: 'Owner', planType: 'team', role: 'account-owner' },
+    ],
+  });
+  const created = await team.createWorkspace({ session: sessionFor('mother@example.com'), socks: 'socks5://127.0.0.1:1080' });
+  assert.equal(created.workspaceId, 'ws-owner');
+});
+
+test('保存时原空间已不是所有者则拒绝', async (t) => {
+  const { prisma, team } = await fixture(t);
+  const created = await mother(team);
+  const before = await team.revealSession(created.id);
+  route = (path) => path.includes('inspect')
+    ? { ok: true, email: 'mother@example.com', workspaces: [{ id: 'ws-1', name: 'Team', planType: 'team', role: 'standard-user' }] }
+    : { ok: true };
+  await assert.rejects(
+    () => team.updateWorkspace(created.id, { session: sessionFor('mother@example.com') }),
+    (error) => /所有者/.test(errorText(error)),
+  );
+  const kept = await prisma.teamWorkspace.findUnique({ where: { id: created.id } });
+  assert.equal(kept.openaiWorkspaceId, 'ws-1');
+  assert.equal((await team.revealSession(created.id)).session, before.session);
+});
+
+test('订阅接口失败时不覆盖已有席位和到期', async (t) => {
+  const { team } = await fixture(t);
+  const created = await mother(team);
+  route = (path) => path.includes('snapshot')
+    ? { ok: true, complete: true, seatsEntitled: 5, activeUntil: '2026-10-08T03:12:01Z', willRenew: false, members: members(), total: 1 }
+    : { ok: true };
+  await team.refresh(created.id);
+  route = (path) => path.includes('snapshot')
+    ? { ok: true, complete: true, subscriptionRead: false, seatsEntitled: null, activeUntil: null, willRenew: null, members: members(), total: 1 }
+    : { ok: true };
+  await team.refresh(created.id);
+  const row = (await team.listWorkspaces()).items.find((item) => item.id === created.id);
+  assert.equal(row.seatsEntitled, 5);
+  assert.equal(row.activeUntil, '2026-10-08T03:12:01Z');
+  assert.equal(row.willRenew, false);
+});
+
+test('旧母号缺少设备号时，刷新会补上并在下次继续使用', async (t) => {
+  const { prisma, team } = await fixture(t);
+  const created = await mother(team);
+  const { encryptSecret } = require('../dist/team/team-crypto');
+  const current = JSON.parse((await team.revealSession(created.id)).session);
+  delete current.oaiDeviceId;
+  await prisma.teamWorkspace.update({
+    where: { id: created.id },
+    data: { sessionCipher: encryptSecret(JSON.stringify(current)) },
+  });
+  const devices = [];
+  route = (path, body) => {
+    if (path.includes('snapshot')) {
+      devices.push(body.deviceId || '');
+      return { ok: true, complete: true, seatsEntitled: 2, members: members(), total: 1 };
+    }
+    return { ok: true };
+  };
+  await team.refresh(created.id);
+  await team.refresh(created.id);
+  assert.ok(devices[0]);
+  assert.equal(devices[0], devices[1]);
+  const revealed = JSON.parse((await team.revealSession(created.id)).session);
+  assert.equal(revealed.oaiDeviceId, devices[0]);
+});
+
+test('同一次请求换了新 cookie 后失败，不把母号标成失效', async (t) => {
+  const { team } = await fixture(t);
+  const created = await mother(team);
+  route = (path) => path.includes('snapshot')
+    ? {
+      ok: false,
+      code: 'SESSION_EXPIRED',
+      message: '母号 session 已失效，请重新贴一次',
+      sessionUpdate: { sessionToken: 'rotated-after-401', accessToken: 'fresh-at' },
+    }
+    : { ok: true };
+  await assert.rejects(() => team.refresh(created.id), (error) => /已保留/.test(errorText(error)));
+  const row = (await team.listWorkspaces()).items.find((item) => item.id === created.id);
+  assert.equal(row.sessionStatus, '有效');
+  const revealed = JSON.parse((await team.revealSession(created.id)).session);
+  assert.equal(revealed.sessionToken, 'rotated-after-401');
+  assert.equal(revealed.accessToken, 'fresh-at');
+});
+
+test('没有新 cookie 的失效仍然标成失效', async (t) => {
+  const { team } = await fixture(t);
+  const created = await mother(team);
+  route = (path) => path.includes('snapshot')
+    ? { ok: false, code: 'SESSION_EXPIRED', message: '母号 session 已失效，请重新贴一次', sessionUpdate: { deviceId: 'only-device' } }
+    : { ok: true };
+  await assert.rejects(() => team.refresh(created.id), (error) => /已失效/.test(errorText(error)));
+  const row = (await team.listWorkspaces()).items.find((item) => item.id === created.id);
+  assert.equal(row.sessionStatus, '已失效');
+});
+
+test('只有空间 token 变了不能当成换过的 session', async (t) => {
+  const { team } = await fixture(t);
+  const created = await mother(team);
+  route = (path) => path.includes('snapshot')
+    ? {
+      ok: false,
+      code: 'SESSION_EXPIRED',
+      message: '母号 session 已失效，请重新贴一次',
+      sessionUpdate: { accessToken: 'workspace-at' },
+    }
+    : { ok: true };
+  await assert.rejects(
+    () => team.refresh(created.id),
+    (error) => /已失效/.test(errorText(error)) && !/已保留/.test(errorText(error)),
+  );
+  const row = (await team.listWorkspaces()).items.find((item) => item.id === created.id);
+  assert.equal(row.sessionStatus, '已失效');
+});
+
+test('新建母号检查失败时把换过的 session 还给输入框', async (t) => {
+  const { prisma, team } = await fixture(t);
+  route = () => ({
+    ok: false,
+    code: 'SESSION_EXPIRED',
+    message: '母号 session 已失效，请重新贴一次',
+    sessionUpdate: { sessionToken: 'rotated-session', accessToken: 'personal-at' },
+  });
+  let caught;
+  await assert.rejects(
+    () => team.createWorkspace({ session: sessionFor('mother@example.com'), socks: 'socks5://127.0.0.1:1080' }),
+    (error) => {
+      caught = error;
+      return /已失效|已保留/.test(errorText(error));
+    },
+  );
+  assert.match(String(errorDetails(caught)?.session || ''), /rotated-session/);
+  assert.equal(await prisma.teamWorkspace.count(), 0);
+});
+
+test('保存失败且读不出邮箱时，不把换过的 session 写进这行', async (t) => {
+  const { prisma, team } = await fixture(t);
+  const created = await mother(team);
+  const before = await team.revealSession(created.id);
+  const pasted = JSON.stringify({
+    accessToken: 'old-at',
+    sessionToken: 'old-session',
+    email: 'mother@example.com',
+  });
+  route = (path) => path.includes('inspect')
+    ? {
+      ok: false,
+      code: 'SESSION_EXPIRED',
+      message: '母号 session 已失效，请重新贴一次',
+      sessionUpdate: { sessionToken: 'rotated-session', accessToken: 'personal-at' },
+    }
+    : { ok: true };
+  let caught;
+  await assert.rejects(
+    () => team.updateWorkspace(created.id, { session: pasted }),
+    (error) => {
+      caught = error;
+      return /已失效/.test(errorText(error)) && !/已保留/.test(errorText(error));
+    },
+  );
+  assert.match(String(errorDetails(caught)?.session || ''), /rotated-session/);
+  const row = await prisma.teamWorkspace.findUnique({ where: { id: created.id } });
+  assert.equal(row.openaiWorkspaceId, 'ws-1');
+  assert.equal(row.motherEmail, 'mother@example.com');
+  assert.equal(row.sessionStatus, 'valid');
+  assert.doesNotMatch(String(row.lastError || ''), /已保留/);
+  assert.equal((await team.revealSession(created.id)).session, before.session);
+});
+
+test('保存时所有者校验失败也不丢掉已换过的 session', async (t) => {
+  const { prisma, team } = await fixture(t);
+  const created = await mother(team);
+  route = (path) => path.includes('inspect')
+    ? {
+      ok: true,
+      email: 'mother@example.com',
+      workspaces: [{ id: 'ws-1', name: 'Team', planType: 'team', role: 'standard-user' }],
+      sessionUpdate: { sessionToken: 'rotated-session', accessToken: 'personal-at' },
+    }
+    : { ok: true };
+  await assert.rejects(
+    () => team.updateWorkspace(created.id, { session: sessionFor('mother@example.com') }),
+    (error) => /所有者/.test(errorText(error)) && /rotated-session/.test(String(errorDetails(error)?.session || '')),
+  );
+  const row = await prisma.teamWorkspace.findUnique({ where: { id: created.id } });
+  assert.equal(row.openaiWorkspaceId, 'ws-1');
+  const revealed = JSON.parse((await team.revealSession(created.id)).session);
+  assert.equal(revealed.sessionToken, 'rotated-session');
+});
+
+test('保活遇到不完整名单时仍留下警告', async (t) => {
+  const { prisma, team } = await fixture(t);
+  const created = await mother(team);
+  const { encryptSecret } = require('../dist/team/team-crypto');
+  const current = JSON.parse((await team.revealSession(created.id)).session);
+  current.sessionToken = 'live-session';
+  await prisma.teamWorkspace.update({
+    where: { id: created.id },
+    data: {
+      sessionCipher: encryptSecret(JSON.stringify(current)),
+      lastError: null,
+      snapshotComplete: true,
+    },
+  });
+  route = (path) => path.includes('snapshot')
+    ? { ok: true, complete: false, members: members(), total: 3 }
+    : { ok: true };
+  calls.length = 0;
+  await team.keepAlive();
+  assert.ok(calls.some((item) => String(item.path || '').includes('snapshot')));
+  const warned = (await team.listWorkspaces()).items.find((item) => item.id === created.id);
+  assert.equal(warned.lastError, '成员名单不完整');
+  assert.equal(warned.snapshotComplete, false);
+  route = (path) => path.includes('snapshot')
+    ? { ok: true, complete: true, seatsEntitled: 2, members: members(), total: 1 }
+    : { ok: true };
+  await team.refresh(created.id);
+  const cleared = (await team.listWorkspaces()).items.find((item) => item.id === created.id);
+  assert.equal(cleared.lastError, null);
+  assert.equal(cleared.snapshotComplete, true);
+});
+
+test('检查失败只有个人 token 变了，不能把已失效改回有效', async (t) => {
+  const { prisma, team } = await fixture(t);
+  const created = await mother(team);
+  const { encryptSecret } = require('../dist/team/team-crypto');
+  const current = JSON.parse((await team.revealSession(created.id)).session);
+  current.sessionToken = 'old-session';
+  await prisma.teamWorkspace.update({
+    where: { id: created.id },
+    data: {
+      sessionCipher: encryptSecret(JSON.stringify(current)),
+      sessionStatus: 'expired',
+      lastError: '母号 session 已失效，请重新贴一次',
+    },
+  });
+  route = (path) => path.includes('inspect')
+    ? {
+      ok: false,
+      code: 'SESSION_EXPIRED',
+      message: '母号 session 已失效，请重新贴一次',
+      sessionUpdate: { accessToken: 'fresh-personal-at' },
+    }
+    : { ok: true };
+  await assert.rejects(
+    () => team.updateWorkspace(created.id, {
+      session: JSON.stringify({ accessToken: 'old-at', sessionToken: 'old-session', email: 'mother@example.com' }),
+    }),
+    (error) => /已失效/.test(errorText(error)) && !/已保留/.test(errorText(error)),
+  );
+  const row = await prisma.teamWorkspace.findUnique({ where: { id: created.id } });
+  assert.equal(row.sessionStatus, 'expired');
+  assert.doesNotMatch(String(row.lastError || ''), /已保留/);
+  const revealed = JSON.parse((await team.revealSession(created.id)).session);
+  assert.equal(revealed.sessionToken, 'old-session');
+  assert.notEqual(revealed.accessToken, 'fresh-personal-at');
+});
+
+test('检查到的邮箱不一致时，不把另一份 session 写进这行母号', async (t) => {
+  const { prisma, team } = await fixture(t);
+  const created = await mother(team);
+  const before = await team.revealSession(created.id);
+  route = (path) => path.includes('inspect')
+    ? {
+      ok: true,
+      email: 'other@example.com',
+      workspaces: [{ id: 'ws-other', name: 'Other', planType: 'team', role: 'account-owner' }],
+      sessionUpdate: { sessionToken: 'rotated-session', accessToken: 'other-at' },
+    }
+    : { ok: true };
+  let caught;
+  await assert.rejects(
+    () => team.updateWorkspace(created.id, {
+      session: JSON.stringify({ accessToken: 'other-at', sessionToken: 'old-session', email: 'mother@example.com' }),
+    }),
+    (error) => {
+      caught = error;
+      return /邮箱和已绑定母号不一致/.test(errorText(error));
+    },
+  );
+  assert.match(String(errorDetails(caught)?.session || ''), /rotated-session/);
+  const row = await prisma.teamWorkspace.findUnique({ where: { id: created.id } });
+  assert.equal(row.openaiWorkspaceId, 'ws-1');
+  assert.equal(row.motherEmail, 'mother@example.com');
+  assert.equal((await team.revealSession(created.id)).session, before.session);
+});
+
+test('撤回遇到 session 失效会标成失效，换过 cookie 则保留', async (t) => {
+  const { prisma, team } = await fixture(t);
+  const created = await mother(team);
+  route = (path) => {
+    if (path.includes('snapshot')) {
+      return { ok: true, complete: true, seatsEntitled: 5, members: members(), invites: [{ email: 'kid@example.com' }], total: 1 };
+    }
+    if (path.includes('revoke')) {
+      return { ok: false, code: 'SESSION_EXPIRED', message: '母号 session 已失效，请重新贴一次' };
+    }
+    return { ok: true };
+  };
+  await team.revokeInvites(created.id);
+  const expired = await prisma.teamWorkspace.findUnique({ where: { id: created.id } });
+  assert.equal(expired.sessionStatus, 'expired');
+  assert.match(String(expired.lastError || ''), /已失效/);
+
+  await prisma.teamWorkspace.update({
+    where: { id: created.id },
+    data: { sessionStatus: 'valid', lastError: null },
+  });
+  route = (path) => {
+    if (path.includes('snapshot')) {
+      return { ok: true, complete: true, seatsEntitled: 5, members: members(), invites: [{ email: 'kid@example.com' }], total: 1 };
+    }
+    if (path.includes('revoke')) {
+      return {
+        ok: false,
+        code: 'SESSION_EXPIRED',
+        message: '母号 session 已失效，请重新贴一次',
+        sessionUpdate: { sessionToken: 'rotated-session', accessToken: 'personal-at' },
+      };
+    }
+    return { ok: true };
+  };
+  await team.revokeInvites(created.id);
+  const kept = await prisma.teamWorkspace.findUnique({ where: { id: created.id } });
+  assert.notEqual(kept.sessionStatus, 'expired');
+  assert.match(String(kept.lastError || ''), /已保留/);
+  const revealed = JSON.parse((await team.revealSession(created.id)).session);
+  assert.equal(revealed.sessionToken, 'rotated-session');
+});
+
+test('检查失败但邮箱已核对且 session 换过，仍保留', async (t) => {
+  const { prisma, team } = await fixture(t);
+  const created = await mother(team);
+  route = (path) => path.includes('inspect')
+    ? {
+      ok: false,
+      code: 'SESSION_EXPIRED',
+      email: 'mother@example.com',
+      message: '母号 session 已失效，请重新贴一次',
+      sessionUpdate: { sessionToken: 'rotated-session', accessToken: 'personal-at' },
+    }
+    : { ok: true };
+  let caught;
+  await assert.rejects(
+    () => team.updateWorkspace(created.id, {
+      session: JSON.stringify({ accessToken: 'old-at', sessionToken: 'old-session', email: 'mother@example.com' }),
+    }),
+    (error) => {
+      caught = error;
+      return /已失效/.test(errorText(error));
+    },
+  );
+  assert.match(String(errorDetails(caught)?.session || ''), /rotated-session/);
+  const row = await prisma.teamWorkspace.findUnique({ where: { id: created.id } });
+  assert.equal(row.sessionStatus, 'valid');
+  assert.match(String(row.lastError || ''), /已保留/);
+  const revealed = JSON.parse((await team.revealSession(created.id)).session);
+  assert.equal(revealed.sessionToken, 'rotated-session');
+});
+
+test('同一份 session 换过但读不出邮箱时，不改这行也不标成已保留', async (t) => {
+  const { prisma, team } = await fixture(t);
+  const created = await mother(team);
+  const { encryptSecret } = require('../dist/team/team-crypto');
+  const current = JSON.parse((await team.revealSession(created.id)).session);
+  current.sessionToken = 'stored-session';
+  await prisma.teamWorkspace.update({
+    where: { id: created.id },
+    data: { sessionCipher: encryptSecret(JSON.stringify(current)), sessionStatus: 'valid', lastError: null },
+  });
+  const before = await team.revealSession(created.id);
+  route = (path) => path.includes('inspect')
+    ? {
+      ok: false,
+      code: 'SESSION_EXPIRED',
+      message: '母号 session 已失效，请重新贴一次',
+      sessionUpdate: { sessionToken: 'rotated-session', accessToken: 'personal-at' },
+    }
+    : { ok: true };
+  let caught;
+  await assert.rejects(
+    () => team.updateWorkspace(created.id, {
+      session: JSON.stringify({ accessToken: 'token-mother@example.com', sessionToken: 'stored-session', email: 'mother@example.com' }),
+    }),
+    (error) => {
+      caught = error;
+      return /已失效/.test(errorText(error)) && !/已保留/.test(errorText(error));
+    },
+  );
+  assert.match(String(errorDetails(caught)?.session || ''), /rotated-session/);
+  const row = await prisma.teamWorkspace.findUnique({ where: { id: created.id } });
+  assert.equal(row.sessionStatus, 'valid');
+  assert.equal(row.lastError, null);
+  assert.equal((await team.revealSession(created.id)).session, before.session);
+});
+
+test('另一份失败的 session 不能把仍有效的母号标成失效', async (t) => {
+  const { prisma, team } = await fixture(t);
+  const created = await mother(team);
+  const { encryptSecret } = require('../dist/team/team-crypto');
+  const current = JSON.parse((await team.revealSession(created.id)).session);
+  current.sessionToken = 'stored-session';
+  await prisma.teamWorkspace.update({
+    where: { id: created.id },
+    data: { sessionCipher: encryptSecret(JSON.stringify(current)), sessionStatus: 'valid', lastError: null },
+  });
+  const before = await team.revealSession(created.id);
+  route = (path) => path.includes('inspect')
+    ? { ok: false, code: 'SESSION_EXPIRED', message: '母号 session 已失效，请重新贴一次' }
+    : { ok: true };
+  await assert.rejects(
+    () => team.updateWorkspace(created.id, {
+      session: JSON.stringify({ accessToken: 'other-at' }),
+    }),
+    (error) => /已失效/.test(errorText(error)),
+  );
+  const row = await prisma.teamWorkspace.findUnique({ where: { id: created.id } });
+  assert.equal(row.sessionStatus, 'valid');
+  assert.doesNotMatch(String(row.lastError || ''), /已失效/);
+  assert.equal((await team.revealSession(created.id)).session, before.session);
+});
+
+test('同一份 session 检查失败仍标成失效', async (t) => {
+  const { prisma, team } = await fixture(t);
+  const created = await mother(team);
+  const { encryptSecret } = require('../dist/team/team-crypto');
+  const current = JSON.parse((await team.revealSession(created.id)).session);
+  current.sessionToken = 'stored-session';
+  await prisma.teamWorkspace.update({
+    where: { id: created.id },
+    data: { sessionCipher: encryptSecret(JSON.stringify(current)), sessionStatus: 'valid', lastError: null },
+  });
+  route = (path) => path.includes('inspect')
+    ? { ok: false, code: 'SESSION_EXPIRED', message: '母号 session 已失效，请重新贴一次' }
+    : { ok: true };
+  await assert.rejects(
+    () => team.updateWorkspace(created.id, {
+      session: JSON.stringify({ accessToken: 'token-mother@example.com', sessionToken: 'stored-session', email: 'mother@example.com' }),
+    }),
+    (error) => /已失效/.test(errorText(error)),
+  );
+  const row = await prisma.teamWorkspace.findUnique({ where: { id: created.id } });
+  assert.equal(row.sessionStatus, 'expired');
+  const revealed = JSON.parse((await team.revealSession(created.id)).session);
+  assert.equal(revealed.sessionToken, 'stored-session');
+});
+
+test('撤回前刷新失败不能报成已经撤回', async (t) => {
+  const { prisma, team } = await fixture(t);
+  const created = await mother(team);
+  const imported = await team.importChildren('kid@example.com----chatgpt-pass----JBSWY3DPEHPK3PXP');
+  const child = await prisma.account.findUnique({ where: { cardKey: imported.created[0].cardKey } });
+  await prisma.account.update({
+    where: { id: child.id },
+    data: { workspaceId: created.id, teamStatus: 'invited' },
+  });
+  route = (path) => path.includes('snapshot')
+    ? { ok: false, code: 'SESSION_EXPIRED', message: '母号 session 已失效，请重新贴一次' }
+    : { ok: true };
+  await assert.rejects(
+    () => team.revokeInvites(created.id),
+    (error) => /已失效/.test(errorText(error)) && !/已按邮箱撤回/.test(errorText(error)),
+  );
+  const jobs = await team.listJobs();
+  const job = jobs.items.find((item) => item.workspaceRowId === created.id && item.kind === 'revoke');
+  assert.equal(job.status, 'failed');
+  assert.doesNotMatch(String(job.message || ''), /已按邮箱撤回/);
+  const kept = await prisma.account.findUnique({ where: { id: child.id } });
+  assert.equal(kept.teamStatus, 'invited');
+  assert.equal(kept.workspaceId, created.id);
+});
+
+test('选踢前 session 失效要说明失效，一个人都不踢', async (t) => {
+  const { team } = await fixture(t);
+  const created = await mother(team);
+  route = (path) => path.includes('snapshot')
+    ? { ok: false, code: 'SESSION_EXPIRED', message: '母号 session 已失效，请重新贴一次' }
+    : { ok: true };
+  calls.length = 0;
+  await assert.rejects(
+    () => team.kickSelected(created.id, '踢出选中', ['user-1']),
+    (error) => /已失效/.test(errorText(error)) && !/不完整/.test(errorText(error)),
+  );
+  assert.equal(calls.some((item) => item.path.includes('kick')), false);
+});
+
+test('单踢和退出全部在刷新失败时说明真实原因，一个人都不踢', async (t) => {
+  const { prisma, team } = await fixture(t);
+  const created = await mother(team);
+  const imported = await team.importChildren('kid@example.com----chatgpt-pass----JBSWY3DPEHPK3PXP');
+  const child = await prisma.account.findUnique({ where: { cardKey: imported.created[0].cardKey } });
+  await prisma.account.update({
+    where: { id: child.id },
+    data: { workspaceId: created.id, userId: 'child-user', teamStatus: 'file_ready' },
+  });
+  route = (path) => path.includes('snapshot')
+    ? { ok: false, code: 'SESSION_EXPIRED', message: '母号 session 已失效，请重新贴一次' }
+    : { ok: true };
+  calls.length = 0;
+  await assert.rejects(
+    () => team.kickOne(child.id),
+    (error) => /已失效/.test(errorText(error)) && !/不完整/.test(errorText(error)),
+  );
+  assert.equal(calls.some((item) => item.path.includes('kick')), false);
+  const kept = await prisma.account.findUnique({ where: { id: child.id } });
+  assert.equal(kept.teamStatus, 'file_ready');
+  await assert.rejects(
+    () => team.previewKickAll(created.id),
+    (error) => /已失效/.test(errorText(error)) && !/不完整/.test(errorText(error)),
+  );
+  const other = await mother(team, 'other-mother@example.com', 'ws-upstream');
+  const otherImport = await team.importChildren('other-kid@example.com----chatgpt-pass----JBSWY3DPEHPK3PXP');
+  const otherChild = await prisma.account.findUnique({ where: { cardKey: otherImport.created[0].cardKey } });
+  await prisma.account.update({
+    where: { id: otherChild.id },
+    data: { workspaceId: other.id, userId: 'other-user', teamStatus: 'file_ready' },
+  });
+  route = (path) => path.includes('snapshot')
+    ? { ok: false, code: 'UPSTREAM', message: '上游暂时失败' }
+    : { ok: true };
+  calls.length = 0;
+  await assert.rejects(
+    () => team.previewKickAll(other.id),
+    (error) => /上游暂时失败/.test(errorText(error)) && !/不完整/.test(errorText(error)),
+  );
+  await assert.rejects(
+    () => team.kickAll(other.id, '退出全部', ['other-user']),
+    (error) => /上游暂时失败/.test(errorText(error)) && !/不完整/.test(errorText(error)),
+  );
+  assert.equal(calls.some((item) => item.path.includes('kick')), false);
+  const still = await prisma.account.findUnique({ where: { id: otherChild.id } });
+  assert.equal(still.teamStatus, 'file_ready');
+});
+
+test('补删后再复核失败时，不能说一个账密都没删', async (t) => {
+  const { prisma, team } = await fixture(t);
+  const created = await mother(team);
+  const goneImport = await team.importChildren('gone@example.com----chatgpt-pass----JBSWY3DPEHPK3PXP');
+  const stayImport = await team.importChildren('stay@example.com----chatgpt-pass----JBSWY3DPEHPK3PXP');
+  const gone = await prisma.account.findUnique({ where: { cardKey: goneImport.created[0].cardKey } });
+  const stay = await prisma.account.findUnique({ where: { cardKey: stayImport.created[0].cardKey } });
+  await prisma.account.update({
+    where: { id: gone.id },
+    data: { workspaceId: created.id, userId: 'gone-user', teamStatus: 'file_ready' },
+  });
+  await prisma.account.update({
+    where: { id: stay.id },
+    data: { workspaceId: created.id, userId: 'stay-user', teamStatus: 'file_ready' },
+  });
+  let snaps = 0;
+  route = (path) => {
+    if (path.includes('kick')) return { ok: true };
+    if (path.includes('snapshot')) {
+      snaps += 1;
+      if (snaps === 1) {
+        return {
+          ok: true,
+          complete: true,
+          members: members([{ id: 'stay-user', email: 'stay@example.com', role: 'standard-user' }]),
+          total: 2,
+        };
+      }
+      return { ok: true, complete: false, members: [], total: null };
+    }
+    return { ok: true };
+  };
+  await assert.rejects(
+    () => team.kickOne(stay.id),
+    (error) => {
+      const text = errorText(error);
+      return /已删除 1 个已不在名单里的资料/.test(text)
+        && /复核快照不完整/.test(text)
+        && !/没有删除任何账密或文件/.test(text);
+    },
+  );
+  const wiped = await prisma.account.findUnique({ where: { id: gone.id } });
+  assert.equal(wiped.teamStatus, 'kicked');
+  assert.equal(await prisma.teamSecret.findUnique({ where: { accountId: gone.id } }), null);
+  const kept = await prisma.account.findUnique({ where: { id: stay.id } });
+  assert.equal(kept.teamStatus, 'file_ready');
+  assert.ok(await prisma.teamSecret.findUnique({ where: { accountId: stay.id } }));
+  const job = await prisma.teamJob.findFirst({ where: { workspaceRowId: created.id, kind: 'kick' }, orderBy: { id: 'desc' } });
+  assert.equal(job.status, 'failed');
+  assert.match(job.message, /已删除 1 个已不在名单里的资料/);
+  assert.match(job.message, /复核快照不完整/);
+  assert.doesNotMatch(job.message, /没有删除任何账密或文件/);
+});
+
+test('踢完复核遇到 session 失效要说明失效，不删这次要踢的人', async (t) => {
+  const { prisma, team } = await fixture(t);
+  const created = await mother(team);
+  const imported = await team.importChildren('kid@example.com----chatgpt-pass----JBSWY3DPEHPK3PXP');
+  const child = await prisma.account.findUnique({ where: { cardKey: imported.created[0].cardKey } });
+  await prisma.account.update({
+    where: { id: child.id },
+    data: { workspaceId: created.id, userId: 'child-user', teamStatus: 'file_ready' },
+  });
+  let snaps = 0;
+  route = (path) => {
+    if (path.includes('kick')) return { ok: true };
+    if (path.includes('snapshot')) {
+      snaps += 1;
+      if (snaps === 1) {
+        return {
+          ok: true,
+          complete: true,
+          members: members([{ id: 'child-user', email: 'kid@example.com', role: 'standard-user' }]),
+          total: 2,
+        };
+      }
+      return { ok: false, code: 'SESSION_EXPIRED', message: '母号 session 已失效，请重新贴一次' };
+    }
+    return { ok: true };
+  };
+  await assert.rejects(
+    () => team.kickOne(child.id),
+    (error) => /已失效/.test(errorText(error)) && !/不完整/.test(errorText(error)),
+  );
+  const kept = await prisma.account.findUnique({ where: { id: child.id } });
+  assert.equal(kept.teamStatus, 'file_ready');
+  assert.ok(await prisma.teamSecret.findUnique({ where: { accountId: child.id } }));
+});
+
+test('退出全部名单不一致时，已离开的子号也不删账密', async (t) => {
+  const { prisma, team } = await fixture(t);
+  const created = await mother(team);
+  const goneImport = await team.importChildren('gone@example.com----chatgpt-pass----JBSWY3DPEHPK3PXP');
+  const stayImport = await team.importChildren('stay@example.com----chatgpt-pass----JBSWY3DPEHPK3PXP');
+  const gone = await prisma.account.findUnique({ where: { cardKey: goneImport.created[0].cardKey } });
+  const stay = await prisma.account.findUnique({ where: { cardKey: stayImport.created[0].cardKey } });
+  await prisma.account.update({
+    where: { id: gone.id },
+    data: { workspaceId: created.id, userId: 'gone-user', teamStatus: 'file_ready' },
+  });
+  await prisma.account.update({
+    where: { id: stay.id },
+    data: { workspaceId: created.id, userId: 'stay-user', teamStatus: 'file_ready' },
+  });
+  route = (path) => path.includes('snapshot')
+    ? {
+      ok: true,
+      complete: true,
+      seatsEntitled: 5,
+      members: members([{ id: 'stay-user', email: 'stay@example.com', role: 'standard-user' }]),
+      total: 2,
+    }
+    : { ok: true };
+  calls.length = 0;
+  await assert.rejects(
+    () => team.kickAll(created.id, '退出全部', ['stay-user', 'extra-user']),
+    (error) => /不一致/.test(errorText(error)) && /一个人都不会踢/.test(errorText(error)),
+  );
+  assert.equal(calls.some((item) => item.path.includes('kick')), false);
+  const keptGone = await prisma.account.findUnique({ where: { id: gone.id } });
+  assert.equal(keptGone.teamStatus, 'file_ready');
+  assert.ok(await prisma.teamSecret.findUnique({ where: { accountId: gone.id } }));
+  const keptStay = await prisma.account.findUnique({ where: { id: stay.id } });
+  assert.equal(keptStay.teamStatus, 'file_ready');
+  assert.ok(await prisma.teamSecret.findUnique({ where: { accountId: stay.id } }));
+  const job = await prisma.teamJob.findFirst({ where: { workspaceRowId: created.id, kind: 'kick-all' }, orderBy: { id: 'desc' } });
+  assert.equal(job.status, 'failed');
+  assert.match(job.message, /不一致/);
+  assert.doesNotMatch(job.message, /已删除/);
+});
+
+test('分配邀请遇到刷新失败时说明真实原因，不发邀请', async (t) => {
+  const { prisma, team } = await fixture(t);
+  const created = await mother(team);
+  await team.importChildren('kid@example.com----chatgpt-pass----JBSWY3DPEHPK3PXP');
+  route = (path) => path.includes('snapshot')
+    ? { ok: false, code: 'SESSION_EXPIRED', message: '母号 session 已失效，请重新贴一次' }
+    : { ok: true };
+  calls.length = 0;
+  await assert.rejects(
+    () => team.assign(created.id),
+    (error) => /已失效/.test(errorText(error)) && !/不完整/.test(errorText(error)),
+  );
+  assert.equal(calls.some((item) => item.path.includes('invite')), false);
+  const child = await prisma.account.findFirst({ where: { email: 'kid@example.com' } });
+  assert.equal(child.teamStatus, 'waiting');
+  assert.equal(child.workspaceId, null);
+  const expiredJob = await prisma.teamJob.findFirst({ where: { workspaceRowId: created.id, kind: 'assign' }, orderBy: { id: 'desc' } });
+  assert.equal(expiredJob.status, 'failed');
+  assert.match(expiredJob.message, /已失效/);
+  assert.doesNotMatch(expiredJob.message, /不完整/);
+
+  const other = await mother(team, 'other-mother@example.com', 'ws-upstream');
+  route = (path) => path.includes('snapshot')
+    ? { ok: false, code: 'UPSTREAM', message: '上游暂时失败' }
+    : { ok: true };
+  calls.length = 0;
+  await assert.rejects(
+    () => team.assign(other.id),
+    (error) => /上游暂时失败/.test(errorText(error)) && !/不完整/.test(errorText(error)),
+  );
+  assert.equal(calls.some((item) => item.path.includes('invite')), false);
+  const upstreamJob = await prisma.teamJob.findFirst({ where: { workspaceRowId: other.id, kind: 'assign' }, orderBy: { id: 'desc' } });
+  assert.equal(upstreamJob.status, 'failed');
+  assert.match(upstreamJob.message, /上游暂时失败/);
+  assert.doesNotMatch(upstreamJob.message, /不完整/);
+});
+
+test('选踢只剩已离开的人时，仍删除本地账密', async (t) => {
+  const { prisma, team } = await fixture(t);
+  const created = await mother(team);
+  const goneImport = await team.importChildren('gone@example.com----chatgpt-pass----JBSWY3DPEHPK3PXP');
+  const stayImport = await team.importChildren('stay@example.com----chatgpt-pass----JBSWY3DPEHPK3PXP');
+  const gone = await prisma.account.findUnique({ where: { cardKey: goneImport.created[0].cardKey } });
+  const stay = await prisma.account.findUnique({ where: { cardKey: stayImport.created[0].cardKey } });
+  await prisma.account.update({
+    where: { id: gone.id },
+    data: { workspaceId: created.id, userId: 'gone-user', teamStatus: 'file_ready', accessToken: 'gone-at' },
+  });
+  await prisma.account.update({
+    where: { id: stay.id },
+    data: { workspaceId: created.id, userId: 'stay-user', teamStatus: 'file_ready', accessToken: 'stay-at' },
+  });
+  route = (path) => path.includes('snapshot')
+    ? {
+      ok: true,
+      complete: true,
+      seatsEntitled: 5,
+      members: members([{ id: 'stay-user', email: 'stay@example.com', role: 'standard-user' }]),
+      total: 2,
+    }
+    : { ok: true };
+  calls.length = 0;
+  const job = await team.kickSelected(created.id, '踢出选中', ['gone-user']);
+  assert.match(job.message, /已确认退出并删除资料/);
+  assert.doesNotMatch(job.message, /gone-user：已不在名单里，没有踢/);
+  assert.doesNotMatch(job.message, /没有可踢出的成员/);
+  assert.equal(calls.some((item) => item.path.includes('kick')), false);
+  const wiped = await prisma.account.findUnique({ where: { id: gone.id } });
+  assert.equal(wiped.teamStatus, 'kicked');
+  assert.equal(wiped.accessToken, '');
+  assert.equal(await prisma.teamSecret.findUnique({ where: { accountId: gone.id } }), null);
+  const kept = await prisma.account.findUnique({ where: { id: stay.id } });
+  assert.equal(kept.teamStatus, 'file_ready');
+  assert.equal(kept.accessToken, 'stay-at');
+});
+
+test('选踢混有已离开的人时，不能再说没有踢', async (t) => {
+  const { prisma, team } = await fixture(t);
+  const created = await mother(team);
+  const goneImport = await team.importChildren('gone@example.com----chatgpt-pass----JBSWY3DPEHPK3PXP');
+  const stayImport = await team.importChildren('stay@example.com----chatgpt-pass----JBSWY3DPEHPK3PXP');
+  const gone = await prisma.account.findUnique({ where: { cardKey: goneImport.created[0].cardKey } });
+  const stay = await prisma.account.findUnique({ where: { cardKey: stayImport.created[0].cardKey } });
+  await prisma.account.update({
+    where: { id: gone.id },
+    data: { workspaceId: created.id, userId: 'gone-user', teamStatus: 'file_ready', accessToken: 'gone-at' },
+  });
+  await prisma.account.update({
+    where: { id: stay.id },
+    data: { workspaceId: created.id, userId: 'stay-user', teamStatus: 'file_ready', accessToken: 'stay-at' },
+  });
+  route = (path) => {
+    if (path.includes('kick')) return { ok: true };
+    if (path.includes('snapshot')) {
+      return {
+        ok: true,
+        complete: true,
+        seatsEntitled: 5,
+        members: members([{ id: 'stay-user', email: 'stay@example.com', role: 'standard-user' }]),
+        total: 2,
+      };
+    }
+    return { ok: true };
+  };
+  const job = await team.kickSelected(created.id, '踢出选中', ['gone-user', 'stay-user']);
+  assert.match(job.message, /gone@example.com/);
+  assert.match(job.message, /已确认退出并删除资料/);
+  assert.doesNotMatch(job.message, /gone-user：已不在名单里，没有踢/);
+  assert.match(job.message, /仍在名单里，没有删除资料/);
+  const wiped = await prisma.account.findUnique({ where: { id: gone.id } });
+  assert.equal(wiped.teamStatus, 'kicked');
+  assert.equal(await prisma.teamSecret.findUnique({ where: { accountId: gone.id } }), null);
+  const kept = await prisma.account.findUnique({ where: { id: stay.id } });
+  assert.equal(kept.teamStatus, 'file_ready');
+  assert.equal(kept.accessToken, 'stay-at');
+});
+
+test('刷新失败后快照标成不完整，但保留上次成员和到期', async (t) => {
+  const { team } = await fixture(t);
+  const created = await mother(team);
+  route = (path) => path.includes('snapshot')
+    ? {
+      ok: true,
+      complete: true,
+      seatsEntitled: 5,
+      willRenew: false,
+      activeUntil: '2026-10-08T03:12:01Z',
+      members: members([{ id: 'user-1', email: 'kid@example.com', role: 'standard-user' }]),
+      total: 2,
+    }
+    : { ok: true };
+  await team.refresh(created.id);
+  route = (path) => path.includes('snapshot')
+    ? { ok: false, code: 'UPSTREAM', message: '上游暂时失败' }
+    : { ok: true };
+  await assert.rejects(
+    () => team.refresh(created.id),
+    (error) => /上游暂时失败/.test(errorText(error)) && !/不完整/.test(errorText(error)),
+  );
+  const failed = (await team.listWorkspaces()).items.find((item) => item.id === created.id);
+  assert.equal(failed.snapshotComplete, false);
+  assert.equal(failed.seatsEntitled, 5);
+  assert.equal(failed.activeUntil, '2026-10-08T03:12:01Z');
+  assert.equal(failed.willRenew, false);
+  assert.match(failed.lastError, /上游暂时失败/);
+  const roster = await team.listRemoteMembers();
+  const kid = roster.items.find((item) => item.email === 'kid@example.com');
+  assert.equal(kid.snapshotComplete, false);
+});
+
+test('协议服务中断时刷新标成不完整，保留上次成员和到期，也不删账密', async (t) => {
+  const { prisma, team } = await fixture(t);
+  const created = await mother(team);
+  const imported = await team.importChildren('kid@example.com----chatgpt-pass----JBSWY3DPEHPK3PXP');
+  const child = await prisma.account.findUnique({ where: { cardKey: imported.created[0].cardKey } });
+  await prisma.account.update({
+    where: { id: child.id },
+    data: { workspaceId: created.id, userId: 'user-1', teamStatus: 'file_ready', accessToken: 'kid-at' },
+  });
+  route = (path) => path.includes('snapshot')
+    ? {
+      ok: true,
+      complete: true,
+      seatsEntitled: 5,
+      willRenew: false,
+      activeUntil: '2026-10-08T03:12:01Z',
+      members: members([{ id: 'user-1', email: 'kid@example.com', role: 'standard-user' }]),
+      total: 2,
+    }
+    : { ok: true };
+  await team.refresh(created.id);
+  const previousWorker = process.env.PROTOCOL_WORKER_URL;
+  process.env.PROTOCOL_WORKER_URL = 'http://127.0.0.1:1';
+  try {
+    await assert.rejects(
+      () => team.refresh(created.id),
+      (error) => /协议服务调用失败/.test(errorText(error)) && !/不完整/.test(errorText(error)),
+    );
+    const failed = (await team.listWorkspaces()).items.find((item) => item.id === created.id);
+    assert.equal(failed.snapshotComplete, false);
+    assert.equal(failed.sessionStatus, '有效');
+    assert.equal(failed.seatsEntitled, 5);
+    assert.equal(failed.activeUntil, '2026-10-08T03:12:01Z');
+    assert.equal(failed.willRenew, false);
+    assert.match(failed.lastError, /协议服务调用失败/);
+    const roster = await team.listRemoteMembers();
+    const kid = roster.items.find((item) => item.email === 'kid@example.com');
+    assert.equal(kid.snapshotComplete, false);
+    await assert.rejects(
+      () => team.kickSelected(created.id, '踢出选中', ['user-1']),
+      (error) => /协议服务调用失败/.test(errorText(error)),
+    );
+  } finally {
+    process.env.PROTOCOL_WORKER_URL = previousWorker;
+  }
+  const kept = await prisma.account.findUnique({ where: { id: child.id } });
+  assert.equal(kept.teamStatus, 'file_ready');
+  assert.equal(kept.accessToken, 'kid-at');
+  assert.ok(await prisma.teamSecret.findUnique({ where: { accountId: child.id } }));
+  assert.equal(calls.some((item) => String(item.path || '').includes('kick')), false);
+});
+
+test('撤回把母号标成失效时，名单也不能再踢', async (t) => {
+  const { prisma, team } = await fixture(t);
+  const created = await mother(team);
+  const snapshot = {
+    ok: true,
+    complete: true,
+    seatsEntitled: 5,
+    willRenew: false,
+    activeUntil: '2026-10-08T03:12:01Z',
+    members: members([{ id: 'user-1', email: 'kid@example.com', role: 'standard-user' }]),
+    invites: [{ email: 'pending@example.com' }],
+    total: 2,
+  };
+  route = (path) => path.includes('snapshot') ? snapshot : { ok: true };
+  await team.refresh(created.id);
+  route = (path) => {
+    if (path.includes('snapshot')) return snapshot;
+    if (path.includes('revoke')) return { ok: false, code: 'SESSION_EXPIRED', message: '母号 session 已失效，请重新贴一次' };
+    return { ok: true };
+  };
+  const job = await team.revokeInvites(created.id);
+  assert.match(job.message, /已失效/);
+  const expired = (await team.listWorkspaces()).items.find((item) => item.id === created.id);
+  assert.equal(expired.sessionStatus, '已失效');
+  assert.equal(expired.snapshotComplete, false);
+  assert.equal(expired.seatsEntitled, 5);
+  assert.equal(expired.activeUntil, '2026-10-08T03:12:01Z');
+  assert.equal(expired.willRenew, false);
+  const roster = await team.listRemoteMembers();
+  assert.equal(roster.items.find((item) => item.email === 'kid@example.com').snapshotComplete, false);
+
+  await prisma.teamWorkspace.update({
+    where: { id: created.id },
+    data: { sessionStatus: 'valid', snapshotComplete: true, lastError: null },
+  });
+  route = (path) => {
+    if (path.includes('snapshot')) return snapshot;
+    if (path.includes('revoke')) {
+      return {
+        ok: false,
+        code: 'SESSION_EXPIRED',
+        message: '母号 session 已失效，请重新贴一次',
+        sessionUpdate: { sessionToken: 'rotated-session', accessToken: 'personal-at' },
+      };
+    }
+    return { ok: true };
+  };
+  await team.revokeInvites(created.id);
+  const kept = (await team.listWorkspaces()).items.find((item) => item.id === created.id);
+  assert.equal(kept.sessionStatus, '有效');
+  assert.equal(kept.snapshotComplete, true);
+  assert.equal(kept.seatsEntitled, 5);
+  assert.equal(kept.activeUntil, '2026-10-08T03:12:01Z');
+  assert.match(String(kept.lastError || ''), /已保留/);
+});
+
+test('已经失效的母号再刷新或选踢，也会把名单标成不完整', async (t) => {
+  const { prisma, team } = await fixture(t);
+  const created = await mother(team);
+  const imported = await team.importChildren('kid@example.com----chatgpt-pass----JBSWY3DPEHPK3PXP');
+  const child = await prisma.account.findUnique({ where: { cardKey: imported.created[0].cardKey } });
+  await prisma.account.update({
+    where: { id: child.id },
+    data: { workspaceId: created.id, userId: 'user-1', teamStatus: 'file_ready', accessToken: 'kid-at' },
+  });
+  route = (path) => path.includes('snapshot')
+    ? {
+      ok: true,
+      complete: true,
+      seatsEntitled: 5,
+      willRenew: true,
+      activeUntil: '2026-10-08T03:12:01Z',
+      members: members([{ id: 'user-1', email: 'kid@example.com', role: 'standard-user' }]),
+      total: 2,
+    }
+    : { ok: true };
+  await team.refresh(created.id);
+  await prisma.teamWorkspace.update({
+    where: { id: created.id },
+    data: { sessionStatus: 'expired', snapshotComplete: true },
+  });
+  calls.length = 0;
+  await assert.rejects(
+    () => team.refresh(created.id),
+    (error) => /已失效/.test(errorText(error)),
+  );
+  assert.equal(calls.some((item) => String(item.path || '').includes('snapshot')), false);
+  const afterRefresh = (await team.listWorkspaces()).items.find((item) => item.id === created.id);
+  assert.equal(afterRefresh.snapshotComplete, false);
+  assert.equal(afterRefresh.seatsEntitled, 5);
+  assert.equal(afterRefresh.activeUntil, '2026-10-08T03:12:01Z');
+  assert.equal(afterRefresh.willRenew, true);
+  const roster = await team.listRemoteMembers();
+  assert.equal(roster.items.find((item) => item.email === 'kid@example.com').snapshotComplete, false);
+
+  await prisma.teamWorkspace.update({
+    where: { id: created.id },
+    data: { snapshotComplete: true },
+  });
+  calls.length = 0;
+  await assert.rejects(
+    () => team.kickSelected(created.id, '踢出选中', ['user-1']),
+    (error) => /已失效/.test(errorText(error)) && !/不完整/.test(errorText(error)),
+  );
+  assert.equal(calls.some((item) => String(item.path || '').includes('kick')), false);
+  const afterKick = (await team.listWorkspaces()).items.find((item) => item.id === created.id);
+  assert.equal(afterKick.snapshotComplete, false);
+  assert.equal(afterKick.activeUntil, '2026-10-08T03:12:01Z');
+  const kept = await prisma.account.findUnique({ where: { id: child.id } });
+  assert.equal(kept.teamStatus, 'file_ready');
+  assert.equal(kept.accessToken, 'kid-at');
+  assert.ok(await prisma.teamSecret.findUnique({ where: { accountId: child.id } }));
 });

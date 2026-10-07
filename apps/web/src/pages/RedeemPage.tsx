@@ -3,8 +3,8 @@ import { App as AntApp, Button, Input, InputNumber, Select, Tag } from 'antd';
 
 import { downloadBlob, downloadText, errorMessage, getPublicMeta, redeemCards } from '../api/client';
 import {
-  DELIVER_FORMAT_OPTIONS,
   isZipDeliverFormat,
+  publicDeliverFormats,
   selectDeliverFormat,
   type DeliverFormat,
   type PublicMeta,
@@ -109,18 +109,7 @@ export default function RedeemPage() {
 
   const cards = useMemo(() => parseCards(text), [text]);
 
-  const formatOptions = useMemo(() => {
-    const formats = meta?.formats ?? [];
-    if (formats.length > 0) {
-      return formats.map((item) => ({
-        value: item.value,
-        label: item.label,
-        ext: item.ext,
-        bundle: item.bundle,
-      }));
-    }
-    return DELIVER_FORMAT_OPTIONS;
-  }, [meta]);
+  const formatOptions = useMemo(() => publicDeliverFormats(meta?.formats), [meta]);
 
   const formatLabel = useMemo(
     () => formatOptions.find((item) => item.value === format)?.label ?? format,
@@ -156,7 +145,7 @@ export default function RedeemPage() {
 
     setSubmitting(true);
     try {
-      const data = await redeemCards({ cards, format, limit });
+      const data = await redeemCards(format === 'login' ? { cards, format } : { cards, format, limit });
       setResponse(data);
       setStatusText(`已选择 ${formatLabel} · 共 ${cards.length} 张`);
       void message.success(
@@ -272,8 +261,10 @@ export default function RedeemPage() {
                 </div>
                 <div className="stat-cell">
                   <div className="stat-cell__label">账号锁定</div>
-                  <div className="stat-cell__value">{limit > 1 ? `1:${limit}` : '1:1'}</div>
-                  <div className="stat-cell__caption">{limit > 1 ? '按后台上限交付' : '首次兑换后固定'}</div>
+                  <div className="stat-cell__value">{format === 'login' || limit <= 1 ? '1:1' : `1:${limit}`}</div>
+                  <div className="stat-cell__caption">
+                    {format === 'login' ? '账密只交付本卡账号' : limit > 1 ? '按后台上限交付' : '首次兑换后固定'}
+                  </div>
                 </div>
                 <div className="stat-cell">
                   <div className="stat-cell__label">交付格式</div>
@@ -348,9 +339,11 @@ export default function RedeemPage() {
                     min={1}
                     max={Math.min(20, Math.max(1, Math.trunc(Number(meta?.redeemLimitPerCard) || 1)))}
                     precision={0}
-                    value={limit}
+                    disabled={format === 'login'}
+                    value={format === 'login' ? 1 : limit}
                     onChange={(value) => setLimit(typeof value === 'number' ? value : 1)}
                   />
+                  {format === 'login' ? <div className="console__subtitle">账密不按数量追加账号</div> : null}
                 </div>
               </div>
 

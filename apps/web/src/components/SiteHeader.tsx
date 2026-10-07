@@ -1,6 +1,5 @@
 import { useEffect, useState } from 'react';
-import { NavLink, useNavigate } from 'react-router-dom';
-import { LockOutlined } from '@ant-design/icons';
+import { NavLink } from 'react-router-dom';
 
 import { getPublicMeta } from '../api/client';
 import BrandMark from './BrandMark';
@@ -14,7 +13,6 @@ const POLL_INTERVAL_MS = 30_000;
  * 状态圆点轮询 `GET /api/public/meta`：成功显示「服务在线」，失败显示「服务离线」。
  */
 export default function SiteHeader() {
-  const navigate = useNavigate();
   const [online, setOnline] = useState<boolean | null>(null);
 
   useEffect(() => {
@@ -60,15 +58,6 @@ export default function SiteHeader() {
 
         <div className="site-header__right">
           <StatusDot tone={tone} pulse={online === true} label={label} />
-          <button
-            type="button"
-            className="ghost-button"
-            onClick={() => navigate('/admin')}
-            aria-label="进入管理后台"
-          >
-            <LockOutlined className="ghost-button__glyph" />
-            管理入口
-          </button>
         </div>
       </div>
     </header>

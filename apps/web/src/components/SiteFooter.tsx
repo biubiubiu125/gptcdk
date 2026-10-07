@@ -19,8 +19,8 @@ export default function SiteFooter({ siteName = 'gptcdk' }: SiteFooterProps) {
         </span>
         <nav className="site-footer__links">
           <Link to="/">卡密兑换</Link>
+          <Link to="/reclaim">401 找回</Link>
           <Link to="/pickup">邮箱取件</Link>
-          <Link to="/admin">管理后台</Link>
         </nav>
       </div>
     </footer>

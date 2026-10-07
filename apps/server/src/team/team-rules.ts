@@ -178,6 +178,156 @@ export function emailsMatch(bound: string | null | undefined, next: string | nul
   return bound.trim().toLowerCase() === next.trim().toLowerCase();
 }
 
+export interface RemoteMember {
+  id: string;
+  email: string;
+  role: string;
+}
+
+export interface SessionUpdate {
+  accessToken?: string;
+  sessionToken?: string;
+  deviceId?: string;
+  cookies?: Array<{ name?: string; value?: string; domain?: string }>;
+}
+
+export function normalizeRemoteMembers(value: unknown): RemoteMember[] {
+  if (!Array.isArray(value)) return [];
+  const members: RemoteMember[] = [];
+  for (const item of value) {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) continue;
+    const row = item as { id?: unknown; email?: unknown; role?: unknown };
+    const id = typeof row.id === 'string' ? row.id.trim() : '';
+    const email = typeof row.email === 'string' ? row.email.trim() : '';
+    const role = typeof row.role === 'string' ? row.role.trim() : '';
+    if (!id || (!email && !role)) continue;
+    members.push({ id, email, role });
+  }
+  return members;
+}
+
+export function parseRemoteMembers(raw?: string | null): RemoteMember[] {
+  if (!raw) return [];
+  try {
+    return normalizeRemoteMembers(JSON.parse(raw));
+  } catch {
+    return [];
+  }
+}
+
+export function normalizeActiveUntil(value: unknown): string | null {
+  if (typeof value === 'number' && Number.isFinite(value)) return activeUntilFromUnix(value);
+  if (typeof value !== 'string') return null;
+  const text = value.trim();
+  if (!text) return null;
+  if (/^\d{10,13}$/.test(text)) return activeUntilFromUnix(Number(text));
+  if (/(?:Z|[+-]\d{2}:?\d{2})$/i.test(text)) {
+    const date = new Date(text);
+    if (Number.isNaN(date.getTime())) return null;
+    return date.toISOString().replace(/\.\d{3}Z$/, 'Z');
+  }
+  return text;
+}
+
+function activeUntilFromUnix(value: number): string | null {
+  if (!Number.isFinite(value) || value <= 0) return null;
+  const ms = value > 10_000_000_000 ? value : value * 1000;
+  const date = new Date(ms);
+  if (Number.isNaN(date.getTime())) return null;
+  return date.toISOString().replace(/\.\d{3}Z$/, 'Z');
+}
+
+export function stampDevice(session: string): string {
+  const parsed = JSON.parse(session) as Record<string, unknown>;
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('session 不是 JSON');
+  if (!String(parsed.oaiDeviceId || '').trim()) parsed.oaiDeviceId = randomDevice();
+  return JSON.stringify(parsed);
+}
+
+export function deviceIdOf(session: string): string {
+  try {
+    const parsed = JSON.parse(session) as { oaiDeviceId?: unknown };
+    return typeof parsed.oaiDeviceId === 'string' ? parsed.oaiDeviceId.trim() : '';
+  } catch {
+    return '';
+  }
+}
+
+export function mergeSession(plain: string, update?: SessionUpdate | null): string | null {
+  if (!update || typeof update !== 'object') return null;
+  let parsed: Record<string, unknown>;
+  try {
+    parsed = JSON.parse(plain) as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
+  let changed = false;
+  const accessToken = String(update.accessToken || '').trim();
+  const sessionToken = String(update.sessionToken || '').trim();
+  const deviceId = String(update.deviceId || '').trim();
+  if (accessToken && accessToken !== parsed.accessToken) {
+    parsed.accessToken = accessToken;
+    changed = true;
+  }
+  if (sessionToken && sessionToken !== parsed.sessionToken) {
+    parsed.sessionToken = sessionToken;
+    changed = true;
+  }
+  if (deviceId && deviceId !== parsed.oaiDeviceId) {
+    parsed.oaiDeviceId = deviceId;
+    changed = true;
+  }
+  if (Array.isArray(update.cookies) && update.cookies.length) {
+    const current = Array.isArray(parsed.cookies) ? parsed.cookies : [];
+    const merged = mergeCookies(current, update.cookies);
+    if (JSON.stringify(merged) !== JSON.stringify(current)) {
+      parsed.cookies = merged;
+      changed = true;
+    }
+  }
+  if (!changed) return null;
+  const stillUsable = String(parsed.accessToken || parsed.sessionToken || '').trim()
+    || (Array.isArray(parsed.cookies) && parsed.cookies.length > 0);
+  if (!stillUsable) return null;
+  return JSON.stringify(parsed);
+}
+
+function mergeCookies(
+  current: unknown[],
+  incoming: Array<{ name?: string; value?: string; domain?: string }>,
+): Array<{ name: string; value: string; domain: string }> {
+  const merged = current
+    .filter((item) => item && typeof item === 'object' && !Array.isArray(item))
+    .map((item) => {
+      const row = item as { name?: unknown; value?: unknown; domain?: unknown };
+      return {
+        name: String(row.name || '').trim(),
+        value: String(row.value || '').trim(),
+        domain: String(row.domain || '.chatgpt.com').trim() || '.chatgpt.com',
+      };
+    })
+    .filter((item) => item.name && item.value);
+  for (const item of incoming) {
+    const name = String(item?.name || '').trim();
+    const value = String(item?.value || '').trim();
+    if (!name || !value) continue;
+    const domain = String(item.domain || '.chatgpt.com').trim() || '.chatgpt.com';
+    const index = merged.findIndex((row) => row.name === name);
+    if (index >= 0) merged[index] = { name, value, domain };
+    else merged.push({ name, value, domain });
+  }
+  return merged;
+}
+
+function randomDevice(): string {
+  const bytes = Array.from({ length: 16 }, () => Math.floor(Math.random() * 256));
+  bytes[6] = (bytes[6] & 0x0f) | 0x40;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  const hex = bytes.map((item) => item.toString(16).padStart(2, '0')).join('');
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
 function firstText(...values: unknown[]): string {
   for (const value of values) {
     if (typeof value === 'string' && value.trim()) return value.trim();

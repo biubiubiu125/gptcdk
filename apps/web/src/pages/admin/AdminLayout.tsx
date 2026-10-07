@@ -22,21 +22,21 @@ import { useAuth } from '../../hooks/useAuth';
 const { Content, Header, Sider } = Layout;
 
 const PAGE_TITLES: Record<string, string> = {
-  '/admin/dashboard': '数据概览',
-  '/admin/accounts': '账号列表',
-  '/admin/team': '5x Team',
-  '/admin/cards': '卡密管理',
-  '/admin/tiers': '额度档位',
-  '/admin/settings': '系统设置',
+  '/biubiubiu/dashboard': '数据概览',
+  '/biubiubiu/accounts': '账号列表',
+  '/biubiubiu/team': '5x Team',
+  '/biubiubiu/cards': '卡密管理',
+  '/biubiubiu/tiers': '额度档位',
+  '/biubiubiu/settings': '系统设置',
 };
 
 const MENU_ITEMS: MenuProps['items'] = [
-  { key: '/admin/dashboard', icon: <DashboardOutlined />, label: '数据概览' },
-  { key: '/admin/accounts', icon: <TeamOutlined />, label: '账号列表' },
-  { key: '/admin/team', icon: <UsergroupAddOutlined />, label: '5x Team' },
-  { key: '/admin/cards', icon: <KeyOutlined />, label: '卡密管理' },
-  { key: '/admin/tiers', icon: <TagsOutlined />, label: '额度档位' },
-  { key: '/admin/settings', icon: <SettingOutlined />, label: '系统设置' },
+  { key: '/biubiubiu/dashboard', icon: <DashboardOutlined />, label: '数据概览' },
+  { key: '/biubiubiu/accounts', icon: <TeamOutlined />, label: '账号列表' },
+  { key: '/biubiubiu/team', icon: <UsergroupAddOutlined />, label: '5x Team' },
+  { key: '/biubiubiu/cards', icon: <KeyOutlined />, label: '卡密管理' },
+  { key: '/biubiubiu/tiers', icon: <TagsOutlined />, label: '额度档位' },
+  { key: '/biubiubiu/settings', icon: <SettingOutlined />, label: '系统设置' },
 ];
 
 interface PasswordFormValues {
@@ -48,7 +48,7 @@ interface PasswordFormValues {
 /**
  * 后台外壳：深色侧边栏 + 白色头部 + 内容区。
  *
- * 未登录时重定向到 `/admin/login`；任意接口 401 会由 `useAuth` 清理登录态。
+ * 未登录时重定向到 `/biubiubiu/login`；任意接口 401 会由 `useAuth` 清理登录态。
  */
 export default function AdminLayout() {
   const { message } = AntApp.useApp();
@@ -63,7 +63,7 @@ export default function AdminLayout() {
 
   const currentPath = useMemo(() => {
     const match = Object.keys(PAGE_TITLES).find((path) => location.pathname.startsWith(path));
-    return match ?? '/admin/accounts';
+    return match ?? '/biubiubiu/accounts';
   }, [location.pathname]);
 
   const displayName = user?.displayName || user?.username || 'admin';
@@ -77,7 +77,7 @@ export default function AdminLayout() {
   }
 
   if (!token) {
-    return <Navigate to="/admin/login" replace />;
+    return <Navigate to="/biubiubiu/login" replace />;
   }
 
   const handleMenuClick: MenuProps['onClick'] = ({ key }) => {
@@ -92,7 +92,7 @@ export default function AdminLayout() {
     if (key === 'logout') {
       logout();
       void message.success('已退出登录');
-      navigate('/admin/login', { replace: true });
+      navigate('/biubiubiu/login', { replace: true });
     }
   };
 
