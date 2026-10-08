@@ -85,7 +85,12 @@ async function main() {
   console.log('[1] 公共元信息');
   const meta = await call('GET', '/public/meta');
   assert(meta.json?.siteName === 'gptcdk', '站点信息读取正常', meta.json?.siteName);
-  assert(meta.json?.formats?.length === 9, '交付格式为 9 种', meta.json?.formats?.map((f) => f.value).join(', '));
+  const publicFormats = (meta.json?.formats || []).map((item) => item.value);
+  assert(
+    publicFormats.length === 8 && !publicFormats.includes('email'),
+    '前台交付格式为 8 种，不含邮箱 TXT',
+    publicFormats.join(', '),
+  );
   assert(meta.json?.formats?.every((item) => item.bundle === 'document' || item.bundle === 'zip'), '每种格式都标明打包方式');
   assert(
     Array.isArray(meta.json?.creditTiers),
