@@ -35,6 +35,7 @@ const SECRET_KEYS = new Set([
 ]);
 const ASSIGN_LOCK = 2147483001;
 const EXPIRED_SESSION = '母号 session 已失效，请重新贴一次';
+const SUBSCRIPTION_UNREAD = '订阅没读到，到期和席位仍是上次的';
 
 function responseText(body: unknown): string {
   if (typeof body === 'string' && body.trim()) return body;
@@ -549,7 +550,8 @@ export class TeamService implements OnModuleInit, OnModuleDestroy {
         return '成员名单不完整';
       }
       const count = Array.isArray(snapshot.members) ? snapshot.members.length : 0;
-      return `已刷新空间，成员 ${count} 人`;
+      const head = `已刷新空间，成员 ${count} 人`;
+      return snapshot.subscriptionRead === false ? `${head}。${SUBSCRIPTION_UNREAD}` : head;
     });
   }
 
@@ -838,6 +840,9 @@ export class TeamService implements OnModuleInit, OnModuleDestroy {
     const repaired = await this.wipeConfirmedMissing(mother, members.map((item) => item.id));
     const safeTargets = userIds.filter((id) => liveIds.includes(id));
     const limited = new Set<string>();
+    const kickFailures = new Map<string, string>();
+    const attempted = new Set<string>();
+    let halted = '';
     for (const userId of safeTargets) {
       const member = members.find((item) => item.id === userId);
       const child = await this.localChild(workspaceId, userId, member?.email);
@@ -854,9 +859,20 @@ export class TeamService implements OnModuleInit, OnModuleDestroy {
         userId,
         proxy,
       });
+      attempted.add(userId);
       await this.persistSession(mother.id, session, kicked);
-      if (kicked.rateLimited || /可能被限流/.test(kicked.message || '')) limited.add(userId);
+      const reason = String(kicked.message || '').trim();
+      if (kicked.rateLimited || /可能被限流/.test(reason)) limited.add(userId);
+      if (kicked.ok === false && reason) kickFailures.set(userId, reason);
+      const expired = kicked.code === 'SESSION_EXPIRED' || /session 已失效/.test(reason);
+      const blocked = kicked.code === 'EGRESS_BLOCKED' || /出口被拦截|出口预检失败/.test(reason);
+      if (kicked.ok === false && (expired || blocked) && !kicked.rateLimited && !/可能被限流/.test(reason)) {
+        if (expired) await this.markSession(mother.id, kicked, session);
+        halted = reason || (expired ? '母号 session 已失效，请重新贴一次' : '出口被拦截，已停止');
+        break;
+      }
     }
+    const failureNote = [...kickFailures.values()].filter(Boolean).join('；');
     if (!safeTargets.length) {
       const removed = repaired.map((item) => item.userId);
       const lines = repaired.map((item) => `${item.email || item.userId} / ${item.cardKey || '无卡密'} / ${item.redeemed ? '已兑换' : '未兑换'}：已确认退出并删除资料`);
@@ -865,19 +881,27 @@ export class TeamService implements OnModuleInit, OnModuleDestroy {
     const after = await this.snapshot(mother);
     if (!after.ok) {
       const extra = repaired.length ? `已删除 ${repaired.length} 个已不在名单里的资料；` : '';
-      bizError('UPSTREAM_ERROR', `${extra}${after.message || '空间刷新失败'}`);
+      const noted = failureNote ? `${failureNote}；` : '';
+      bizError('UPSTREAM_ERROR', `${extra}${noted}${after.message || '空间刷新失败'}`);
     }
     if (!after.complete) {
       const extra = repaired.length ? `已删除 ${repaired.length} 个已不在名单里的资料；` : '';
+      const noted = failureNote ? `${failureNote}；` : '';
       const tail = repaired.length
         ? '复核快照不完整，这次要踢的人没有删除账密或文件'
         : '复核快照不完整，没有删除任何账密或文件';
-      bizError('CONFLICT', `${extra}${tail}`);
+      bizError('CONFLICT', `${extra}${noted}${tail}`);
     }
     const removedNow = confirmedAbsent(members.map((item) => item.id), (after.members || []).map((item) => item.id), safeTargets);
     const removed = [...repaired.map((item) => item.userId), ...removedNow];
     const lines: string[] = repaired.map((item) => `${item.email || item.userId} / ${item.cardKey || '无卡密'} / ${item.redeemed ? '已兑换' : '未兑换'}：已确认退出并删除资料`);
     const warn = (userId: string) => limited.has(userId) ? '，可能被限流' : '';
+    const keptDetail = (userId: string) => {
+      const reason = kickFailures.get(userId);
+      if (reason) return `，${reason}`;
+      if (halted && !attempted.has(userId)) return `，未继续踢：${halted}`;
+      return '';
+    };
     for (const userId of removedNow) {
       const member = members.find((item) => item.id === userId);
       const child = await this.localChild(workspaceId, userId, member?.email);
@@ -888,12 +912,12 @@ export class TeamService implements OnModuleInit, OnModuleDestroy {
     for (const userId of kept) {
       const member = members.find((item) => item.id === userId);
       const child = await this.localChild(workspaceId, userId, member?.email);
-      lines.push(`${member?.email || userId} / ${child?.cardKey || '无卡密'} / ${child?.redeemStatus === 'redeemed' ? '已兑换' : '未兑换'}：仍在名单里，没有删除资料${warn(userId)}`);
+      lines.push(`${member?.email || userId} / ${child?.cardKey || '无卡密'} / ${child?.redeemStatus === 'redeemed' ? '已兑换' : '未兑换'}：仍在名单里，没有删除资料${warn(userId)}${keptDetail(userId)}`);
     }
     const summary = kept.length
       ? `已确认退出 ${removed.length} 人，仍在名单里的 ${kept.length} 人没有删除资料`
       : `已确认退出 ${removed.length} 人`;
-    const head = limited.size ? '母号 session 踢人，可能被限流' : '';
+    const head = [limited.size ? '母号 session 踢人，可能被限流' : '', halted].filter(Boolean).join('；');
     return { removed, message: [head, summary, ...lines].filter(Boolean).join('\n') };
   }
 
@@ -1037,8 +1061,11 @@ export class TeamService implements OnModuleInit, OnModuleDestroy {
       data.seatsEntitled = seats;
       data.activeUntil = expiry;
       data.willRenew = willRenew;
+      data.subscriptionRead = !subscriptionMissing;
+      if (subscriptionMissing) data.lastError = SUBSCRIPTION_UNREAD;
       if (this.seatHoldReleased(live, seats, memberCount, openSeats, complete)) data.inviteHold = null;
     } else if (!subscriptionMissing) {
+      data.subscriptionRead = true;
       data.memberCount = null;
       if (typeof result.seatsEntitled === 'number') data.seatsEntitled = result.seatsEntitled;
       if (expiry) data.activeUntil = expiry;
@@ -1053,6 +1080,7 @@ export class TeamService implements OnModuleInit, OnModuleDestroy {
       seatsEntitled: seats,
       activeUntil: expiry,
       willRenew,
+      subscriptionRead: !subscriptionMissing,
       members: complete ? members : parseRemoteMembers(live.remoteMembersJson),
     };
   }
@@ -1478,6 +1506,7 @@ export class TeamService implements OnModuleInit, OnModuleDestroy {
     snapshotComplete: boolean;
     activeUntil: string | null;
     willRenew: boolean | null;
+    subscriptionRead?: boolean | null;
     inviteHold?: string | null;
     sessionCipher?: string | null;
   }, reveal: boolean) {
@@ -1498,6 +1527,7 @@ export class TeamService implements OnModuleInit, OnModuleDestroy {
       snapshotComplete: row.snapshotComplete,
       activeUntil: row.activeUntil,
       willRenew: row.willRenew,
+      subscriptionRead: row.subscriptionRead ?? null,
       inviteHold: row.inviteHold || null,
       canAutoRenew: this.canAutoRenew('sessionCipher' in row ? row.sessionCipher : null),
       session: reveal ? undefined : undefined,

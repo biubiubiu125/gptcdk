@@ -5,8 +5,8 @@
 
 ## 当前版本
 
-- 当前版本是 `1.1.0`，以根目录 `package.json` 为准；`apps/server/package.json` 与 `apps/web/package.json` 必须与它一致。
-- 数据库只使用 PostgreSQL。`SchemaMigration` 的版本号仍是 `1`。`stagedCredential`、`refreshHeld`、`remoteMembersJson` 和其它 Team 相关列都在这个版本门外面用 `ADD COLUMN IF NOT EXISTS` 补齐，不要为这些列再插一条版本记录。
+- 当前版本是 `1.1.1`，以根目录 `package.json` 为准；`apps/server/package.json` 与 `apps/web/package.json` 必须与它一致。
+- 数据库只使用 PostgreSQL。`SchemaMigration` 的版本号仍是 `1`。`stagedCredential`、`refreshHeld`、`remoteMembersJson`、`subscriptionRead` 和其它 Team 相关列都在这个版本门外面用 `ADD COLUMN IF NOT EXISTS` 补齐，不要为这些列再插一条版本记录。
 
 ## 兑换与找回
 
@@ -26,7 +26,9 @@
 - 分配按空位从少到多，空位相同用更早的 `createdAt`。同一母号两次邀请至少隔 10 分钟；只有邀请请求实际发出后才写 `lastInviteAt`。邀请失败只停当前母号，不打断其他母号。
 - 邀请返回 200 不等于已加入。席位已满、空间停用或空间不存在要停住后续邀请。公式算出的空位不能单独清掉 `seat_full`。
 - 踢出必须先有完整名单。人还在名单里不删资料。确认不在后才删密码、2FA、token、`rawJson`、用量和邮箱，并把状态改成 `kicked`。已确认离开但本地还在的，下次踢人用踢前完整快照补删。
+- 踢出失败要留下真实原因，不能一律写成可能被限流。只有真正限流才标限流。母号兜底踢人成功时仍提示可能被限流。session 失效或出口被拦截时停止继续踢后面的人；session 失效要把母号标成失效。
 - 完整快照才覆盖 `remoteMembersJson`。名单不完整时仍显示上次完整名单，但不能踢人。踢出选中必须输入「踢出选中」，只踢普通成员，不踢所有者或母号，踢完不自动分配。
-- 协议换到的 session 即使这次调用失败也要留下，下次再用。缺设备号时补上。
+- 订阅没读到时，席位、到期和是否续费仍用上次的值，并标明这次没核对。下次订阅读到后清掉这个标记。
+- 协议换到的 session 即使这次调用失败也要留下，下次再用。缺设备号时补上。子号自退使用已保存的设备号，不改母号会话。
 - 代理顺序是子号、母号、全局。只接受 SOCKS。三者都空就失败，不直连。协议服务不连数据库，不发布端口。
 - 不读子号邮箱，不按用量自动踢人，不做定时轮转。`oai-client-*` 观察头只转发已有值，不自行编造。

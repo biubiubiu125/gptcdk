@@ -212,6 +212,7 @@ model TeamWorkspace {
   snapshotAt         DateTime?
   willRenew          Boolean?
   activeUntil        String?
+  subscriptionRead   Boolean?
   remoteMembersJson  String?
   lastInviteAt       DateTime?
   createdAt          DateTime  @default(now())

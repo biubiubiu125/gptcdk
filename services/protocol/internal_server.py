@@ -245,19 +245,44 @@ def open_session(proxy: str):
     return http
 
 
-def bind_device(http, body, session=None) -> None:
+def saved_device_id(body, session=None) -> str:
     device = str((body or {}).get("deviceId") or "").strip()
     if not device and isinstance(session, dict):
         device = str(session.get("oaiDeviceId") or session.get("oai_device_id") or "").strip()
-    if device:
-        try:
-            http.oai_device_id = device
-        except Exception:
-            pass
+    return device
+
+
+def apply_saved_device(http, body, session=None) -> None:
+    device = saved_device_id(body, session)
+    if not device:
+        return
+    try:
+        http.oai_device_id = device
+    except Exception:
+        pass
+
+
+def bind_device(http, body, session=None) -> None:
+    apply_saved_device(http, body, session)
     try:
         _bound.http = http
     except Exception:
         pass
+
+
+def mother_kick_error(error: TeamCallError):
+    limited = error.code == "RATE_LIMITED" or error.http_status == 429
+    if limited:
+        return fail(error.code, f"{error.message}，可能被限流", rateLimited=True)
+    return fail(error.code, error.message, error.http_status or 400)
+
+
+def mother_kick_status(status: int):
+    if status in (200, 204):
+        return ok(temporary=True, rateLimited=True, message="可能被限流")
+    if status == 429:
+        return fail("RATE_LIMITED", f"退出失败：HTTP {status}，可能被限流", 429, rateLimited=True)
+    return fail("UPSTREAM", f"退出失败：HTTP {status}")
 
 
 def normalize_active_until(value):
@@ -1224,6 +1249,7 @@ def team_kick(body: dict):
     try:
         proxy = require_socks(body.get("proxy") or "")
         http = open_session(proxy)
+        apply_saved_device(http, body, mother_session(body.get("session")))
         precheck(http)
         stored = str(body.get("accessToken") or "").strip()
         if stored:
@@ -1261,10 +1287,8 @@ def team_kick(body: dict):
                 token = str(exchanged.get("accessToken") or exchanged.get("access_token") or "")
                 status = delete_member(http, token, workspace_id, user_id)
             except TeamCallError as error:
-                return fail(error.code, f"{error.message}，可能被限流", rateLimited=True)
-            if status in (200, 204):
-                return ok(temporary=True, rateLimited=True, message="可能被限流")
-            return fail("UPSTREAM", f"退出失败：HTTP {status}，可能被限流", rateLimited=True)
+                return mother_kick_error(error)
+            return mother_kick_status(status)
         return fail("AUTH", "自退失败，且没有母号会话可兜底")
     except TeamCallError as error:
         return fail(error.code, error.message)

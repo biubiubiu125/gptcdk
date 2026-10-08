@@ -591,6 +591,7 @@ export interface TeamWorkspaceRow {
   canAutoRenew?: boolean;
   willRenew?: boolean | null;
   activeUntil?: string | null;
+  subscriptionRead?: boolean | null;
   inviteHold?: string | null;
 }
 

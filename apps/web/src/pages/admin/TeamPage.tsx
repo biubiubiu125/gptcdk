@@ -44,9 +44,10 @@ function detachedNames(saved: unknown): string[] {
   return Array.isArray(names) ? names.map((item) => String(item || '')).filter(Boolean) : [];
 }
 
-function expiryText(value?: string | null, willRenew?: boolean | null) {
+function expiryText(value?: string | null, willRenew?: boolean | null, subscriptionRead?: boolean | null) {
   const text = String(value || '').trim();
-  if (!text) return '未知';
+  const unread = subscriptionRead === false ? '（这次没核对）' : '';
+  if (!text) return `未知${unread}`;
   const hasZone = /(?:Z|[+-]\d{2}:?\d{2})$/i.test(text);
   let shown = text;
   if (hasZone) {
@@ -67,7 +68,8 @@ function expiryText(value?: string | null, willRenew?: boolean | null) {
   } else {
     shown = `${text}（时区不明）`;
   }
-  return willRenew === false ? `${shown} 不续费` : shown;
+  const marked = willRenew === false ? `${shown} 不续费` : shown;
+  return `${marked}${unread}`;
 }
 
 function jobMessage(result: unknown): string {
@@ -264,6 +266,7 @@ export default function TeamPage() {
   return (
     <Space direction="vertical" size={16} style={{ width: '100%' }}>
       {notice ? <Card size="small"><Text type="warning">{notice}</Text></Card> : null}
+      <Card size="small"><Text type="warning">同一份母号 session 不要中途更换 SOCKS 出口 IP。换 IP 可能导致 session 失效，需要重新粘贴。</Text></Card>
       <Tabs
         items={[
           {
@@ -281,12 +284,16 @@ export default function TeamPage() {
                   columns={[
                     { title: '邮箱', dataIndex: 'email' },
                     { title: '空间', dataIndex: 'displayName' },
-                    { title: '空位', dataIndex: 'emptySeats', render: (value) => value ?? '未知' },
+                    { title: '空位', dataIndex: 'emptySeats', render: (value, row) => {
+                      const unread = row.subscriptionRead === false ? '（这次没核对）' : '';
+                      return value == null ? `席位未知${unread}` : `${value}${unread}`;
+                    } },
+                    { title: '已解析人数', dataIndex: 'memberCount', render: (value) => value ?? '未知' },
                     { title: '状态', render: (_, row) => {
                       const hold = row.inviteHold === 'seat_full' ? '席位已满已停止' : row.inviteHold === 'stopped' ? '空间不可用已停止' : row.sessionStatus;
                       return row.canAutoRenew === false ? `${hold}（不能自动续期）` : hold;
                     } },
-                    { title: '到期', render: (_, row) => expiryText(row.activeUntil, row.willRenew) },
+                    { title: '到期时间（北京时间）', render: (_, row) => expiryText(row.activeUntil, row.willRenew, row.subscriptionRead) },
                     { title: '最近成功', dataIndex: 'lastSuccessAt', render: (value) => value || '—' },
                     { title: '最近错误', dataIndex: 'lastError', render: (value) => value || '—' },
                     {
@@ -389,7 +396,7 @@ export default function TeamPage() {
                               title: '踢出选中的普通成员',
                               content: (
                                 <div>
-                                  <Paragraph>只踢勾选的普通成员，不会自动分配空位。所有者不会被踢。</Paragraph>
+                                  <Paragraph>只踢勾选的普通成员，不会自动分配空位。所有者不会被踢。踢出后账密和文件不能恢复。</Paragraph>
                                   <Input placeholder="请输入踢出选中" onChange={(event) => { typed = event.target.value; }} />
                                 </div>
                               ),
@@ -431,8 +438,49 @@ export default function TeamPage() {
                         columns={[
                           { title: '邮箱', dataIndex: 'email', render: (value: string) => value || '—' },
                           { title: '角色', dataIndex: 'role', render: (value: string) => value || '—' },
+                          { title: '本地归属', dataIndex: 'local', render: (value: boolean) => value ? '本地子号' : '仅远程' },
+                          { title: '兑换状态', dataIndex: 'redeemStatus', render: (value: string) => value === 'redeemed' ? '已兑换' : value ? '未兑换' : '—' },
                           { title: '成员编号', dataIndex: 'id' },
                           { title: '卡密', dataIndex: 'cardKey', render: (value: string) => value || '—' },
+                          {
+                            title: '操作',
+                            render: (_: unknown, row: RemoteMemberRow) => {
+                              const motherEmail = String(mother?.motherEmail || '').trim().toLowerCase();
+                              const isMother = Boolean(row.email) && row.email.trim().toLowerCase() === motherEmail;
+                              const canKick = row.role === 'standard-user' && mother?.snapshotComplete === true && !isMother;
+                              const redeemed = row.local && row.redeemStatus === 'redeemed';
+                              return (
+                                <Button size="small" danger disabled={!canKick} title={canKick ? undefined : '成员快照不完整或不能踢所有者'} onClick={() => {
+                                  let typed = '';
+                                  modal.confirm({
+                                    title: redeemed ? '这张卡密已经兑换过，踢出后账密和文件不能恢复' : '确认踢出这个成员？',
+                                    content: (
+                                      <div>
+                                        <Paragraph>邮箱 {row.email || '无'}，卡密 {row.cardKey || '无'}，{row.local ? (redeemed ? '已兑换' : '未兑换') : '不是本地子号'}。只退出这个成员。{row.local ? '踢出后账密和文件不能恢复。' : '没有本地账密可删。'}</Paragraph>
+                                        <Input placeholder="请输入踢出选中" onChange={(event) => { typed = event.target.value; }} />
+                                      </div>
+                                    ),
+                                    okText: '踢出选中',
+                                    onOk: () => {
+                                      if (typed.trim() !== '踢出选中') {
+                                        void message.error('请输入「踢出选中」');
+                                        return Promise.reject(new Error('confirm'));
+                                      }
+                                      return kickSelectedTeam(workspaceId, [row.id]).then((job) => {
+                                        const warning = rateLimitText(job);
+                                        if (warning) void message.warning(warning);
+                                        else if (jobMessage(job)) void message.success(jobMessage(job));
+                                        return load();
+                                      }).catch((error) => {
+                                        void message.error(errorMessage(error));
+                                        return load();
+                                      });
+                                    },
+                                  });
+                                }}>踢出</Button>
+                              );
+                            },
+                          },
                         ]}
                       />
                     </Card>
@@ -447,7 +495,8 @@ export default function TeamPage() {
             children: (
               <Space direction="vertical" style={{ width: '100%' }}>
                 <Card size="small" title="导入免费子号">
-                  <TextArea rows={6} value={importText} onChange={(event) => setImportText(event.target.value)} placeholder="邮箱----ChatGPT密码----2FA密钥" />
+                  <Paragraph type="secondary">每行格式：邮箱----ChatGPT密码----2FA密钥。2FA 是密钥，不是验证码数字。</Paragraph>
+                  <TextArea rows={6} value={importText} onChange={(event) => setImportText(event.target.value)} placeholder="邮箱----ChatGPT密码----2FA密钥。2FA 是密钥，不是验证码数字" />
                   <Button style={{ marginTop: 12 }} type="primary" loading={busy} onClick={() => void run(async () => {
                     const result = await importTeamLines(importText);
                     setImportText('');
@@ -512,7 +561,7 @@ export default function TeamPage() {
               </Space>
             </Form.Item>
           ) : null}
-          <Form.Item label="母号 SOCKS，可留空" extra="留空不会改掉原来的代理，也不会直连。">
+          <Form.Item label="母号 SOCKS，可留空" extra="留空不会改掉原来的代理，也不会直连。同一份 session 不要中途更换 SOCKS 出口 IP。">
             <Input value={proxyText} onChange={(event) => setProxyText(event.target.value)} placeholder="socks5://主机:端口" />
           </Form.Item>
         </Form>
