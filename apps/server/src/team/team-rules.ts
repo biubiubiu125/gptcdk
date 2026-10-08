@@ -106,6 +106,21 @@ export function countedMembers(members: Array<{ email?: string | null }> | null 
   return list.length + (present ? 0 : 1);
 }
 
+export function premiumOccupancy(
+  members: Array<{ email?: string | null; seatType?: string | null }> | null | undefined,
+  motherEmail?: string | null,
+  seatsInUse?: number | null,
+): number | null {
+  if (typeof seatsInUse === 'number' && Number.isInteger(seatsInUse) && seatsInUse >= 0) return seatsInUse;
+  const list = Array.isArray(members) ? members : [];
+  const typed = list.some((item) => String(item?.seatType || '').trim());
+  if (!typed) return countedMembers(list, motherEmail);
+  const premium = list.filter((item) => String(item?.seatType || '').trim().toLowerCase() === 'default').length;
+  const mother = String(motherEmail || '').trim().toLowerCase();
+  const present = Boolean(mother) && list.some((item) => String(item?.email || '').trim().toLowerCase() === mother);
+  return premium + (present ? 0 : 1);
+}
+
 export function emptySeats(entitled: number | null | undefined, memberCount: number | null | undefined, complete: boolean): number | null {
   if (!complete || entitled == null || memberCount == null) return null;
   if (!Number.isInteger(entitled) || entitled < 0 || !Number.isInteger(memberCount) || memberCount < 0) return null;
@@ -182,6 +197,7 @@ export interface RemoteMember {
   id: string;
   email: string;
   role: string;
+  seatType?: string;
 }
 
 export interface SessionUpdate {
@@ -196,12 +212,13 @@ export function normalizeRemoteMembers(value: unknown): RemoteMember[] {
   const members: RemoteMember[] = [];
   for (const item of value) {
     if (!item || typeof item !== 'object' || Array.isArray(item)) continue;
-    const row = item as { id?: unknown; email?: unknown; role?: unknown };
+    const row = item as { id?: unknown; email?: unknown; role?: unknown; seatType?: unknown; seat_type?: unknown };
     const id = typeof row.id === 'string' ? row.id.trim() : '';
     const email = typeof row.email === 'string' ? row.email.trim() : '';
     const role = typeof row.role === 'string' ? row.role.trim() : '';
+    const seatType = typeof row.seatType === 'string' ? row.seatType.trim() : typeof row.seat_type === 'string' ? row.seat_type.trim() : '';
     if (!id || (!email && !role)) continue;
-    members.push({ id, email, role });
+    members.push(seatType ? { id, email, role, seatType } : { id, email, role });
   }
   return members;
 }

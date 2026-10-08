@@ -56,6 +56,7 @@ export async function initializeSchema(prisma: PrismaClient): Promise<void> {
       "lastError" TEXT,
       "socksCipher" TEXT,
       "seatsEntitled" INTEGER,
+      "seatsInUse" INTEGER,
       "memberCount" INTEGER,
       "snapshotComplete" BOOLEAN NOT NULL DEFAULT false,
       "snapshotAt" TIMESTAMP,
@@ -70,6 +71,7 @@ export async function initializeSchema(prisma: PrismaClient): Promise<void> {
     await tx.$executeRawUnsafe('ALTER TABLE "TeamWorkspace" ADD COLUMN IF NOT EXISTS "inviteHold" TEXT');
     await tx.$executeRawUnsafe('ALTER TABLE "TeamWorkspace" ADD COLUMN IF NOT EXISTS "remoteMembersJson" TEXT');
     await tx.$executeRawUnsafe('ALTER TABLE "TeamWorkspace" ADD COLUMN IF NOT EXISTS "subscriptionRead" BOOLEAN');
+    await tx.$executeRawUnsafe('ALTER TABLE "TeamWorkspace" ADD COLUMN IF NOT EXISTS "seatsInUse" INTEGER');
     await tx.$executeRawUnsafe('CREATE UNIQUE INDEX IF NOT EXISTS "TeamWorkspace_openaiWorkspaceId_key" ON "TeamWorkspace"("openaiWorkspaceId")');
     await tx.$executeRawUnsafe('CREATE INDEX IF NOT EXISTS "TeamWorkspace_motherEmail_idx" ON "TeamWorkspace"("motherEmail")');
     await tx.$executeRawUnsafe(`CREATE TABLE IF NOT EXISTS "TeamSecret" (

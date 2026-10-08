@@ -13,6 +13,7 @@ import {
   emailsMatch,
   countedMembers,
   emptySeats,
+  premiumOccupancy,
   inviteAllowed,
   inviteSlots,
   kickTargets,
@@ -36,6 +37,7 @@ const SECRET_KEYS = new Set([
 const ASSIGN_LOCK = 2147483001;
 const EXPIRED_SESSION = '母号 session 已失效，请重新贴一次';
 const SUBSCRIPTION_UNREAD = '订阅没读到，到期和席位仍是上次的';
+const PREMIUM_UNKNOWN = '订阅没有席位类型，不能确认高级席位';
 
 function responseText(body: unknown): string {
   if (typeof body === 'string' && body.trim()) return body;
@@ -392,7 +394,11 @@ export class TeamService implements OnModuleInit, OnModuleDestroy {
         skipped.push({ id: mother.id, ok: false, message: jobText(error) });
         continue;
       }
-      const empty = emptySeats(snapshot.seatsEntitled, countedMembers(snapshot.members, mother.motherEmail), Boolean(snapshot.complete));
+      const empty = emptySeats(
+        snapshot.seatsEntitled,
+        typeof snapshot.seatsInUse === 'number' ? snapshot.seatsInUse : premiumOccupancy(snapshot.members, mother.motherEmail, null),
+        Boolean(snapshot.complete),
+      );
       if (empty == null || empty <= 0) {
         onboardOnly.push(mother.id);
         continue;
@@ -551,7 +557,9 @@ export class TeamService implements OnModuleInit, OnModuleDestroy {
       }
       const count = Array.isArray(snapshot.members) ? snapshot.members.length : 0;
       const head = `已刷新空间，成员 ${count} 人`;
-      return snapshot.subscriptionRead === false ? `${head}。${SUBSCRIPTION_UNREAD}` : head;
+      if (snapshot.subscriptionRead === false) return `${head}。${SUBSCRIPTION_UNREAD}`;
+      if (snapshot.premiumKnown === false) return `${head}。${PREMIUM_UNKNOWN}`;
+      return head;
     });
   }
 
@@ -694,7 +702,15 @@ export class TeamService implements OnModuleInit, OnModuleDestroy {
         if (pending.length) bizError('UPSTREAM_ERROR', withPending('邀请列表不完整，没有发送邀请'));
         return '邀请列表不完整，没有发送邀请';
       }
-      const empty = emptySeats(snapshot.seatsEntitled, countedMembers(snapshot.members, mother.motherEmail), true);
+      if (snapshot.premiumKnown === false) {
+        if (pending.length) bizError('UPSTREAM_ERROR', withPending('高级席位无法确认，没有发送邀请'));
+        return '高级席位无法确认，没有发送邀请';
+      }
+      const empty = emptySeats(
+        snapshot.seatsEntitled,
+        typeof snapshot.seatsInUse === 'number' ? snapshot.seatsInUse : premiumOccupancy(snapshot.members, mother.motherEmail, null),
+        true,
+      );
       const slots = inviteSlots(empty);
       if (!slots) {
         if (pending.length) bizError('UPSTREAM_ERROR', withPending('没有空位，没有发送邀请'));
@@ -995,15 +1011,16 @@ export class TeamService implements OnModuleInit, OnModuleDestroy {
   }
 
   private seatHoldReleased(
-    live: { inviteHold?: string | null; seatsEntitled?: number | null; memberCount?: number | null },
+    live: { inviteHold?: string | null; seatsEntitled?: number | null; memberCount?: number | null; seatsInUse?: number | null },
     seatsEntitled: number | null,
-    memberCount: number | null,
+    occupancy: number | null,
     openSeats: number | null,
     complete: boolean,
   ): boolean {
     if (!complete || live.inviteHold !== 'seat_full' || openSeats == null || openSeats <= 0) return false;
     const seatsIncreased = seatsEntitled != null && live.seatsEntitled != null && seatsEntitled > live.seatsEntitled;
-    const membersDecreased = memberCount != null && live.memberCount != null && memberCount < live.memberCount;
+    const previous = typeof live.seatsInUse === 'number' ? live.seatsInUse : live.memberCount;
+    const membersDecreased = occupancy != null && previous != null && occupancy < previous;
     return seatsIncreased || membersDecreased;
   }
 
@@ -1043,13 +1060,19 @@ export class TeamService implements OnModuleInit, OnModuleDestroy {
     }
     const members = normalizeRemoteMembers(result.members);
     const subscriptionMissing = result.subscriptionRead === false;
-    const expiry = subscriptionMissing ? (live.activeUntil ?? null) : normalizeActiveUntil(result.activeUntil);
+    const premiumUnknown = !subscriptionMissing && result.premiumKnown === false;
+    const expiry = subscriptionMissing
+      ? (live.activeUntil ?? null)
+      : premiumUnknown ? null : normalizeActiveUntil(result.activeUntil);
     const memberCount = complete ? countedMembers(members, live.motherEmail) : null;
     const seats = subscriptionMissing
       ? (typeof live.seatsEntitled === 'number' ? live.seatsEntitled : null)
-      : (result.seatsEntitled ?? null);
-    const willRenew = subscriptionMissing ? (live.willRenew ?? null) : (result.willRenew ?? null);
-    const openSeats = emptySeats(seats, memberCount, complete);
+      : premiumUnknown ? null : (result.seatsEntitled ?? null);
+    const willRenew = subscriptionMissing ? (live.willRenew ?? null) : premiumUnknown ? null : (result.willRenew ?? null);
+    const occupancy = complete
+      ? premiumOccupancy(members, live.motherEmail, subscriptionMissing || premiumUnknown ? null : result.seatsInUse)
+      : null;
+    const openSeats = emptySeats(seats, occupancy, complete);
     const data: Prisma.TeamWorkspaceUpdateInput = {
       snapshotComplete: complete,
       snapshotAt: new Date(),
@@ -1059,11 +1082,13 @@ export class TeamService implements OnModuleInit, OnModuleDestroy {
       data.remoteMembersJson = JSON.stringify(members);
       data.memberCount = memberCount;
       data.seatsEntitled = seats;
+      data.seatsInUse = occupancy;
       data.activeUntil = expiry;
       data.willRenew = willRenew;
       data.subscriptionRead = !subscriptionMissing;
       if (subscriptionMissing) data.lastError = SUBSCRIPTION_UNREAD;
-      if (this.seatHoldReleased(live, seats, memberCount, openSeats, complete)) data.inviteHold = null;
+      else if (premiumUnknown) data.lastError = PREMIUM_UNKNOWN;
+      if (this.seatHoldReleased(live, seats, occupancy, openSeats, complete)) data.inviteHold = null;
     } else if (!subscriptionMissing) {
       data.subscriptionRead = true;
       data.memberCount = null;
@@ -1078,9 +1103,11 @@ export class TeamService implements OnModuleInit, OnModuleDestroy {
       ...result,
       complete,
       seatsEntitled: seats,
+      seatsInUse: occupancy,
       activeUntil: expiry,
       willRenew,
       subscriptionRead: !subscriptionMissing,
+      premiumKnown: subscriptionMissing ? true : result.premiumKnown !== false,
       members: complete ? members : parseRemoteMembers(live.remoteMembersJson),
     };
   }
@@ -1502,6 +1529,7 @@ export class TeamService implements OnModuleInit, OnModuleDestroy {
     lastError: string | null;
     socksCipher: string | null;
     seatsEntitled: number | null;
+    seatsInUse?: number | null;
     memberCount: number | null;
     snapshotComplete: boolean;
     activeUntil: string | null;
@@ -1520,9 +1548,10 @@ export class TeamService implements OnModuleInit, OnModuleDestroy {
       lastError: row.lastError,
       hasSocks: Boolean(row.socksCipher),
       seatsEntitled: row.seatsEntitled,
+      seatsInUse: row.seatsInUse ?? null,
       memberCount: row.memberCount,
-      emptySeats: row.snapshotComplete && row.seatsEntitled != null && row.memberCount != null
-        ? Math.max(0, row.seatsEntitled - row.memberCount)
+      emptySeats: row.snapshotComplete && row.seatsEntitled != null && (row.seatsInUse != null || row.memberCount != null)
+        ? Math.max(0, row.seatsEntitled - (row.seatsInUse ?? row.memberCount ?? 0))
         : null,
       snapshotComplete: row.snapshotComplete,
       activeUntil: row.activeUntil,

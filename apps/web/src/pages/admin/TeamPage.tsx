@@ -284,9 +284,9 @@ export default function TeamPage() {
                   columns={[
                     { title: '邮箱', dataIndex: 'email' },
                     { title: '空间', dataIndex: 'displayName' },
-                    { title: '空位', dataIndex: 'emptySeats', render: (value, row) => {
+                    { title: '高级空位', dataIndex: 'emptySeats', render: (value, row) => {
                       const unread = row.subscriptionRead === false ? '（这次没核对）' : '';
-                      return value == null ? `席位未知${unread}` : `${value}${unread}`;
+                      return value == null ? `高级席位未知${unread}` : `${value}${unread}`;
                     } },
                     { title: '已解析人数', dataIndex: 'memberCount', render: (value) => value ?? '未知' },
                     { title: '状态', render: (_, row) => {

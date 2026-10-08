@@ -24,6 +24,7 @@ PORT = int(os.environ.get("PROTOCOL_WORKER_PORT", "8080"))
 CHATGPT = "https://chatgpt.com"
 AUTH = "https://auth.openai.com"
 MAX_BODY = 2_000_000
+PREMIUM_SEAT = "default"
 _bound = threading.local()
 
 
@@ -534,6 +535,106 @@ def walk(value):
             yield from walk(item)
 
 
+def seat_label(node) -> str:
+    if not isinstance(node, dict):
+        return ""
+    for name in ("seat_type", "seatType"):
+        value = node.get(name)
+        if isinstance(value, str) and value.strip():
+            return value.strip().lower()
+    return ""
+
+
+def has_seat_fields(node: dict) -> bool:
+    return (
+        isinstance(node.get("seats_entitled"), int)
+        or isinstance(node.get("seats_in_use"), int)
+        or isinstance(node.get("will_renew"), bool)
+        or node.get("active_until") is not None
+    )
+
+
+def seat_nodes(value, inherited=""):
+    if isinstance(value, dict):
+        label = seat_label(value) or inherited
+        if has_seat_fields(value):
+            yield label, value
+        for item in value.values():
+            yield from seat_nodes(item, label)
+    elif isinstance(value, list):
+        for item in value:
+            yield from seat_nodes(item, inherited)
+
+
+def first_seat_fields(nodes):
+    seats = None
+    seats_in_use = None
+    will_renew = None
+    active_until = None
+    for node in nodes:
+        if seats is None and isinstance(node.get("seats_entitled"), int):
+            seats = node["seats_entitled"]
+        if seats_in_use is None and isinstance(node.get("seats_in_use"), int):
+            seats_in_use = node["seats_in_use"]
+        if will_renew is None and isinstance(node.get("will_renew"), bool):
+            will_renew = node["will_renew"]
+        if active_until is None and node.get("active_until") is not None:
+            active_until = normalize_active_until(node.get("active_until"))
+    return seats, seats_in_use, will_renew, active_until
+
+
+def subscription_records(data):
+    if isinstance(data, list):
+        return [item for item in data if isinstance(item, dict)]
+    if not isinstance(data, dict):
+        return []
+    nested = []
+    for key in ("items", "subscriptions", "data"):
+        rows = data.get(key)
+        if isinstance(rows, list):
+            nested.extend(item for item in rows if isinstance(item, dict))
+    if nested and (has_seat_fields(data) or seat_label(data)):
+        return [data, *nested]
+    return nested or [data]
+
+
+def other_seat_types(data) -> bool:
+    if not isinstance(data, dict):
+        return False
+    counts = data.get("seat_type_counts")
+    if not isinstance(counts, dict):
+        return False
+    for key, value in counts.items():
+        label = str(key).strip().lower()
+        if not label or label == PREMIUM_SEAT:
+            continue
+        if isinstance(value, int) and not isinstance(value, bool) and value <= 0:
+            continue
+        return True
+    return False
+
+
+def premium_subscription(data, other_types=False, counts_checked=False):
+    found = list(seat_nodes(data))
+    if any(label for label, _node in found):
+        premium = [node for label, node in found if label == PREMIUM_SEAT]
+        if not premium:
+            return 0, 0, None, None, True
+        seats, seats_in_use, will_renew, active_until = first_seat_fields(premium)
+        return seats, seats_in_use, will_renew, active_until, True
+    records = []
+    for record in subscription_records(data):
+        nodes = [node for _label, node in seat_nodes(record)]
+        if nodes:
+            records.append(nodes)
+    if not records and not other_types:
+        return None, None, None, None, True
+    if other_types or len(records) != 1 or not counts_checked:
+        return None, None, None, None, False
+    seats, seats_in_use, will_renew, active_until = first_seat_fields(records[0])
+    return seats, seats_in_use, will_renew, active_until, True
+
+
 def nested_person(row: dict) -> list:
     found = []
     for key in ("user", "account_user"):
@@ -559,9 +660,13 @@ def flatten_person(row):
     person_id = pick("id", "user_id")
     email = pick("email", "email_address")
     role = pick("role", "account_user_role")
+    seat_type = pick("seat_type", "seatType")
     if not person_id or not (email or role):
         return None
-    return {"id": person_id, "email": email, "role": role}
+    person = {"id": person_id, "email": email, "role": role}
+    if seat_type:
+        person["seatType"] = seat_type
+    return person
 
 
 def people_in(rows) -> list:
@@ -666,11 +771,15 @@ def invite_page_unparsed(data) -> bool:
 
 
 def member_of(row: dict) -> dict:
-    return {
+    person = {
         "id": str(row.get("id") or row.get("user_id") or ""),
         "email": str(row.get("email") or row.get("email_address") or ""),
         "role": str(row.get("role") or row.get("account_user_role") or ""),
     }
+    seat_type = str(row.get("seatType") or row.get("seat_type") or "").strip()
+    if seat_type:
+        person["seatType"] = seat_type
+    return person
 
 
 def page_total(data):
@@ -758,29 +867,39 @@ def snapshot(http, token: str, workspace_id: str) -> dict:
     if not isinstance(sub_data, (dict, list)):
         sub_data = {}
         subscription_read = False
-    seats = None
-    will_renew = None
-    active_until = None
-    for node in walk(sub_data):
-        if seats is None and isinstance(node.get("seats_entitled"), int):
-            seats = node["seats_entitled"]
-        if will_renew is None and isinstance(node.get("will_renew"), bool):
-            will_renew = node["will_renew"]
-        if active_until is None and node.get("active_until") is not None:
-            active_until = normalize_active_until(node.get("active_until"))
+    other_types = False
+    counts_checked = False
     seat_path = f"/backend-api/accounts/{workspace_id}/users/seat_type_counts"
     try:
-        classify(
-            request_with_retry(
-                http,
-                "GET",
-                f"{CHATGPT}{seat_path}",
-                headers=browser_headers(token, workspace_id, seat_path, f"{CHATGPT}/admin", http),
-            ),
-            session_call=True,
+        counted = request_with_retry(
+            http,
+            "GET",
+            f"{CHATGPT}{seat_path}",
+            headers=browser_headers(token, workspace_id, seat_path, f"{CHATGPT}/admin", http),
         )
-    except TeamCallError:
-        pass
+        try:
+            counted = classify(counted, session_call=True)
+        except TeamCallError:
+            counted = None
+        if counted is not None and counted.status_code < 400:
+            try:
+                counted_body = read_json(counted)
+            except TeamCallError:
+                counted_body = None
+            counts = counted_body.get("seat_type_counts") if isinstance(counted_body, dict) else None
+            if isinstance(counts, dict):
+                counts_checked = True
+                other_types = other_seat_types(counted_body)
+    except Exception:
+        other_types = False
+        counts_checked = False
+    seats, seats_in_use, will_renew, active_until, premium_known = premium_subscription(
+        sub_data,
+        other_types if subscription_read else False,
+        counts_checked if subscription_read else False,
+    )
+    if not subscription_read:
+        premium_known = True
     complete = (not page_failed) and (not truncated) and (not unparsed) and total is not None and len(members) == total
     return {
         "complete": complete,
@@ -788,9 +907,11 @@ def snapshot(http, token: str, workspace_id: str) -> dict:
         "invites": invites,
         "invitesTruncated": invites_truncated,
         "seatsEntitled": seats,
+        "seatsInUse": seats_in_use,
         "willRenew": will_renew,
         "activeUntil": active_until,
         "subscriptionRead": subscription_read,
+        "premiumKnown": premium_known,
     }
 
 
@@ -988,7 +1109,7 @@ def team_invite(body: dict):
         "email_addresses": emails,
         "flow_id": str(uuid.uuid4()),
         "role": "standard-user",
-        "seat_type": "default",
+        "seat_type": PREMIUM_SEAT,
         "resend_emails": True,
         "submission_id": str(uuid.uuid4()),
     }

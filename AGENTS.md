@@ -5,8 +5,8 @@
 
 ## 当前版本
 
-- 当前版本是 `1.1.1`，以根目录 `package.json` 为准；`apps/server/package.json` 与 `apps/web/package.json` 必须与它一致。
-- 数据库只使用 PostgreSQL。`SchemaMigration` 的版本号仍是 `1`。`stagedCredential`、`refreshHeld`、`remoteMembersJson`、`subscriptionRead` 和其它 Team 相关列都在这个版本门外面用 `ADD COLUMN IF NOT EXISTS` 补齐，不要为这些列再插一条版本记录。
+- 当前版本是 `1.1.2`，以根目录 `package.json` 为准；`apps/server/package.json` 与 `apps/web/package.json` 必须与它一致。
+- 数据库只使用 PostgreSQL。`SchemaMigration` 的版本号仍是 `1`。`stagedCredential`、`refreshHeld`、`remoteMembersJson`、`subscriptionRead`、`seatsInUse` 和其它 Team 相关列都在这个版本门外面用 `ADD COLUMN IF NOT EXISTS` 补齐，不要为这些列再插一条版本记录。
 
 ## 兑换与找回
 
@@ -29,6 +29,7 @@
 - 踢出失败要留下真实原因，不能一律写成可能被限流。只有真正限流才标限流。母号兜底踢人成功时仍提示可能被限流。session 失效或出口被拦截时停止继续踢后面的人；session 失效要把母号标成失效。
 - 完整快照才覆盖 `remoteMembersJson`。名单不完整时仍显示上次完整名单，但不能踢人。踢出选中必须输入「踢出选中」，只踢普通成员，不踢所有者或母号，踢完不自动分配。
 - 订阅没读到时，席位、到期和是否续费仍用上次的值，并标明这次没核对。下次订阅读到后清掉这个标记。
+- 只检查并加入高级席位。高级席位类型是 `default`。`prolite`、`usage_based`、`automation` 不计入空位，也不邀请。只有一份没有席位类型、并且 `seat_type_counts` 已经读到、里面没有其他正数席位类型的旧订阅，才用它的 `seats_entitled`。多份没类型的订阅，计数里还有其他席位类型，计数没读到或读不出来时，不能把第一个名额当成高级席位，要清空旧名额并不邀请。只有标准席位时高级席位记为 0，订阅算读到了，不能沿用上次的高级席位数继续邀请。`seat_type_counts` 只用来发现还有没有其他席位类型，不拿它的数字当空位或邀请依据。这个接口失败不能让整份快照失败，也不能因此继续邀请。免费上车的请求和接受仍发空对象，席位由刚发出的高级邀请决定。
 - 协议换到的 session 即使这次调用失败也要留下，下次再用。缺设备号时补上。子号自退使用已保存的设备号，不改母号会话。
 - 代理顺序是子号、母号、全局。只接受 SOCKS。三者都空就失败，不直连。协议服务不连数据库，不发布端口。
 - 不读子号邮箱，不按用量自动踢人，不做定时轮转。`oai-client-*` 观察头只转发已有值，不自行编造。

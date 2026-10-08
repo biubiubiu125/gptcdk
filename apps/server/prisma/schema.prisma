@@ -207,6 +207,7 @@ model TeamWorkspace {
   lastError          String?
   socksCipher        String?
   seatsEntitled      Int?
+  seatsInUse         Int?
   memberCount        Int?
   snapshotComplete   Boolean   @default(false)
   snapshotAt         DateTime?

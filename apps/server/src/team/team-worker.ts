@@ -4,7 +4,7 @@ export interface WorkerResponse {
   message?: string;
   email?: string;
   workspaces?: Array<{ id: string; name?: string; role?: string; planType?: string; deactivated?: boolean }>;
-  members?: Array<{ id: string; email: string; role: string }>;
+  members?: Array<{ id: string; email: string; role: string; seatType?: string }>;
   invites?: Array<{ email: string }>;
   invitesTruncated?: boolean;
   total?: number | null;
@@ -37,6 +37,7 @@ export interface WorkerResponse {
   willRenew?: boolean | null;
   activeUntil?: string | null;
   subscriptionRead?: boolean;
+  premiumKnown?: boolean;
   sessionUpdate?: {
     accessToken?: string;
     sessionToken?: string;
