@@ -5,8 +5,17 @@
 
 ## 当前版本
 
-- 当前版本是 `1.1.2`，以根目录 `package.json` 为准；`apps/server/package.json` 与 `apps/web/package.json` 必须与它一致。
-- 数据库只使用 PostgreSQL。`SchemaMigration` 的版本号仍是 `1`。`stagedCredential`、`refreshHeld`、`remoteMembersJson`、`subscriptionRead`、`seatsInUse` 和其它 Team 相关列都在这个版本门外面用 `ADD COLUMN IF NOT EXISTS` 补齐，不要为这些列再插一条版本记录。
+- 当前版本是 `1.1.3`，以根目录 `package.json` 为准；`apps/server/package.json` 与 `apps/web/package.json` 必须与它一致。
+- 数据库只使用 PostgreSQL。`SchemaMigration` 的版本号仍是 `1`。`stagedCredential`、`refreshHeld`、`remoteMembersJson`、`subscriptionRead`、`seatsInUse`、`subscriptionTag`、`remoteWorkspaceId` 和 `ExtractJob` 都在这个版本门外面用 `ADD COLUMN IF NOT EXISTS` 或 `CREATE TABLE IF NOT EXISTS` 补齐，不要为这些列再插一条版本记录。
+
+## 标记售货
+
+- 新导入必须带订阅标记。有标记的库存按标记卖，不再按邮箱额度定档。没有标记的历史库存仍按额度，额度是 0 不能卖。
+- `5X Team` 只接受空间 token。`chatgpt_plan_type` 必须是 `self_serve_business_prolite`，并且 `chatgpt_account_id` 等于已保存的 `remoteWorkspaceId`。个人文件不能靠这个标记入库或兑换。其它标记按个人订阅核对，拒绝 free、team 和 `self_serve_business*`。
+- 账密先登录提取成功才入库发卡。提取必须有 SOCKS 代理，操作者当场填写，或显式打开已记住的代理。空代理不登录。密码错误停止后续登录，不把账号标成 `invalid`。
+- 新提取不写浏览器 session。密码、2FA 和代理不进 CPA `extra`、sub2api `notes` 和 sub2api `proxies`。账密格式仍可读本地 notes 里的 ChatGPT 密码。
+- 凭据找回先在已交付账号里对上，只恢复对上的那一条。对不上不调用 OpenAI。对不上的暂存凭据不能兑换、导出或覆盖已经对上的 token。刷新结果和标记不一致时不写入，也不标 `invalid`。
+- JSON 导入不调用 OpenAI。`5X Team` 只能用 JWT 里的套餐和空间账号核对，看不到 `structure=workspace`。
 
 ## 兑换与找回
 

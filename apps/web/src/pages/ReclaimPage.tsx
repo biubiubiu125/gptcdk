@@ -19,14 +19,16 @@ import './RedeemPage.css';
 
 const { TextArea } = Input;
 const MAX_CARDS = 500;
+const MAX_LINES = 20;
 const DEFAULT_FORMAT: DeliverFormat = 'sub2api';
 
 /**
- * 401 找回。只提交已兑换卡密和交付格式，不接收密码、JSON、邮箱或令牌。
+ * 401 找回。卡密找回刷新已交付文件；账密找回只匹配本站已交付记录。
  */
 export default function ReclaimPage() {
   const { message } = AntApp.useApp();
   const [meta, setMeta] = useState<PublicMeta | null>(null);
+  const [mode, setMode] = useState<'card' | 'credential'>('card');
   const [text, setText] = useState('');
   const [format, setFormat] = useState<DeliverFormat>(DEFAULT_FORMAT);
   const [submitting, setSubmitting] = useState(false);
@@ -49,6 +51,7 @@ export default function ReclaimPage() {
   }, []);
 
   const cards = useMemo(() => parseCards(text), [text]);
+  const lines = useMemo(() => text.split(/\r?\n/).map((line) => line.trim()).filter(Boolean), [text]);
   const formatOptions = useMemo(() => publicDeliverFormats(meta?.formats), [meta]);
 
   const results: RedeemResult[] = response?.results ?? [];
@@ -58,14 +61,20 @@ export default function ReclaimPage() {
     : Boolean(response?.mergedContent);
 
   const handleSubmit = useCallback(async () => {
-    if (cards.length === 0 || submitting) return;
-    if (cards.length > MAX_CARDS) {
+    if (submitting) return;
+    if (mode === 'card' && cards.length === 0) return;
+    if (mode === 'credential' && lines.length === 0) return;
+    if (mode === 'card' && cards.length > MAX_CARDS) {
       void message.error(`单次最多提交 ${MAX_CARDS} 张卡密`);
+      return;
+    }
+    if (mode === 'credential' && lines.length > MAX_LINES) {
+      void message.error(`单次最多找回 ${MAX_LINES} 条账密`);
       return;
     }
     setSubmitting(true);
     try {
-      const data = await reclaimCards({ cards, format });
+      const data = await reclaimCards(mode === 'card' ? { cards, format } : { lines, format });
       setResponse(data);
       void message.success(`找回完成：成功 ${data.summary.success} 张，失败 ${data.summary.failed} 张`);
     } catch (error) {
@@ -73,7 +82,7 @@ export default function ReclaimPage() {
     } finally {
       setSubmitting(false);
     }
-  }, [cards, format, message, submitting]);
+  }, [cards, format, lines, message, mode, submitting]);
 
   const downloadAll = useCallback(() => {
     if (!response || !hasBatch) {
@@ -99,27 +108,39 @@ export default function ReclaimPage() {
             <div className="eyebrow">CREDENTIAL RECLAIM</div>
             <h1 className="redeem-title">401 找回</h1>
             <p className="redeem-lead">
-              只填写已经兑换过的卡密。文件格式会刷新原账号后重新交付；账密只导出已保存的账号和密码，不刷新。未兑换的卡密不能在这里找回。
+              卡密找回会刷新已交付文件。账密找回只匹配本站已交付记录，请填写邮箱、密码和 2FA 密钥，不要填写 6 位动态码。
             </p>
             <p className="footnote">
               <span className="footnote__mark">+</span>
-              不要在这里粘贴密码、JSON、邮箱或令牌。还没换到新凭据时，失败不会改库。已经换到新凭据时，结果里会带上新文件，请马上保存，不要继续使用旧文件。
+              密码改过或记录对不上时，不会拿新密码去登录。失败结果只显示第几行，不回显账密。
             </p>
           </div>
 
           <aside className="console console--sticky redeem-console">
             <div className="console__head">
               <span className="console__eyebrow">RECLAIM</span>
-              <span className="console__pill">仅卡密</span>
+              <span className="console__pill">{mode === 'card' ? '卡密' : '账密'}</span>
             </div>
-            <h2 className="console__title">{format === 'login' ? '导出并下载' : '刷新并下载'}</h2>
-            <p className="console__subtitle">一次最多 {MAX_CARDS} 张。成功与失败分开显示。</p>
-            <label className="console__label" htmlFor="gptcdk-reclaim-cards">卡密列表</label>
+            <h2 className="console__title">{mode === 'credential' || format === 'login' ? '导出并下载' : '刷新并下载'}</h2>
+            <p className="console__subtitle">{mode === 'card' ? `一次最多 ${MAX_CARDS} 张。` : `一次最多 ${MAX_LINES} 条。`}成功与失败分开显示。</p>
+            <div style={{ marginBottom: 12 }}>
+              <Select
+                style={{ width: '100%' }}
+                value={mode}
+                options={[{ value: 'card', label: '卡密找回' }, { value: 'credential', label: '账密找回' }]}
+                onChange={(value: 'card' | 'credential') => {
+                  setMode(value);
+                  setText('');
+                  setResponse(null);
+                }}
+              />
+            </div>
+            <label className="console__label" htmlFor="gptcdk-reclaim-cards">{mode === 'card' ? '卡密列表' : '账密列表'}</label>
             <TextArea
               id="gptcdk-reclaim-cards"
               rows={7}
               className="redeem-textarea"
-              placeholder={'CARD-XXXXX-XXXXX-XXXXX'}
+              placeholder={mode === 'card' ? 'CARD-XXXXX-XXXXX-XXXXX' : '邮箱----密码----2FA密钥'}
               value={text}
               spellCheck={false}
               onChange={(event) => setText(event.target.value)}
@@ -134,8 +155,8 @@ export default function ReclaimPage() {
               />
             </div>
             <div className="console__action-row">
-              <span className="console__counter">{cards.length} 张有效卡密</span>
-              <Button type="primary" loading={submitting} disabled={cards.length === 0} onClick={() => void handleSubmit()}>
+              <span className="console__counter">{mode === 'card' ? `${cards.length} 张有效卡密` : `${lines.length} 条账密`}</span>
+              <Button type="primary" loading={submitting} disabled={mode === 'card' ? cards.length === 0 : lines.length === 0} onClick={() => void handleSubmit()}>
                 开始找回
               </Button>
             </div>

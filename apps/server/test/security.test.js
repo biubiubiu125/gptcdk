@@ -190,9 +190,10 @@ test('后台邮箱 TXT 保持四段或六段，前台兑换不再接受邮箱 TX
       notes.gpt = { password };
       notes.two_factor = { secret };
     }
-    return { type: 'codex', email, access_token: 'synthetic-access-token', notes: JSON.stringify(notes) };
+    const accessToken = `e30.${Buffer.from(JSON.stringify({ chatgpt_plan_type: 'plus', chatgpt_account_id: 'personal-1' })).toString('base64url')}.sig`;
+    return { type: 'codex', email, access_token: accessToken, notes: JSON.stringify(notes) };
   });
-  const imported = await f.accounts.importAccounts({ content: JSON.stringify(records) });
+  const imported = await f.accounts.importAccounts({ content: JSON.stringify(records), subscriptionTag: 'Plus' });
   assert.equal(imported.imported, 2);
   assert.equal(imported.failed, 0);
   const rows = await f.prisma.account.findMany({ orderBy: { id: 'asc' }, include: { mailbox: true } });

@@ -147,11 +147,19 @@ export interface PublicCreditsStat {
   redeemed: number;
 }
 
+export interface PublicTagStat {
+  tag: string;
+  total: number;
+  available: number;
+  redeemed: number;
+}
+
 export interface PublicStats {
   total: number;
   available: number;
   redeemed: number;
   byCredits: PublicCreditsStat[];
+  byTags?: PublicTagStat[];
 }
 
 export interface PublicPickupMeta {
@@ -181,9 +189,11 @@ export interface RedeemRequest {
   limit?: number;
 }
 
-/** 凭据找回只接受卡密和格式，不接受上传凭据。 */
+/** 凭据找回接受卡密，或已交付的邮箱、密码和 2FA 密钥。 */
 export interface ReclaimRequest {
-  cards: string[];
+  cards?: string[];
+  lines?: string[];
+  credential?: string;
   format: DeliverFormat;
 }
 
@@ -421,6 +431,7 @@ export interface AccountRow {
   redeemedAt: string | null;
   redeemCount: number;
   planType: string | null;
+  subscriptionTag?: string | null;
   hasMailbox: boolean;
   batchId: string | null;
   remark: string | null;
@@ -468,6 +479,21 @@ export interface ImportRequest {
   skipDuplicate?: boolean;
   keyLength?: number;
   keyGroups?: number;
+  subscriptionTag?: string;
+  proxy?: string;
+  rememberProxy?: boolean;
+  useRememberedProxy?: boolean;
+}
+
+export interface ExtractJobRow {
+  id: number;
+  email: string;
+  status: string;
+  code: string | null;
+  message: string | null;
+  attempt: number;
+  accountId: number | null;
+  updatedAt: string;
 }
 
 export interface ImportErrorItem {
@@ -487,6 +513,7 @@ export interface ImportResponse {
   imported: number;
   skipped: number;
   failed: number;
+  queued?: number;
   cards: string[];
   /** 恒为 0：额度不再手填，导入后由邮箱取件自动定档 */
   credits: number;

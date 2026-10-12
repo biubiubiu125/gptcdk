@@ -76,6 +76,33 @@ export class AccountsController {
       skipDuplicate: body?.skipDuplicate !== false,
       keyGroups: Number(body?.keyGroups) || 3,
       keyLength: Number(body?.keyLength) || 5,
+      subscriptionTag: body?.subscriptionTag as string,
+      proxy: body?.proxy as string,
+      rememberProxy: body?.rememberProxy === true,
+      useRememberedProxy: body?.useRememberedProxy === true,
+    });
+  }
+
+  @Get('extract-jobs')
+  extractJobs(@Query('batchId') batchId?: string) {
+    return this.accounts.listExtractJobs(batchId);
+  }
+
+  @Get('extract-proxy')
+  extractProxy() {
+    return this.accounts.extractProxyReady().then((ready) => ({ ready }));
+  }
+
+  @Post('extract-jobs/:id/stop')
+  stopExtractJob(@Param('id', ParseIntPipe) id: number) {
+    return this.accounts.stopExtractJob(id);
+  }
+
+  @Post('retag')
+  retag(@Body() body: Record<string, unknown>) {
+    return this.accounts.retag({
+      ids: (body?.ids as number[]) || [],
+      subscriptionTag: body?.subscriptionTag as string,
     });
   }
 

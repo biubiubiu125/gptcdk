@@ -567,6 +567,10 @@ class OAuthClient:
                 or "email-verification" in (continue_url or "")
                 or "email-otp" in (continue_url or "")
             )
+            if need_oauth_otp and not mail_client:
+                from app.extract import note_email_otp_without_mailbox
+                note_email_otp_without_mailbox(self)
+                return None
             if need_oauth_otp and mail_client:
                 self._log("authorize/continue 已进入邮箱 OTP 验证，跳过 password/verify")
                 return self._handle_otp_verification(
@@ -686,6 +690,9 @@ class OAuthClient:
                 self._log(f"/password/verify(重试) -> {r.status_code}")
 
             if r.status_code in (401, 409):
+                from app.extract import note_password_verify_failure
+                if note_password_verify_failure(self, r.status_code, mail_client):
+                    return None
                 if r.status_code == 401 and mail_client is not None:
                     self._log("password/verify -> 401，尝试 passwordless/send-otp")
                     headers_pwdless = {
@@ -775,6 +782,10 @@ class OAuthClient:
                 or "email-otp" in (continue_url or "")
             )
             
+            if need_oauth_otp and not mail_client:
+                from app.extract import note_email_otp_without_mailbox
+                note_email_otp_without_mailbox(self)
+                return None
             if need_oauth_otp and mail_client:
                 self._log("检测到需要邮箱 OTP 验证")
                 return self._handle_otp_verification(
@@ -2470,6 +2481,9 @@ class OAuthClient:
             self._log(f"log-in password/verify -> {getattr(resp_pwd, 'status_code', 0)}")
             if getattr(resp_pwd, "status_code", 0) != 200:
                 self._log(f"log-in password/verify 失败: {getattr(resp_pwd, 'text', '')[:160]}")
+                from app.extract import note_password_verify_failure
+                if note_password_verify_failure(self, getattr(resp_pwd, "status_code", 0), mail_client):
+                    return ""
                 if getattr(resp_pwd, "status_code", 0) == 401 and mail_client:
                     self._log("log-in password/verify -> 401，尝试 passwordless/send-otp")
                     baseline_ids = set()
@@ -2546,8 +2560,10 @@ class OAuthClient:
 
         if page_low in {"email_otp_verification", "contact_verification"} or "email-verification" in url_low or "email-otp" in url_low:
             if not mail_client:
+                from app.extract import note_email_otp_without_mailbox
+                note_email_otp_without_mailbox(self)
                 self._log("log-in 分支需要邮箱 OTP，但没有 mail_client")
-                return continue_url or ""
+                return ""
             baseline_ids = set()
             if hasattr(mail_client, "snapshot_openai_message_ids"):
                 try:

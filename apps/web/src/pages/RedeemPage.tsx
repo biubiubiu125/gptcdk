@@ -274,6 +274,9 @@ export default function RedeemPage() {
                   <div className="stat-cell__caption">按需选择</div>
                 </div>
               </div>
+              {meta?.stats.byTags?.length ? (
+                <p className="footnote">可售标记：{meta.stats.byTags.map((item) => `${item.tag} ${item.available}`).join(' · ')}</p>
+              ) : null}
 
               <section className="flow">
                 <div className="eyebrow flow__eyebrow">DELIVERY FLOW</div>

@@ -1,3 +1,5 @@
+import { credentialMatchesSellerTag } from '../common/subscription';
+
 /** 刷新已经成功、但当前凭据列还没写成新值时，暂存在这一列里。再次找回先提交它，不再拿旧凭据去刷新。 */
 export type StagedCredential = {
   accessToken: string;
@@ -51,6 +53,18 @@ export function stagedForAccount(account: {
 }): StagedCredential | null {
   const staged = parseStagedCredential(account.stagedCredential);
   if (!staged || !account.refreshToken || staged.previousRefreshToken !== account.refreshToken) return null;
+  return staged;
+}
+
+/** 暂存还要对上订阅标记。对不上就不能当作成品或当前凭据。 */
+export function acceptedStagedCredential(account: {
+  subscriptionTag?: string | null;
+  remoteWorkspaceId?: string | null;
+  refreshToken?: string | null;
+  stagedCredential?: string | null;
+}): StagedCredential | null {
+  const staged = stagedForAccount(account);
+  if (!staged || !credentialMatchesSellerTag(account, staged.accessToken)) return null;
   return staged;
 }
 

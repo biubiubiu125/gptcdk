@@ -32,19 +32,22 @@ import {
   PlusOutlined,
   ReloadOutlined,
   SyncOutlined,
-  ThunderboltOutlined,
 } from '@ant-design/icons';
 
 import {
   batchDeleteAccounts,
+  retagAccounts,
   copyCard,
   downloadBlob,
   downloadText,
   errorMessage,
   exportAccountsBlob,
+  extractProxyReady,
   importAccounts,
   listAccounts,
   listCreditTiers,
+  listExtractJobs,
+  stopExtractJob,
   refreshAccountStatus,
   updateAccount,
   MAIL_CREDITS_PER_TIER,
@@ -58,6 +61,7 @@ import {
   BanStatus,
   CreditTier,
   DeliverFormat,
+  ExtractJobRow,
   ImportFile,
   ImportResponse,
   RedeemStatus,
@@ -84,6 +88,27 @@ import {
 } from '../../utils/format';
 
 const { TextArea } = Input;
+
+const SUBSCRIPTION_TAG_OPTIONS = [
+  { value: 'Plus' },
+  { value: 'Pro' },
+  { value: 'Pro5x' },
+  { value: 'Pro10x' },
+  { value: 'Pro25x' },
+  { value: '20X' },
+  { value: '5X Team' },
+];
+
+function subscriptionTagError(value: string): string {
+  const tag = value.trim();
+  if (!tag) return '';
+  if (tag.length > 32 || /[\\/]/.test(tag) || tag.includes('..')) return '标记只能是 32 字以内的短名称，不能包含斜杠';
+  return '';
+}
+
+function resolveSubscriptionTag(selected?: string, custom?: string): string {
+  return String(custom || '').trim() || String(selected || '').trim();
+}
 
 const PAGE_SIZE_DEFAULT = 20;
 const IMPORT_MAX_FILE_SIZE = 20 * 1024 * 1024;
@@ -136,8 +161,11 @@ interface ImportFormValues {
   prefix: string;
   remark?: string;
   skipDuplicate: boolean;
-  /** 导入完成后立刻按邮箱取件自动定档 */
-  autoTier: boolean;
+  subscriptionTag: string;
+  customSubscriptionTag?: string;
+  proxy?: string;
+  rememberProxy?: boolean;
+  useRememberedProxy?: boolean;
   keyGroups: number;
   keyLength: number;
 }
@@ -150,15 +178,13 @@ interface ImportAccountsModalProps {
   open: boolean;
   tiers: CreditTier[];
   onClose: () => void;
-  /** 导入成功回调；autoTier = 用户勾选了「导入后自动取件定档」 */
-  onImported: (result: ImportResponse, autoTier: boolean) => void;
+  onImported: (result: ImportResponse) => void;
 }
 
 /**
  * 导入弹窗。
  *
- * 额度不在这里填写：导入的账号先落「待定档」，随后由邮箱取件命中额度关键字自动定档
- * （档位 = 命中 credits ÷ 25）。
+ * 必须选择订阅标记。账密行会异步登录提取；JSON 直接入库，但 5X Team 必须已是空间 token。
  */
 function ImportAccountsModal({ open, tiers, onClose, onImported }: ImportAccountsModalProps) {
   const { message } = AntApp.useApp();
@@ -169,14 +195,32 @@ function ImportAccountsModal({ open, tiers, onClose, onImported }: ImportAccount
   const [files, setFiles] = useState<LocalFile[]>([]);
   const [submitting, setSubmitting] = useState(false);
   const [result, setResult] = useState<ImportResponse | null>(null);
+  const [jobs, setJobs] = useState<ExtractJobRow[]>([]);
+  const [proxyReady, setProxyReady] = useState(false);
+
+  const loadJobs = useCallback(async () => {
+    try {
+      const data = await listExtractJobs();
+      setJobs(data.items);
+    } catch {
+      /* 提取任务列表失败时不打断导入 */
+    }
+  }, []);
 
   useEffect(() => {
-    if (open) return;
-    setResult(null);
-    setContent('');
-    setFiles([]);
-    setTab('paste');
-  }, [open]);
+    if (!open) {
+      setResult(null);
+      setContent('');
+      setFiles([]);
+      setTab('paste');
+      setJobs([]);
+      return;
+    }
+    void extractProxyReady().then((data) => setProxyReady(data.ready)).catch(() => setProxyReady(false));
+    void loadJobs();
+    const timer = window.setInterval(() => void loadJobs(), 3000);
+    return () => window.clearInterval(timer);
+  }, [loadJobs, open]);
 
   const tierHint = useMemo(() => {
     const values = tiers
@@ -233,10 +277,15 @@ function ImportAccountsModal({ open, tiers, onClose, onImported }: ImportAccount
         skipDuplicate: values.skipDuplicate,
         keyGroups: values.keyGroups,
         keyLength: values.keyLength,
+        subscriptionTag: resolveSubscriptionTag(values.subscriptionTag, values.customSubscriptionTag),
+        proxy: values.proxy,
+        rememberProxy: values.rememberProxy,
+        useRememberedProxy: values.useRememberedProxy,
       });
       setResult(response);
-      void message.success(`导入完成：成功 ${response.imported} 个，跳过 ${response.skipped} 个`);
-      onImported(response, values.autoTier !== false);
+      void loadJobs();
+      void message.success(`导入完成：成功 ${response.imported} 个，排队 ${response.queued ?? 0} 个`);
+      onImported(response);
     } catch (error) {
       void message.error(errorMessage(error));
     } finally {
@@ -368,12 +417,35 @@ function ImportAccountsModal({ open, tiers, onClose, onImported }: ImportAccount
         initialValues={{
           prefix: 'CARD',
           skipDuplicate: true,
-          autoTier: true,
+          subscriptionTag: 'Plus',
           keyGroups: 3,
           keyLength: 5,
         }}
       >
         <div className="import-grid">
+          <Form.Item name="subscriptionTag" label="订阅标记" rules={[{ required: true, message: '请选择订阅标记' }]}>
+            <Select options={SUBSCRIPTION_TAG_OPTIONS} />
+          </Form.Item>
+          <Form.Item
+            name="customSubscriptionTag"
+            label="自定义短标记"
+            extra="填写后优先使用。32 字以内，不能包含斜杠。5X Team 仍按空间 token 核对。"
+            rules={[{ validator: async (_, value) => {
+              const reason = subscriptionTagError(String(value || ''));
+              if (reason) throw new Error(reason);
+            } }]}
+          >
+            <Input maxLength={32} placeholder="例如 Pro5x" />
+          </Form.Item>
+          <Form.Item name="proxy" label="提取 SOCKS 代理">
+            <Input.Password placeholder="socks5://user:pass@host:port" autoComplete="new-password" />
+          </Form.Item>
+          <Form.Item name="useRememberedProxy" label={proxyReady ? '使用已记住代理（已保存）' : '使用已记住代理'} valuePropName="checked">
+            <Switch />
+          </Form.Item>
+          <Form.Item name="rememberProxy" label="记住本次代理" valuePropName="checked">
+            <Switch />
+          </Form.Item>
           <Form.Item name="prefix" label="卡密前缀">
             <Input placeholder="CARD" />
           </Form.Item>
@@ -389,23 +461,47 @@ function ImportAccountsModal({ open, tiers, onClose, onImported }: ImportAccount
           <Form.Item name="skipDuplicate" label="跳过重复账号" valuePropName="checked">
             <Switch />
           </Form.Item>
-          <Form.Item
-            name="autoTier"
-            label="导入后自动取件定档"
-            valuePropName="checked"
-            tooltip="导入的账号先记为「待定档」，随后自动逐个取件，命中额度关键字后自动定档"
-          >
-            <Switch />
-          </Form.Item>
         </div>
 
         <div className="import-note">
-          额度不用填：导入后按邮箱取件命中关键字自动定档（档位 = 命中 credits ÷ 25，向下取整）。
-          没命中额度的账号会停在「待定档」，不进兑换池。
-          <br />
-          当前已有档位：{tierHint}
+          5X Team 的 JSON 必须已经是空间 token；没有套餐声明的个人文件不会入库。账密行按 `邮箱----密码----2FA` 异步提取，必须提供 SOCKS 代理。
+          已标记账号按标记售卖，不再按邮箱额度定档。当前已有档位：{tierHint}
         </div>
       </Form>
+
+      <Table
+        rowKey="id"
+        size="small"
+        style={{ marginTop: 12 }}
+        pagination={false}
+        dataSource={jobs.slice(0, 20)}
+        locale={{ emptyText: <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无提取任务" /> }}
+        columns={[
+          { title: '邮箱', dataIndex: 'email', ellipsis: true },
+          {
+            title: '状态',
+            dataIndex: 'status',
+            width: 90,
+            render: (status: string) => ({ queued: '排队', running: '提取中', retrying: '重试中', succeeded: '已入库', failed: '失败', stopped: '已停止' }[status] || status),
+          },
+          { title: '说明', dataIndex: 'message', ellipsis: true },
+          {
+            title: '',
+            width: 72,
+            render: (_value, job) => ['queued', 'running', 'retrying'].includes(job.status) ? (
+              <Button
+                type="link"
+                size="small"
+                onClick={() => {
+                  void stopExtractJob(job.id).then(() => loadJobs()).catch((error) => message.error(errorMessage(error)));
+                }}
+              >
+                停止
+              </Button>
+            ) : null,
+          },
+        ]}
+      />
 
       {result ? (
         <div className="import-result">
@@ -476,66 +572,6 @@ function ImportAccountsModal({ open, tiers, onClose, onImported }: ImportAccount
 }
 
 /* ==================================================================== *
- * 定档任务（邮箱取件命中额度关键字 → 自动写回档位）
- * ==================================================================== */
-
-interface TierJobProgress {
-  processed: number;
-  hit: number;
-  pending: number;
-  failed: number;
-  rounds: number;
-}
-
-/**
- * 循环调用 refresh-status（targets: credits）直到处理完。
- *
- * - 「按筛选条件」时用 cursor 递增推进，保证取件成功但没命中额度的账号
- *   不会被同一轮反复重复取件；
- * - 「选中账号」时一次请求即可。
- */
-async function runTierAssignment(options: {
-  filter?: RefreshFilterPayload;
-  ids?: number[];
-  limit?: number;
-  onProgress?: (progress: TierJobProgress) => void;
-  shouldStop?: () => boolean;
-}): Promise<TierJobProgress> {
-  const limit = Math.min(500, Math.max(1, options.limit || 50));
-  const progress: TierJobProgress = { processed: 0, hit: 0, pending: 0, failed: 0, rounds: 0 };
-  const maxRounds = 200;
-
-  if (options.ids?.length) {
-    const response = await refreshAccountStatus({ ids: options.ids, targets: ['credits'] });
-    progress.processed += response.processed ?? 0;
-    progress.hit += response.credits?.hit ?? 0;
-    progress.pending += response.credits?.pending ?? 0;
-    progress.failed += response.credits?.failed ?? 0;
-    progress.rounds = 1;
-    options.onProgress?.({ ...progress });
-    return progress;
-  }
-
-  let cursor: number | null = null;
-  while (progress.rounds < maxRounds) {
-    if (options.shouldStop?.()) break;
-    const payload: RefreshStatusRequest = { filter: options.filter, limit, targets: ['credits'] };
-    if (cursor !== null) payload.cursor = cursor;
-    const response = await refreshAccountStatus(payload);
-    progress.rounds++;
-    progress.processed += response.processed ?? 0;
-    progress.hit += response.credits?.hit ?? 0;
-    progress.pending += response.credits?.pending ?? 0;
-    progress.failed += response.credits?.failed ?? 0;
-    options.onProgress?.({ ...progress });
-    cursor = response.nextCursor ?? null;
-    if (!response.processed || cursor === null) break;
-  }
-
-  return progress;
-}
-
-/* ==================================================================== *
  * 刷新状态弹窗
  * ==================================================================== */
 
@@ -560,18 +596,15 @@ function RefreshStatusModal({
   const hasSelection = selectedIds.length > 0;
 
   const [refreshBan, setRefreshBan] = useState(true);
-  const [refreshCredits, setRefreshCredits] = useState(false);
   const [refreshRedeem, setRefreshRedeem] = useState(true);
   const [scope, setScope] = useState<'selected' | 'filter'>('filter');
   const [limit, setLimit] = useState(100);
   const [running, setRunning] = useState(false);
   const [result, setResult] = useState<RefreshStatusResponse | null>(null);
-  const [tierProgress, setTierProgress] = useState<TierJobProgress | null>(null);
 
   useEffect(() => {
     if (!open) return;
     setResult(null);
-    setTierProgress(null);
     setRunning(false);
     setScope(hasSelection ? 'selected' : 'filter');
   }, [open, hasSelection]);
@@ -581,25 +614,13 @@ function RefreshStatusModal({
     if (refreshBan) targets.push('ban');
     if (refreshRedeem) targets.push('redeem');
 
-    if (targets.length === 0 && !refreshCredits) {
+    if (targets.length === 0) {
       void message.warning('请至少选择一个刷新目标');
       return;
     }
 
     setRunning(true);
     try {
-      if (refreshCredits) {
-        const progress = await runTierAssignment({
-          filter,
-          ids: scope === 'selected' && hasSelection ? selectedIds : undefined,
-          limit: scope === 'selected' && hasSelection ? undefined : limit,
-          onProgress: setTierProgress,
-        });
-        void message.success(
-          `定档完成：新增档位 ${progress.hit} 个 · 待定档 ${progress.pending} 个 · 失败 ${progress.failed} 个`,
-        );
-      }
-
       if (targets.length > 0) {
         const payload: RefreshStatusRequest =
           scope === 'selected' && hasSelection
@@ -615,7 +636,6 @@ function RefreshStatusModal({
       void message.error(errorMessage(error));
     } finally {
       setRunning(false);
-      setTierProgress(null);
     }
   };
 
@@ -623,7 +643,7 @@ function RefreshStatusModal({
     <Modal
       open={open}
       width={560}
-      title="刷新状态 / 取件定档"
+      title="刷新状态"
       okText="开始执行"
       cancelText="关闭"
       confirmLoading={running}
@@ -645,12 +665,6 @@ function RefreshStatusModal({
               onChange={(event) => setRefreshRedeem(event.target.checked)}
             >
               检查账号凭据
-            </Checkbox>
-            <Checkbox
-              checked={refreshCredits}
-              onChange={(event) => setRefreshCredits(event.target.checked)}
-            >
-              取件定档（命中额度关键字 → 自动写回档位）
             </Checkbox>
           </Space>
         </div>
@@ -689,18 +703,7 @@ function RefreshStatusModal({
         {running ? (
           <div style={{ display: 'flex', alignItems: 'center', gap: 10, color: '#6B7A74' }}>
             <Spin size="small" />
-            {tierProgress
-              ? `取件定档中… 已处理 ${tierProgress.processed}，命中 ${tierProgress.hit}，待定档 ${tierProgress.pending}`
-              : '正在执行…'}
-          </div>
-        ) : null}
-
-        {tierProgress && !running ? (
-          <div className="admin-card" style={{ background: '#FAFBF9' }}>
-            <div style={{ fontSize: 12.5, color: '#2C3A35' }}>
-              定档：本次处理 {tierProgress.processed} 个 · 新增档位 {tierProgress.hit} 个 · 仍待定档{' '}
-              {tierProgress.pending} 个 · 失败 {tierProgress.failed} 个
-            </div>
+            正在执行…
           </div>
         ) : null}
 
@@ -787,10 +790,11 @@ export default function AccountsPage() {
   const [mailboxAccount, setMailboxAccount] = useState<AccountRow | null>(null);
   const [remarkSaving, setRemarkSaving] = useState(false);
   const [deleting, setDeleting] = useState(false);
+  const [retagOpen, setRetagOpen] = useState(false);
+  const [retagging, setRetagging] = useState(false);
+  const [retagForm] = Form.useForm<{ subscriptionTag?: string; customSubscriptionTag?: string }>();
   const [copyingKeys, setCopyingKeys] = useState(false);
   const [remarkForm] = Form.useForm<{ remark?: string }>();
-  /** 导入后自动定档任务的进度（null = 没有在跑） */
-  const [tierJob, setTierJob] = useState<TierJobProgress | null>(null);
 
   const loadTiers = useCallback(async () => {
     try {
@@ -904,6 +908,29 @@ export default function AccountsPage() {
     [message],
   );
 
+  const handleRetag = async () => {
+    const values = await retagForm.validateFields();
+    const tag = resolveSubscriptionTag(values.subscriptionTag, values.customSubscriptionTag);
+    const reason = subscriptionTagError(tag);
+    if (!tag || reason) {
+      void message.error(reason || '请选择订阅标记');
+      return;
+    }
+    setRetagging(true);
+    try {
+      const response = await retagAccounts(selectedIds, tag);
+      void message.success(`已更新 ${response.updated} 个${response.rejected?.length ? `，${response.rejected.length} 个未通过` : ''}`);
+      setRetagOpen(false);
+      retagForm.resetFields();
+      setSelectedIds([]);
+      await load();
+    } catch (error) {
+      void message.error(errorMessage(error));
+    } finally {
+      setRetagging(false);
+    }
+  };
+
   const handleBatchDelete = async () => {
     if (selectedIds.length === 0) return;
     setDeleting(true);
@@ -1005,32 +1032,6 @@ export default function AccountsPage() {
       setRemarkSaving(false);
     }
   };
-
-  /** 取件定档：默认只处理「待定档」账号（credits = 0） */
-  const handleTierAssignment = useCallback(
-    async (filter?: RefreshFilterPayload) => {
-      if (tierJob) return;
-      const payload: RefreshFilterPayload = filter ?? { credits: [PENDING_CREDITS] };
-      setTierJob({ processed: 0, hit: 0, pending: 0, failed: 0, rounds: 0 });
-      try {
-        const progress = await runTierAssignment({
-          filter: payload,
-          limit: 50,
-          onProgress: setTierJob,
-        });
-        void message.success(
-          `定档完成：新增档位 ${progress.hit} 个 · 仍待定档 ${progress.pending} 个 · 失败 ${progress.failed} 个`,
-        );
-      } catch (error) {
-        void message.error(errorMessage(error));
-      } finally {
-        setTierJob(null);
-        await load();
-        void loadTiers();
-      }
-    },
-    [load, loadTiers, message, tierJob],
-  );
 
   const sortOrderFor = (field: AccountSortField): SortOrder | null =>
     filters.sortField === field ? filters.sortOrder ?? null : null;
@@ -1385,18 +1386,6 @@ export default function AccountsPage() {
           >
             导入账号
           </Button>
-          <Tooltip title="对「待定档」账号逐个取件，命中额度关键字后自动写回档位（档位 = 命中 credits ÷ 25）">
-            <Button
-              icon={<ThunderboltOutlined />}
-              loading={tierJob !== null}
-              onClick={() => {
-                void handleTierAssignment();
-              }}
-            >
-              取件定档
-              {summary.pending > 0 ? ` (${formatNumber(summary.pending)})` : ''}
-            </Button>
-          </Tooltip>
           <Button
             icon={<SyncOutlined />}
             onClick={() => {
@@ -1404,6 +1393,15 @@ export default function AccountsPage() {
             }}
           >
             刷新状态
+          </Button>
+          <Button
+            disabled={selectedIds.length === 0}
+            onClick={() => {
+              setRetagOpen(true);
+            }}
+          >
+            改标记
+            {selectedIds.length > 0 ? ` (${selectedIds.length})` : ''}
           </Button>
           <Popconfirm
             title={`删除选中的 ${selectedIds.length} 个账号？`}
@@ -1487,12 +1485,8 @@ export default function AccountsPage() {
         open={importOpen}
         tiers={tiers}
         onClose={() => setImportOpen(false)}
-        onImported={(result, autoTier) => {
+        onImported={() => {
           void load();
-          // 导入的账号都是「待定档」：直接接着跑批量取件定档
-          if (autoTier && result.imported > 0) {
-            void handleTierAssignment({ batchId: result.batchId, credits: [PENDING_CREDITS] });
-          }
         }}
       />
 
@@ -1515,6 +1509,36 @@ export default function AccountsPage() {
           void load();
         }}
       />
+
+      <Modal
+        title={`改标记 · ${selectedIds.length} 个账号`}
+        open={retagOpen}
+        confirmLoading={retagging}
+        okText="保存"
+        cancelText="取消"
+        onOk={() => {
+          void handleRetag();
+        }}
+        onCancel={() => setRetagOpen(false)}
+        destroyOnClose
+      >
+        <Form form={retagForm} layout="vertical" preserve={false} style={{ marginTop: 12 }} initialValues={{ subscriptionTag: 'Plus' }}>
+          <Form.Item name="subscriptionTag" label="订阅标记" rules={[{ required: true, message: '请选择订阅标记' }]}>
+            <Select options={SUBSCRIPTION_TAG_OPTIONS} />
+          </Form.Item>
+          <Form.Item
+            name="customSubscriptionTag"
+            label="自定义短标记"
+            extra="填写后优先使用。5X Team 会按 token 核对空间，对不上的行不会改。"
+            rules={[{ validator: async (_, value) => {
+              const reason = subscriptionTagError(String(value || ''));
+              if (reason) throw new Error(reason);
+            } }]}
+          >
+            <Input maxLength={32} placeholder="例如 Pro5x" />
+          </Form.Item>
+        </Form>
+      </Modal>
 
       <Modal
         title={`编辑备注 · ${remarkTarget?.name ?? ''}`}

@@ -31,6 +31,7 @@ model Batch {
   count     Int       @default(0)
   remark    String?
   source    String    @default("paste")
+  subscriptionTag String?
   createdAt DateTime  @default(now())
   accounts  Account[]
 }
@@ -69,6 +70,8 @@ model Account {
   stagedCredential String?
   refreshHeld      Boolean   @default(false)
   stockKind        String    @default("standard")
+  subscriptionTag  String?
+  remoteWorkspaceId String?
   teamStatus       String?
   workspaceId      Int?
   priorUserId      String?
@@ -88,8 +91,10 @@ model Account {
   workspace  TeamWorkspace?  @relation(fields: [workspaceId], references: [id], onDelete: SetNull)
   teamSecret TeamSecret?
   teamUsage  TeamUsage?
+  extractJobs ExtractJob[]
 
   @@index([credits])
+  @@index([subscriptionTag])
   @@index([banStatus])
   @@index([redeemStatus])
   @@index([redeemedByCard])
@@ -262,4 +267,31 @@ model TeamJob {
   workspace      TeamWorkspace @relation(fields: [workspaceRowId], references: [id], onDelete: Cascade)
 
   @@index([workspaceRowId, status])
+}
+
+model ExtractJob {
+  id              Int       @id @default(autoincrement())
+  batchId         String
+  email           String
+  subscriptionTag String
+  passwordCipher  String
+  totpCipher      String
+  proxyCipher     String
+  status          String    @default("queued")
+  failureClass    String?
+  code            String?
+  message         String?
+  attempt         Int       @default(0)
+  nextRetryAt     DateTime?
+  accountId       Int?
+  keyPrefix       String    @default("CARD")
+  keyGroups       Int       @default(3)
+  keyLength       Int       @default(5)
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+  account         Account?  @relation(fields: [accountId], references: [id], onDelete: SetNull)
+
+  @@index([status, nextRetryAt])
+  @@index([batchId])
+  @@index([email])
 }

@@ -1,4 +1,4 @@
-import { Injectable, Logger, NotFoundException } from '@nestjs/common';
+import { Injectable, Logger, NotFoundException, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
 import { Prisma } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { ConvertService, readSub2ApiPassthrough } from '../convert/convert.service';
@@ -19,9 +19,22 @@ import {
   toStringArray,
 } from '../common/utils';
 import { PENDING_TIER, formatTier, isPendingTier, tierFromMailCredits } from '../common/credits';
+import { credentialMatchesSellerTag, looksLikeLoginImport, normalizeSubscriptionTag, parseLoginImport, sellerTokenFields } from '../common/subscription';
+import { postAccountExtract, type AccountExtractClient } from './extract-client';
+import {
+  enqueueLoginImport,
+  listExtractJobs,
+  pumpExtractQueue,
+  recoverInterruptedExtracts,
+  rememberedProxyReady,
+  startExtractPump,
+  stopExtractJob,
+  stopExtractPump,
+  type ExtractHost,
+} from './extract-runner';
 import { FORMAT_META, isDeliverFormat, type DeliverFormat } from '../common/error-codes';
 import { withReclaimLock } from '../public/reclaim-lock';
-import { serializeStagedCredential, stagedExpiresAt, stagedForAccount } from '../public/staged-credential';
+import { acceptedStagedCredential, serializeStagedCredential, stagedExpiresAt, stagedForAccount } from '../public/staged-credential';
 import { expiresAtFromJwt } from '../common/jwt-expiry';
 import { formatLoginLine } from '../common/login-line';
 import { decryptSecret, teamSecretReady } from '../team/team-crypto';
@@ -79,6 +92,7 @@ export interface AccountRow {
   cardKey: string;
   cardDisabled: boolean;
   planType: string | null;
+  subscriptionTag: string | null;
   accountId: string | null;
   createdAt: string;
   updatedAt: string;
@@ -101,8 +115,11 @@ type AccountWithMailbox = Account & {
 };
 
 @Injectable()
-export class AccountsService {
+export class AccountsService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(AccountsService.name);
+  extractClient: AccountExtractClient = postAccountExtract;
+  extractPumping = false;
+  extractTimer?: NodeJS.Timeout;
 
   constructor(
     private readonly prisma: PrismaService,
@@ -110,6 +127,65 @@ export class AccountsService {
     private readonly mailbox: MailboxService,
     private readonly settings: SettingsService,
   ) {}
+
+  private host(): ExtractHost {
+    return this as unknown as ExtractHost;
+  }
+
+  onModuleInit(): void {
+    const host = this.host();
+    void recoverInterruptedExtracts(host).then(() => startExtractPump(host));
+  }
+
+  onModuleDestroy(): void {
+    stopExtractPump(this.host());
+  }
+
+  listExtractJobs(batchId?: string) {
+    return listExtractJobs(this.host(), batchId);
+  }
+
+  stopExtractJob(id: number) {
+    return stopExtractJob(this.host(), id);
+  }
+
+  extractProxyReady() {
+    return rememberedProxyReady(this.host());
+  }
+
+  pumpExtractQueue() {
+    return pumpExtractQueue(this.host());
+  }
+
+  async retag(payload: { ids?: number[]; subscriptionTag?: string }) {
+    const tag = normalizeSubscriptionTag(payload?.subscriptionTag);
+    if (!tag) bizError('BAD_INPUT', '请选择订阅标记');
+    const ids = (payload?.ids || []).map((id) => Number(id)).filter((id) => Number.isInteger(id) && id > 0);
+    if (!ids.length) bizError('BAD_INPUT', '请选择账号');
+    const rows = await this.prisma.account.findMany({
+      where: { id: { in: ids }, stockKind: { not: 'team' } },
+    });
+    const rejected: Array<{ id: number; reason: string }> = [];
+    const accepted: Array<{ id: number; planType: string | null; remoteWorkspaceId: string | null }> = [];
+    for (const row of rows) {
+      const proof = sellerTokenFields(tag, row.accessToken);
+      if (!proof.ok) {
+        rejected.push({ id: row.id, reason: proof.reason });
+        continue;
+      }
+      accepted.push({ id: row.id, planType: proof.planType, remoteWorkspaceId: proof.remoteWorkspaceId });
+    }
+    if (!accepted.length) bizError('BAD_INPUT', rejected[0]?.reason || '没有可更新的账号');
+    await this.prisma.$transaction(accepted.map((item) => this.prisma.account.update({
+      where: { id: item.id },
+      data: {
+        subscriptionTag: tag,
+        planType: item.planType,
+        remoteWorkspaceId: item.remoteWorkspaceId,
+      },
+    })));
+    return { updated: accepted.length, rejected };
+  }
 
   // -------------------------------------------------------------------------
   // 查询
@@ -164,7 +240,8 @@ export class AccountsService {
       name: account.name,
       email: account.email,
       credits: account.credits,
-      creditStatus: isPendingTier(account.credits) ? 'pending' : 'ready',
+      creditStatus: account.subscriptionTag ? 'ready' : isPendingTier(account.credits) ? 'pending' : 'ready',
+      subscriptionTag: account.subscriptionTag || null,
       cardKey: account.cardKey,
       cardDisabled: account.cardDisabled,
       planType: account.planType,
@@ -196,7 +273,15 @@ export class AccountsService {
         this.prisma.account.count({ where: { AND: [base, { banStatus: 'banned' }] } }),
         this.prisma.account.count({ where: { AND: [base, { banStatus: 'invalid' }] } }),
         this.prisma.account.count({ where: { AND: [base, { banStatus: 'unknown' }] } }),
-        this.prisma.account.count({ where: { AND: [base, { credits: PENDING_TIER }] } }),
+        this.prisma.account.count({
+          where: {
+            AND: [
+              base,
+              { credits: PENDING_TIER },
+              { OR: [{ subscriptionTag: null }, { subscriptionTag: '' }] },
+            ],
+          },
+        }),
         this.prisma.account.groupBy({
           by: ['credits', 'redeemStatus', 'banStatus'],
           where: base,
@@ -363,6 +448,10 @@ export class AccountsService {
     skipDuplicate?: boolean;
     keyGroups?: number;
     keyLength?: number;
+    subscriptionTag?: string;
+    proxy?: string;
+    rememberProxy?: boolean;
+    useRememberedProxy?: boolean;
   }) {
     const sources: Array<{ name: string; content: string }> = [];
     if (payload?.content && String(payload.content).trim()) {
@@ -374,6 +463,8 @@ export class AccountsService {
       }
     }
     if (!sources.length) bizError('BAD_INPUT', '请粘贴 JSON 内容或上传文件');
+    const subscriptionTag = normalizeSubscriptionTag(payload?.subscriptionTag);
+    if (!subscriptionTag) bizError('BAD_INPUT', '请选择订阅标记');
 
     const skipDuplicate = payload?.skipDuplicate !== false;
     const prefix = (payload?.prefix || process.env.CARD_PREFIX || 'CARD').trim();
@@ -409,6 +500,22 @@ export class AccountsService {
       }
     }
 
+    const combined = sources.map((item) => item.content).join('\n');
+    const login = parseLoginImport(combined);
+    if (parsedItems.length && login.lines.length) bizError('BAD_INPUT', '不能同时提交 JSON 账号和账密行');
+    if (!parsedItems.length && (login.lines.length || looksLikeLoginImport(combined))) {
+      return enqueueLoginImport(this.host(), combined, {
+        subscriptionTag,
+        proxy: payload?.proxy,
+        rememberProxy: payload?.rememberProxy === true,
+        useRememberedProxy: payload?.useRememberedProxy === true,
+        prefix,
+        keyGroups,
+        keyLength,
+        source,
+        remark: payload?.remark,
+      });
+    }
     if (!parsedItems.length) {
       bizError('BAD_INPUT', '未解析出任何账号，请检查 JSON 格式（需要包含 access_token 的账号对象）', 400, {
         errors,
@@ -486,12 +593,22 @@ export class AccountsService {
         count: 0,
         remark: payload?.remark || null,
         source,
+        subscriptionTag,
         createdAt: now,
       },
     });
 
     for (const item of toInsert) {
       const account = item.account;
+      const proof = sellerTokenFields(subscriptionTag, account.accessToken);
+      if (!proof.ok) {
+        errors.push({
+          index: index++,
+          name: account.name || account.email || 'account',
+          reason: proof.reason,
+        });
+        continue;
+      }
       try {
         const cardKey = await this.uniqueCardKey(prefix, keyGroups, keyLength);
         const created = await this.prisma.account.create({
@@ -499,8 +616,10 @@ export class AccountsService {
             name: account.name,
             email: account.email || account.mailbox?.email || null,
             credits: PENDING_TIER,
+            subscriptionTag,
             cardKey,
-            planType: account.planType || null,
+            planType: proof.planType,
+            remoteWorkspaceId: proof.remoteWorkspaceId,
             accountId: account.accountId || null,
             userId: account.userId || null,
             accessToken: account.accessToken,
@@ -564,8 +683,7 @@ export class AccountsService {
       failed: errors.length,
       cards,
       credits: PENDING_TIER,
-      /** 待定档数量（= 本次导入数，额度需取件后才能得出） */
-      pending: imported,
+      pending: 0,
       errors: errors.slice(0, 200),
       samples,
     };
@@ -723,7 +841,7 @@ export class AccountsService {
           }
         : undefined;
 
-    const staged = stagedForAccount(account);
+    const staged = acceptedStagedCredential(account);
     const expiresAt = staged ? stagedExpiresAt(staged.expiresAt) : account.expiresAt;
     return {
       name: account.name,
@@ -778,6 +896,13 @@ export class AccountsService {
             if (!selected.has(item.id)) continue;
             const staged = stagedForAccount(item);
             if (!staged || !item.refreshToken) continue;
+            if (!acceptedStagedCredential(item)) {
+              await this.prisma.account.updateMany({
+                where: { id: item.id, refreshToken: item.refreshToken },
+                data: { stagedCredential: null },
+              });
+              continue;
+            }
             await this.prisma.account.updateMany({
               where: { id: item.id, refreshToken: item.refreshToken },
               data: {
@@ -1003,7 +1128,6 @@ export class AccountsService {
         banReason,
         banKeywords: result.banned ? JSON.stringify(result.banKeywords) : null,
         banCheckedAt: new Date(),
-        ...(tier > PENDING_TIER ? { credits: tier } : {}),
       },
     });
     await this.prisma.pickupLog.create({
@@ -1058,7 +1182,12 @@ export class AccountsService {
     let account = await this.prisma.account.findUnique({ where: { id: accountId } });
     if (!account) return { redeemStatus: 'unredeemed', redeemedAt: null, error: '账号不存在' };
     const staged = stagedForAccount(account);
-    if (staged && account.refreshToken) {
+    if (staged && account.refreshToken && !acceptedStagedCredential(account)) {
+      await this.prisma.account.updateMany({
+        where: { id: account.id, refreshToken: account.refreshToken },
+        data: { stagedCredential: null },
+      });
+    } else if (staged && account.refreshToken) {
       const owner = account.redeemedByCard || account.cardKey;
       const held = await this.prisma.account.count({
         where: { redeemedByCard: owner, refreshHeld: true },
@@ -1124,6 +1253,9 @@ export class AccountsService {
     const nextAccessToken = refreshed.accessToken!;
     const nextIdToken = refreshed.idToken || account.idToken || null;
     const nextExpiry = credentialExpiry(refreshed);
+    if (!credentialMatchesSellerTag(account, nextAccessToken)) {
+      return result('刷新结果与订阅标记不一致，未写入');
+    }
     let persisted = false;
     let stagedAside = false;
     for (let attempt = 0; attempt < 2 && !persisted && !stagedAside; attempt += 1) {
@@ -1393,7 +1525,6 @@ export class AccountsService {
             banReason: pickup.banned ? pickup.banReason : null,
             banKeywords: pickup.banned ? JSON.stringify(pickup.banKeywords) : null,
             banCheckedAt: new Date(),
-            ...(tier > PENDING_TIER ? { credits: tier } : {}),
           },
         });
       }

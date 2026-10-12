@@ -22,6 +22,7 @@ export interface WorkerResponse {
   accountId?: string;
   userId?: string;
   planType?: string;
+  remoteWorkspaceId?: string;
   expiresAt?: string;
   raw?: Record<string, unknown>;
   pct5h?: number | null;
@@ -50,7 +51,7 @@ export function workerConfigured(): boolean {
   return Boolean((process.env.PROTOCOL_WORKER_URL || '').trim() && (process.env.PROTOCOL_WORKER_TOKEN || '').trim());
 }
 
-export async function workerPost(path: string, body: unknown): Promise<WorkerResponse> {
+export async function workerPost(path: string, body: unknown, signal?: AbortSignal): Promise<WorkerResponse> {
   const base = (process.env.PROTOCOL_WORKER_URL || '').trim();
   const token = (process.env.PROTOCOL_WORKER_TOKEN || '').trim();
   if (!base || !token) {
@@ -63,6 +64,7 @@ export async function workerPost(path: string, body: unknown): Promise<WorkerRes
       authorization: `Bearer ${token}`,
     },
     body: JSON.stringify(body),
+    signal,
   });
   const text = await response.text();
   let parsed: WorkerResponse = { ok: false, message: '协议服务没有返回 JSON' };

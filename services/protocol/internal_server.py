@@ -463,6 +463,102 @@ def attach_session_update(http, payload):
     return copied
 
 
+class SessionHttp:
+    def __init__(self, session):
+        self.session = session
+        self.session_refresh = {}
+
+    def request(self, method, url, headers=None, json=None, data=None, timeout=60):
+        kwargs = {"headers": headers or {}, "timeout": timeout}
+        if json is not None:
+            kwargs["json"] = json
+        if data is not None:
+            kwargs["data"] = data
+        return self.session.request(method, url, **kwargs)
+
+    def get(self, url, headers=None, timeout=60):
+        return self.session.get(url, headers=headers or {}, timeout=timeout)
+
+
+def real_login(email: str, password: str, totp: str, proxy: str):
+    from app.config import Settings
+    from app.engine import authorize_account
+    from app.parsing import AccountLine
+    settings = Settings(data_dir=ROOT / ".runtime")
+    settings.proxy = proxy or ""
+    client, tokens = authorize_account(AccountLine(email, password, totp, ""), settings)
+    return {
+        "client": client,
+        "tokens": tokens if isinstance(tokens, dict) else {},
+        "email": email,
+        "password": password,
+        "totp": totp,
+        "proxy": proxy,
+    }
+
+
+def real_list(session: dict, proxy: str):
+    client = session.get("client")
+    tokens = session.get("tokens") if isinstance(session.get("tokens"), dict) else {}
+    http = SessionHttp(client.session)
+    token = str(tokens.get("access_token") or tokens.get("accessToken") or "")
+    path = "/backend-api/accounts/check/v4-2023-04-27"
+    response = request_with_retry(http, "GET", f"{CHATGPT}{path}", headers=browser_headers(token, "", path, f"{CHATGPT}/", http))
+    text = str(getattr(response, "text", "") or "").lower()
+    if response.status_code in (401, 403, 429) or response.status_code >= 500:
+        if "deactivated" in text or "banned" in text:
+            raise TeamCallError("DEACTIVATED", "账号已停用", response.status_code)
+        raise TeamCallError("UPSTREAM", "上游暂时失败", response.status_code)
+    return read_json(response)
+
+
+def mint_workspace_oauth(session: dict, workspace_id: str, proxy: str):
+    from app.config import Settings
+    from app.engine import authorize_account
+    from app.parsing import AccountLine
+    email = str((session or {}).get("email") or "").strip()
+    password = str((session or {}).get("password") or "")
+    totp = str((session or {}).get("totp") or "")
+    if not email or not password or not totp:
+        return {}
+    settings = Settings(data_dir=ROOT / ".runtime")
+    settings.proxy = proxy or str((session or {}).get("proxy") or "")
+    _client, tokens = authorize_account(AccountLine(email, password, totp, ""), settings, workspace_id=workspace_id)
+    return tokens if isinstance(tokens, dict) else {}
+
+
+def real_exchange(session: dict, workspace_id: str, proxy: str):
+    from app.extract import exchange_or_mint
+
+    def exchange(current, workspace, current_proxy):
+        client = current.get("client")
+        tokens = current.get("tokens") if isinstance(current.get("tokens"), dict) else {}
+        http = SessionHttp(client.session)
+        token = str(tokens.get("access_token") or tokens.get("accessToken") or "")
+        data = exchange_workspace(http, token, workspace)
+        return {
+            "access_token": str(data.get("accessToken") or data.get("access_token") or "").strip(),
+            "refresh_token": str(data.get("refreshToken") or data.get("refresh_token") or "").strip(),
+            "id_token": str(data.get("idToken") or data.get("id_token") or "").strip(),
+        }
+
+    return exchange_or_mint(session, workspace_id, proxy, exchange, mint_workspace_oauth)
+
+
+def account_extract(body: dict):
+    from app.extract import run_extract
+    try:
+        result = run_extract(body, real_login, real_list, real_exchange)
+    except Exception as error:
+        print(f"[gptcdk-protocol] {type(error).__name__} /internal/account/extract", flush=True)
+        result = {"ok": False, "temporary": True, "code": "UPSTREAM", "message": "协议服务处理失败"}
+    if not isinstance(result, dict):
+        result = {"ok": False, "temporary": True, "code": "UPSTREAM", "message": "协议服务处理失败"}
+    for key in ("password", "proxy", "totp", "session", "sessionUpdate", "cookies"):
+        result.pop(key, None)
+    return 200, result
+
+
 def login_child(email: str, password: str, totp: str, proxy: str, workspace_id: str = ""):
     from app.engine import open_login_session
     client, tokens = open_login_session(email, password, totp, proxy, workspace_id=workspace_id)
@@ -1447,6 +1543,7 @@ ROUTES = {
     "/internal/team/usage": team_usage,
     "/internal/team/kick": team_kick,
     "/internal/team/revoke": team_revoke,
+    "/internal/account/extract": account_extract,
 }
 
 
@@ -1505,6 +1602,10 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             pass
         payload = attach_session_update(http, payload)
+        if path == "/internal/account/extract" and isinstance(payload, dict):
+            for key in ("password", "proxy", "totp", "session", "sessionUpdate", "cookies"):
+                payload.pop(key, None)
+            status = 200
         self._send(status if status < 500 else 200, payload)
 
 

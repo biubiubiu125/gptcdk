@@ -26,6 +26,7 @@ import type {
   CreditTierListResponse,
   DownloadPayload,
   ExportAccountsRequest,
+  ExtractJobRow,
   GenerateCardsRequest,
   GenerateCardsResponse,
   ImportRequest,
@@ -417,6 +418,18 @@ export function importAccounts(payload: ImportRequest): Promise<ImportResponse> 
   return request<ImportResponse>('/admin/accounts/import', { method: 'POST', body: payload });
 }
 
+export function listExtractJobs(): Promise<{ items: ExtractJobRow[] }> {
+  return request('/admin/accounts/extract-jobs');
+}
+
+export function extractProxyReady(): Promise<{ ready: boolean }> {
+  return request('/admin/accounts/extract-proxy');
+}
+
+export function stopExtractJob(id: number): Promise<{ id: number; stopped: boolean }> {
+  return request(`/admin/accounts/extract-jobs/${id}/stop`, { method: 'POST', body: {} });
+}
+
 /** `POST /api/admin/accounts/generate-cards` */
 export function generateCards(payload: GenerateCardsRequest): Promise<GenerateCardsResponse> {
   return request<GenerateCardsResponse>('/admin/accounts/generate-cards', {
@@ -440,6 +453,13 @@ export function batchDeleteAccounts(ids: number[]): Promise<BatchDeleteAccountsR
   return request<BatchDeleteAccountsResponse>('/admin/accounts/batch-delete', {
     method: 'POST',
     body: payload,
+  });
+}
+
+export function retagAccounts(ids: number[], subscriptionTag: string) {
+  return request<{ updated: number; rejected: Array<{ id: number; reason: string }> }>('/admin/accounts/retag', {
+    method: 'POST',
+    body: { ids, subscriptionTag },
   });
 }
 

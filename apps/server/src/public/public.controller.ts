@@ -43,6 +43,8 @@ export class PublicController {
     try {
       const result = await this.service.reclaim({
         cards: body?.cards,
+        lines: body?.lines,
+        credential: body?.credential,
         format: typeof body?.format === 'string' ? body.format : undefined,
         ip: clientIp(request),
         userAgent: request.headers['user-agent'],

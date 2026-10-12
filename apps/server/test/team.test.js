@@ -1716,6 +1716,78 @@ test('踢完仍在名单里时不删除本地账密', async (t) => {
   assert.equal(kept.accessToken, 'keep-me');
 });
 
+test('踢出失败且人还在名单里时，保留真实原因，不写成限流', async (t) => {
+  const { prisma, team } = await fixture(t);
+  const created = await mother(team);
+  const imported = await team.importChildren('kid@example.com----chatgpt-pass----JBSWY3DPEHPK3PXP');
+  const child = await prisma.account.findUnique({ where: { cardKey: imported.created[0].cardKey } });
+  await prisma.account.update({
+    where: { id: child.id },
+    data: { workspaceId: created.id, userId: 'user-1', teamStatus: 'joined', accessToken: 'keep-me' },
+  });
+  route = (path) => {
+    if (path.includes('kick')) return { ok: false, code: 'UPSTREAM', message: '退出失败：HTTP 500' };
+    if (path.includes('snapshot')) {
+      return { ok: true, complete: true, seatsEntitled: 5, members: members([{ id: 'user-1', email: 'kid@example.com', role: 'standard-user' }]), total: 2 };
+    }
+    return { ok: true };
+  };
+  const job = await team.kickSelected(created.id, '踢出选中', ['user-1']);
+  assert.match(job.message, /退出失败：HTTP 500/);
+  assert.match(job.message, /仍在名单里，没有删除资料/);
+  assert.doesNotMatch(job.message, /可能被限流/);
+  const kept = await prisma.account.findUnique({ where: { id: child.id } });
+  assert.equal(kept.teamStatus, 'joined');
+});
+
+test('母号踢人遇到 session 失效时说明失效，不再继续踢后面的人', async (t) => {
+  const { prisma, team } = await fixture(t);
+  const created = await mother(team);
+  const first = await team.importChildren('one@example.com----chatgpt-pass----JBSWY3DPEHPK3PXP');
+  const second = await team.importChildren('two@example.com----chatgpt-pass----JBSWY3DPEHPK3PXP');
+  const one = await prisma.account.findUnique({ where: { cardKey: first.created[0].cardKey } });
+  const two = await prisma.account.findUnique({ where: { cardKey: second.created[0].cardKey } });
+  await prisma.account.update({
+    where: { id: one.id },
+    data: { workspaceId: created.id, userId: 'user-1', teamStatus: 'file_ready' },
+  });
+  await prisma.account.update({
+    where: { id: two.id },
+    data: { workspaceId: created.id, userId: 'user-2', teamStatus: 'file_ready' },
+  });
+  const kicked = [];
+  route = (path, body) => {
+    if (path.includes('kick')) {
+      kicked.push(body.userId);
+      return { ok: false, code: 'SESSION_EXPIRED', message: '母号 session 已失效，请重新贴一次' };
+    }
+    if (path.includes('snapshot')) {
+      return {
+        ok: true,
+        complete: true,
+        seatsEntitled: 5,
+        members: members([
+          { id: 'user-1', email: 'one@example.com', role: 'standard-user' },
+          { id: 'user-2', email: 'two@example.com', role: 'standard-user' },
+        ]),
+        total: 3,
+      };
+    }
+    return { ok: true };
+  };
+  await assert.rejects(
+    () => team.kickSelected(created.id, '踢出选中', ['user-1', 'user-2']),
+    (error) => /已失效/.test(errorText(error)) && !/可能被限流/.test(errorText(error)),
+  );
+  assert.deepEqual(kicked, ['user-1']);
+  const keptOne = await prisma.account.findUnique({ where: { id: one.id } });
+  const keptTwo = await prisma.account.findUnique({ where: { id: two.id } });
+  assert.equal(keptOne.teamStatus, 'file_ready');
+  assert.equal(keptTwo.teamStatus, 'file_ready');
+  const motherRow = await prisma.teamWorkspace.findUnique({ where: { id: created.id } });
+  assert.equal(motherRow.sessionStatus, 'expired');
+});
+
 test('空的 session 回写不会清掉母号会话，新 cookie 才会写回', async (t) => {
   const { team } = await fixture(t);
   const created = await mother(team);
@@ -1825,6 +1897,133 @@ test('订阅接口失败时不覆盖已有席位和到期', async (t) => {
   assert.equal(row.seatsEntitled, 5);
   assert.equal(row.activeUntil, '2026-10-08T03:12:01Z');
   assert.equal(row.willRenew, false);
+});
+
+test('订阅接口失败时保留旧到期，并标明这次没核对', async (t) => {
+  const { team } = await fixture(t);
+  const created = await mother(team);
+  route = (path) => path.includes('snapshot')
+    ? { ok: true, complete: true, seatsEntitled: 5, activeUntil: '2026-10-08T03:12:01Z', willRenew: false, members: members(), total: 1 }
+    : { ok: true };
+  await team.refresh(created.id);
+  route = (path) => path.includes('snapshot')
+    ? { ok: true, complete: true, subscriptionRead: false, seatsEntitled: null, activeUntil: null, willRenew: null, members: members(), total: 1 }
+    : { ok: true };
+  const job = await team.refresh(created.id);
+  const row = (await team.listWorkspaces()).items.find((item) => item.id === created.id);
+  assert.equal(row.seatsEntitled, 5);
+  assert.equal(row.activeUntil, '2026-10-08T03:12:01Z');
+  assert.equal(row.willRenew, false);
+  assert.equal(row.subscriptionRead, false);
+  assert.match(String(row.lastError || ''), /订阅没读到/);
+  assert.match(String(row.lastError || ''), /仍是上次/);
+  assert.match(String(job.message || ''), /订阅没读到/);
+  route = (path) => path.includes('snapshot')
+    ? { ok: true, complete: true, seatsEntitled: 6, activeUntil: '2026-11-08T03:12:01Z', willRenew: true, members: members(), total: 1 }
+    : { ok: true };
+  await team.refresh(created.id);
+  const fresh = (await team.listWorkspaces()).items.find((item) => item.id === created.id);
+  assert.equal(fresh.subscriptionRead, true);
+  assert.equal(fresh.seatsEntitled, 6);
+  assert.equal(fresh.activeUntil, '2026-11-08T03:12:01Z');
+  assert.equal(fresh.lastError, null);
+});
+
+test('只按高级席位算空位，标准席位不占也不邀请', async (t) => {
+  const { team } = await fixture(t);
+  const created = await mother(team);
+  await team.importChildren('kid@example.com----chatgpt-pass----JBSWY3DPEHPK3PXP');
+  route = (path) => path.includes('snapshot')
+    ? {
+      ok: true,
+      complete: true,
+      seatsEntitled: 5,
+      seatsInUse: 5,
+      subscriptionRead: true,
+      members: members([{ id: 'std', email: 'std@example.com', role: 'standard-user', seatType: 'prolite' }]),
+      total: 2,
+    }
+    : { ok: true };
+  const full = await team.assign(created.id);
+  assert.match(full.results[0].message, /没有空位/);
+  assert.equal(calls.some((item) => item.path.includes('invite')), false);
+  const listed = (await team.listWorkspaces()).items.find((item) => item.id === created.id);
+  assert.equal(listed.emptySeats, 0);
+  assert.equal(listed.memberCount, 2);
+
+  calls.length = 0;
+  route = (path) => path.includes('snapshot')
+    ? {
+      ok: true,
+      complete: true,
+      seatsEntitled: 3,
+      subscriptionRead: true,
+      members: members([{ id: 'std', email: 'std@example.com', role: 'standard-user', seatType: 'prolite' }]).map((item, index) => (
+        index === 0 ? { ...item, seatType: 'default' } : item
+      )),
+      total: 2,
+    }
+    : { ok: true };
+  await team.refresh(created.id);
+  const premium = (await team.listWorkspaces()).items.find((item) => item.id === created.id);
+  assert.equal(premium.seatsEntitled, 3);
+  assert.equal(premium.memberCount, 2);
+  assert.equal(premium.emptySeats, 2);
+
+  route = (path) => path.includes('snapshot')
+    ? {
+      ok: true,
+      complete: true,
+      seatsEntitled: 0,
+      seatsInUse: 0,
+      subscriptionRead: true,
+      members: [{ id: 'std', email: 'std@example.com', role: 'standard-user', seatType: 'prolite' }],
+      total: 1,
+    }
+    : { ok: true };
+  const standardOnly = await team.assign(created.id);
+  assert.match(standardOnly.results[0].message, /没有空位/);
+  const cleared = (await team.listWorkspaces()).items.find((item) => item.id === created.id);
+  assert.equal(cleared.seatsEntitled, 0);
+  assert.equal(cleared.subscriptionRead, true);
+  assert.equal(cleared.emptySeats, 0);
+});
+
+test('订阅分不出高级席位时清空旧名额，并且不邀请', async (t) => {
+  const { team } = await fixture(t);
+  const created = await mother(team);
+  await team.importChildren('kid@example.com----chatgpt-pass----JBSWY3DPEHPK3PXP');
+  route = (path) => path.includes('snapshot')
+    ? { ok: true, complete: true, seatsEntitled: 5, seatsInUse: 1, activeUntil: '2026-10-08T03:12:01Z', willRenew: true, subscriptionRead: true, members: members(), total: 1 }
+    : { ok: true };
+  await team.refresh(created.id);
+  route = (path) => path.includes('snapshot')
+    ? {
+      ok: true,
+      complete: true,
+      subscriptionRead: true,
+      premiumKnown: false,
+      seatsEntitled: null,
+      seatsInUse: null,
+      activeUntil: null,
+      willRenew: null,
+      members: members(),
+      total: 1,
+    }
+    : { ok: true };
+  const job = await team.refresh(created.id);
+  const row = (await team.listWorkspaces()).items.find((item) => item.id === created.id);
+  assert.equal(row.subscriptionRead, true);
+  assert.equal(row.seatsEntitled, null);
+  assert.equal(row.activeUntil, null);
+  assert.equal(row.willRenew, null);
+  assert.equal(row.emptySeats, null);
+  assert.match(String(row.lastError || ''), /不能确认高级席位/);
+  assert.match(String(job.message || ''), /不能确认高级席位/);
+  calls.length = 0;
+  const assigned = await team.assign(created.id);
+  assert.match(assigned.results[0].message, /高级席位无法确认/);
+  assert.equal(calls.some((item) => item.path.includes('invite')), false);
 });
 
 test('旧母号缺少设备号时，刷新会补上并在下次继续使用', async (t) => {
