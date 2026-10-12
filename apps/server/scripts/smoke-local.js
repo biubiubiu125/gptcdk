@@ -42,9 +42,23 @@ MailboxService.prototype.pickupOne = async function(credential) {
     }] : [],
   };
 };
+function plusAccessToken(marker) {
+  const header = Buffer.from(JSON.stringify({ alg: 'none', typ: 'JWT' })).toString('base64url');
+  const payload = Buffer.from(JSON.stringify({
+    exp: Math.floor(Date.now() / 1000) + 3600,
+    'https://api.openai.com/auth': {
+      chatgpt_plan_type: 'plus',
+      chatgpt_account_id: '00000000-0000-4000-9000-000000000001',
+    },
+  })).toString('base64url');
+  return `${header}.${payload}.${marker}`;
+}
 MailboxService.prototype.refreshOpenAiToken = async () => ({
-  ok: true, accessToken: 'synthetic-refreshed-access', refreshToken: 'synthetic-refreshed-token',
-  expiresAt: new Date(Date.now() + 3600000), invalidCredential: false,
+  ok: true,
+  accessToken: plusAccessToken('synthetic-refreshed-access'),
+  refreshToken: 'synthetic-refreshed-token',
+  expiresAt: new Date(Date.now() + 3600000),
+  invalidCredential: false,
 });
 
 let app;
