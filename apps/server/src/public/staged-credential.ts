@@ -6,7 +6,7 @@ export type StagedCredential = {
   refreshToken: string;
   idToken: string | null;
   expiresAt: string | null;
-  previousRefreshToken: string;
+  previousRefreshToken: string | null;
 };
 
 export function serializeStagedCredential(write: {
@@ -14,7 +14,7 @@ export function serializeStagedCredential(write: {
   refreshToken: string;
   idToken: string | null;
   expiresAt: Date | null;
-  previousRefreshToken: string;
+  previousRefreshToken: string | null;
 }): string {
   return JSON.stringify({
     accessToken: write.accessToken,
@@ -32,7 +32,7 @@ export function parseStagedCredential(raw: string | null | undefined): StagedCre
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
     if (typeof parsed.accessToken !== 'string' || !parsed.accessToken.trim()) return null;
     if (typeof parsed.refreshToken !== 'string' || !parsed.refreshToken.trim()) return null;
-    if (typeof parsed.previousRefreshToken !== 'string' || !parsed.previousRefreshToken) return null;
+    if (parsed.previousRefreshToken !== null && (typeof parsed.previousRefreshToken !== 'string' || !parsed.previousRefreshToken)) return null;
     const expiresAt = typeof parsed.expiresAt === 'string' && parsed.expiresAt.trim() ? parsed.expiresAt.trim() : null;
     return {
       accessToken: parsed.accessToken,
@@ -52,7 +52,7 @@ export function stagedForAccount(account: {
   stagedCredential?: string | null;
 }): StagedCredential | null {
   const staged = parseStagedCredential(account.stagedCredential);
-  if (!staged || !account.refreshToken || staged.previousRefreshToken !== account.refreshToken) return null;
+  if (!staged || (account.refreshToken ?? null) !== staged.previousRefreshToken) return null;
   return staged;
 }
 

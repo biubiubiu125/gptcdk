@@ -9,9 +9,10 @@ import {
   parseLoginImport,
   redactMessage,
 } from '../common/subscription';
-import { encryptSecret, teamSecretReady } from '../team/team-crypto';
-import { normalizeSocks } from '../team/team-rules';
+import { encryptSecret, teamSecretReady } from '../common/secret-box';
+import { normalizeSocks } from '../common/socks';
 import type { AccountExtractClient, AccountExtractResult } from './extract-client';
+import { withExtractEmailLock } from '../public/reclaim-lock';
 
 export interface ExtractHost {
   prisma: any;
@@ -25,6 +26,85 @@ type LoginLine = { email: string; password: string; totp: string };
 
 function lineError(index: number, reason: string) {
   return { index, name: `第${index}行`, reason };
+}
+
+async function extractBlocked(host: ExtractHost, email: string, exceptJobId?: number): Promise<string | null> {
+  const account = await host.prisma.account.findFirst({
+    where: { email: { equals: email, mode: 'insensitive' } },
+    select: { id: true },
+  });
+  if (account) return '邮箱已在库或提取队列中';
+  const active = await host.prisma.extractJob.findFirst({
+    where: {
+      email: { equals: email, mode: 'insensitive' },
+      status: { in: ['queued', 'running', 'retrying', 'succeeded'] },
+      ...(exceptJobId ? { NOT: { id: exceptJobId } } : {}),
+    },
+    select: { id: true },
+  });
+  if (active) return '邮箱已在库或提取队列中';
+  const passwordFailure = await host.prisma.extractJob.findFirst({
+    where: {
+      email: { equals: email, mode: 'insensitive' },
+      status: 'failed',
+      ...(exceptJobId ? { NOT: { id: exceptJobId } } : {}),
+      OR: passwordOrTotpJobWhere(),
+    },
+    select: { id: true },
+  });
+  if (passwordFailure) return '该邮箱密码登录已失败，不能再次提取';
+  return null;
+}
+
+function passwordOrTotpJobWhere() {
+  const phrases = [
+    'invalid_username_or_password',
+    '密码错误',
+    '密码不正确',
+    '邮箱或密码',
+    '用户名或密码',
+    'mfa_totp',
+    '动态码未通过',
+    '2fa 动态码',
+  ];
+  return phrases.flatMap((phrase) => ([
+    { code: { contains: phrase, mode: 'insensitive' as const } },
+    { message: { contains: phrase, mode: 'insensitive' as const } },
+  ]));
+}
+
+const STOCKED_BATCH = 'stocked';
+const STOCKED_CODE = 'STOCKED';
+
+export async function ensureStockedEmail(
+  prisma: { extractJob: { findFirst(args: unknown): Promise<{ id: number } | null>; create(args: unknown): Promise<unknown> } },
+  email: string | null | undefined,
+): Promise<void> {
+  const normalized = String(email || '').trim();
+  if (!normalized) return;
+  const existing = await prisma.extractJob.findFirst({
+    where: {
+      email: { equals: normalized, mode: 'insensitive' },
+      status: 'succeeded',
+    },
+    select: { id: true },
+  });
+  if (existing) return;
+  await prisma.extractJob.create({
+    data: {
+      batchId: STOCKED_BATCH,
+      email: normalized,
+      subscriptionTag: '',
+      passwordCipher: 'stocked',
+      totpCipher: 'stocked',
+      proxyCipher: 'stocked',
+      status: 'succeeded',
+      failureClass: 'permanent',
+      code: STOCKED_CODE,
+      message: 'JSON 已入库，不能再次密码登录',
+      attempt: 0,
+    },
+  });
 }
 
 export async function enqueueLoginImport(
@@ -61,16 +141,9 @@ export async function enqueueLoginImport(
       continue;
     }
     seen.add(email);
-    const existing = await host.prisma.account.findFirst({
-      where: { email: { equals: email, mode: 'insensitive' }, cardDisabled: false, stockKind: 'standard' },
-      select: { id: true },
-    });
-    const queued = await host.prisma.extractJob.findFirst({
-      where: { email: { equals: email, mode: 'insensitive' }, status: { in: ['queued', 'running', 'retrying'] } },
-      select: { id: true },
-    });
-    if (existing || queued) {
-      errors.push(lineError(accepted.length + errors.length + 1, '邮箱已在库或提取队列中'));
+    const blocked = await extractBlocked(host, email);
+    if (blocked) {
+      errors.push(lineError(accepted.length + errors.length + 1, blocked));
       continue;
     }
     accepted.push(line);
@@ -151,7 +224,7 @@ async function resolveImportProxy(host: ExtractHost, raw: string | undefined, us
 async function readRememberedProxy(host: ExtractHost): Promise<string> {
   const row = await host.prisma.setting.findUnique({ where: { key: 'extractSocksProxy' } });
   if (!row?.value) return '';
-  const { decryptSecret } = await import('../team/team-crypto');
+  const { decryptSecret } = await import('../common/secret-box');
   try {
     return decryptSecret(row.value);
   } catch {
@@ -174,7 +247,10 @@ export async function rememberedProxyReady(host: ExtractHost): Promise<boolean> 
 
 export async function listExtractJobs(host: ExtractHost, batchId?: string) {
   const items = await host.prisma.extractJob.findMany({
-    where: batchId ? { batchId } : {},
+    where: {
+      NOT: { code: STOCKED_CODE },
+      ...(batchId ? { batchId } : {}),
+    },
     orderBy: { id: 'desc' },
     take: 100,
     select: {
@@ -264,7 +340,22 @@ export async function pumpExtractQueue(host: ExtractHost): Promise<void> {
 
 export async function runExtractJob(host: ExtractHost, id: number): Promise<void> {
   const job = await host.prisma.extractJob.findUnique({ where: { id } });
-  if (!job || job.status === 'stopped') return;
+  if (!job || job.status === 'stopped' || job.status === 'succeeded' || job.status === 'failed') return;
+  await withExtractEmailLock(host.prisma, job.email, () => runExtractJobLocked(host, job));
+}
+
+async function runExtractJobLocked(host: ExtractHost, job: any): Promise<void> {
+  const current = await host.prisma.extractJob.findUnique({ where: { id: job.id }, select: { status: true } });
+  if (!current || current.status === 'stopped' || current.status === 'succeeded' || current.status === 'failed') return;
+  const blocked = await extractBlocked(host, job.email, job.id);
+  if (blocked) {
+    await host.prisma.extractJob.updateMany({
+      where: { id: job.id, status: { not: 'stopped' } },
+      data: { status: 'failed', failureClass: 'permanent', code: 'DUPLICATE', message: blocked, nextRetryAt: null },
+    });
+    return;
+  }
+  const id = job.id;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 120000);
   const watch = setInterval(() => {
@@ -276,7 +367,7 @@ export async function runExtractJob(host: ExtractHost, id: number): Promise<void
   let totp = '';
   let proxy = '';
   try {
-    const { decryptSecret } = await import('../team/team-crypto');
+    const { decryptSecret } = await import('../common/secret-box');
     password = decryptSecret(job.passwordCipher);
     totp = decryptSecret(job.totpCipher);
     proxy = decryptSecret(job.proxyCipher);
@@ -368,7 +459,7 @@ async function saveExtractedAccount(
   };
   await host.prisma.$transaction(async (tx: any) => {
     const duplicate = await tx.account.findFirst({
-      where: { email: { equals: job.email, mode: 'insensitive' }, cardDisabled: false },
+      where: { email: { equals: job.email, mode: 'insensitive' } },
       select: { id: true },
     });
     if (duplicate) {
@@ -379,12 +470,16 @@ async function saveExtractedAccount(
       return;
     }
     const cardKey = await uniqueCardKey(tx, job.keyPrefix || 'CARD', job.keyGroups || 3, job.keyLength || 5);
+    const batch = job.batchId
+      ? await tx.batch.findUnique({ where: { batchId: job.batchId }, select: { remark: true } })
+      : null;
     const created = await tx.account.create({
       data: {
         name: job.email,
         email: job.email,
         credits: 0,
         subscriptionTag: job.subscriptionTag,
+        remark: batch?.remark?.trim() || null,
         remoteWorkspaceId: result.remoteWorkspaceId || null,
         planType: result.planType || null,
         accountId: result.accountId || result.remoteWorkspaceId || null,

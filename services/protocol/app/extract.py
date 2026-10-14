@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextvars
 import re
 from typing import Any, Callable
 
@@ -28,12 +29,42 @@ def redact(text: str, secrets: tuple[str, ...] = ()) -> str:
     return cleaned[:180]
 
 
+_otp_policy: contextvars.ContextVar[str] = contextvars.ContextVar("otp_policy", default="")
+
+
+def set_otp_policy(value: str):
+    return _otp_policy.set(str(value or ""))
+
+
+def reset_otp_policy(token) -> None:
+    _otp_policy.reset(token)
+
+
+def current_otp_policy() -> str:
+    return str(_otp_policy.get() or "")
+
+
 def password_rejected(status: int, mail_client: Any) -> bool:
+    if current_otp_policy() == "reclaim":
+        return False
     try:
         code = int(status or 0)
     except (TypeError, ValueError):
         code = 0
     return code == 401 and mail_client is None
+
+
+def note_reclaim_bare_401(client: Any, status: int, mail_client: Any) -> bool:
+    if current_otp_policy() != "reclaim" or mail_client is not None:
+        return False
+    try:
+        code = int(status or 0)
+    except (TypeError, ValueError):
+        code = 0
+    if code != 401:
+        return False
+    client.last_oauth_error = "email_verification_required"
+    return True
 
 
 def note_password_verify_failure(client: Any, status: int, mail_client: Any) -> bool:
@@ -45,6 +76,75 @@ def note_password_verify_failure(client: Any, status: int, mail_client: Any) -> 
 
 def note_email_otp_without_mailbox(client: Any) -> None:
     client.last_oauth_error = "email_verification_required"
+
+
+def note_reclaim_password_exhausted(client: Any, status: int, mail_client: Any) -> None:
+    """找回带邮箱的 401 在验证码和会话恢复都失败后，记成密码失败以便冷却。"""
+    if current_otp_policy() != "reclaim" or mail_client is None:
+        return
+    if str(getattr(client, "last_oauth_error", "") or "").strip():
+        return
+    try:
+        code = int(status or 0)
+    except (TypeError, ValueError):
+        return
+    if code != 401:
+        return
+    client.last_oauth_error = "invalid_username_or_password"
+
+
+def reclaim_follow_after_otp(next_url: str, continue_url: str, otp_attempted: bool) -> str:
+    """验证码已经试过并且没有下一步时不再跟着 continue_url 重进邮箱页。"""
+    if str(next_url or "").strip():
+        return str(next_url).strip()
+    if otp_attempted:
+        return ""
+    return str(continue_url or "").strip()
+
+
+def preserve_login_code(detail: str, hint: str) -> str:
+    """限流文案必须留下机器码，否则找回冷却对不上。"""
+    code = str(detail or "").strip()
+    text = str(hint or "").strip()
+    if code.startswith("email_otp_rejected_") and code not in text:
+        return f"{text}（{code}）" if text else code
+    return text or code
+
+
+def reclaim_otp_next_url(next_url: str, continue_url: str) -> str:
+    """验证码校验后只接受新的非邮箱页。空地址或仍是邮箱页都不再重进。"""
+    nxt = str(next_url or "").strip()
+    if not nxt:
+        return ""
+    current = str(continue_url or "").strip().rstrip("/")
+    if current and nxt.rstrip("/") == current:
+        return ""
+    low = nxt.lower()
+    if "email-verification" in low or "email-otp" in low or "email_otp" in low:
+        return ""
+    return nxt
+
+
+def note_reclaim_otp_exhausted(client: Any, mail_client: Any) -> None:
+    """找回的验证码或会话恢复失败后记冷却码。已有更具体的错误不覆盖。"""
+    if current_otp_policy() != "reclaim" or mail_client is None:
+        return
+    if str(getattr(client, "last_oauth_error", "") or "").strip():
+        return
+    client.last_oauth_error = "email_otp_exhausted"
+
+
+def note_reclaim_otp_send_failure(client: Any, status: int, mail_client: Any) -> None:
+    """找回发验证码失败时不要记成密码错误。已有更具体的错误不覆盖。"""
+    if current_otp_policy() != "reclaim" or mail_client is None:
+        return
+    if str(getattr(client, "last_oauth_error", "") or "").strip():
+        return
+    try:
+        code = int(status or 0)
+    except (TypeError, ValueError):
+        code = 0
+    client.last_oauth_error = f"email_otp_rejected_{code}" if code > 0 else "email_otp_exhausted"
 
 
 def jwt_claims(token: str) -> dict:
@@ -129,6 +229,15 @@ def personal_plan_allowed(payload: dict) -> bool:
     if account_id and workspace_id and account_id != workspace_id:
         return False
     return True
+
+
+def reclaim_plan_allowed(payload: dict) -> bool:
+    """找回已经拿到成对凭据时，缺套餐声明仍保留。显式错误套餐和空间冲突仍拒绝。"""
+    if claim(payload, "chatgpt_plan_type"):
+        return personal_plan_allowed(payload)
+    account_id = claim(payload, "chatgpt_account_id")
+    workspace_id = claim(payload, "chatgpt_workspace_id") or claim(payload, "workspace_id")
+    return not (account_id and workspace_id and account_id != workspace_id)
 
 
 def fail(code: str, message: str, *, temporary: bool) -> dict:
@@ -223,7 +332,7 @@ def token_value(data: dict, *keys: str) -> str:
 
 
 def success(data: dict, claims: dict, workspace_id: str | None, email: str) -> dict:
-    return {
+    payload = {
         "ok": True,
         "temporary": False,
         "code": "OK",
@@ -237,9 +346,27 @@ def success(data: dict, claims: dict, workspace_id: str | None, email: str) -> d
         "remoteWorkspaceId": workspace_id,
         "email": email,
     }
+    if payload["accessToken"] and payload["refreshToken"]:
+        return payload
+    from app.cancel import raise_if_cancelled
+    raise_if_cancelled()
+    return payload
 
 
 def run_extract(
+    body: dict,
+    login: Callable,
+    list_accounts: Callable,
+    exchange: Callable,
+) -> dict:
+    token = set_otp_policy(str(body.get("otpPolicy") or ""))
+    try:
+        return run_extract_body(body, login, list_accounts, exchange)
+    finally:
+        reset_otp_policy(token)
+
+
+def run_extract_body(
     body: dict,
     login: Callable,
     list_accounts: Callable,
@@ -288,8 +415,12 @@ def run_extract(
                 return fail("PLAN_MISMATCH", "空间核对失败", temporary=False)
             return success(current, claims, workspace_id, email)
         claims = jwt_claims(access)
-        if not personal_plan_allowed(claims):
+        allowed = reclaim_plan_allowed(claims) if current_otp_policy() == "reclaim" else personal_plan_allowed(claims)
+        if not allowed:
             return fail("PLAN_MISMATCH", "个人订阅核对失败", temporary=False)
         return success(tokens, claims, None, email)
     except Exception as error:
+        from app.cancel import ExtractCancelled
+        if isinstance(error, ExtractCancelled):
+            return fail("ABORTED", "提取已中断", temporary=True)
         return classified_exception(error, secrets)

@@ -63,4 +63,6 @@ export interface OpenAiTokenResult {
   error?: string;
   /** invalid_grant / unauthorized_client 之类表示凭据已失效 */
   invalidCredential: boolean;
+  /** 会话结束，需要重新登录，但不能当成凭据作废。 */
+  sessionEnded?: boolean;
 }

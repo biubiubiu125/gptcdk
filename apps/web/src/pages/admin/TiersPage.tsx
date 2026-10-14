@@ -90,13 +90,6 @@ export default function TiersPage() {
       render: (value: number) => formatNumber(value),
     },
     {
-      title: '已封禁',
-      dataIndex: 'banned',
-      key: 'banned',
-      width: 100,
-      render: (value: number) => formatNumber(value),
-    },
-    {
       title: '已停用',
       dataIndex: 'disabled',
       key: 'disabled',

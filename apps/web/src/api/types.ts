@@ -399,6 +399,7 @@ export type AccountSortField =
   | 'createdAt'
   | 'banStatus'
   | 'banCheckedAt'
+  | 'subscriptionTag'
   | 'redeemStatus'
   | 'redeemedAt'
   | 'updatedAt';
@@ -410,6 +411,11 @@ export interface AccountListQuery {
   credits?: number[];
   banStatus?: BanStatus[];
   redeemStatus?: RedeemStatus[];
+  batchRemark?: string;
+  subscriptionTag?: string[];
+  subscriptionTagEmpty?: boolean;
+  createdFrom?: string;
+  createdTo?: string;
   cardKey?: string;
   sortField?: AccountSortField;
   sortOrder?: SortOrder;
@@ -424,9 +430,6 @@ export interface AccountRow {
   creditStatus: CreditStatus;
   cardKey: string;
   createdAt: string;
-  banStatus: BanStatus;
-  banReason: string | null;
-  banCheckedAt: string | null;
   redeemStatus: RedeemStatus;
   redeemedAt: string | null;
   redeemCount: number;
@@ -435,6 +438,7 @@ export interface AccountRow {
   hasMailbox: boolean;
   batchId: string | null;
   remark: string | null;
+  batchRemark?: string | null;
   updatedAt: string;
 }
 
@@ -443,16 +447,12 @@ export interface AccountCreditsSummary {
   total: number;
   unredeemed: number;
   redeemed: number;
-  banned: number;
 }
 
 export interface AccountSummary {
   total: number;
   unredeemed: number;
   redeemed: number;
-  banned: number;
-  invalid: number;
-  unknown: number;
   /** 待定档账号数（额度还没从邮件里定出来） */
   pending: number;
   byCredits: AccountCreditsSummary[];
@@ -464,6 +464,7 @@ export interface AccountListResponse {
   page: number;
   pageSize: number;
   summary: AccountSummary;
+  subscriptionTags?: string[];
 }
 
 /* ------------------------------------------------------------------ *
@@ -554,10 +555,13 @@ export interface UpdateAccountRequest {
 
 export interface BatchDeleteAccountsRequest {
   ids: number[];
+  confirmRedeemed?: boolean;
 }
 
 export interface BatchDeleteAccountsResponse {
   deleted: number;
+  redeemed?: number;
+  kept?: number;
 }
 
 export interface CopyCardResponse {
@@ -576,6 +580,11 @@ export interface RefreshFilterPayload {
   redeemStatus?: RedeemStatus[];
   keyword?: string;
   batchId?: string;
+  batchRemark?: string;
+  subscriptionTag?: string[];
+  subscriptionTagEmpty?: boolean;
+  createdFrom?: string;
+  createdTo?: string;
 }
 
 export interface RefreshStatusRequest {
@@ -717,9 +726,6 @@ export interface OverviewAccounts {
   total: number;
   unredeemed: number;
   redeemed: number;
-  banned: number;
-  invalid: number;
-  unknown?: number;
   /** 待定档账号数 */
   pending?: number;
 }
@@ -749,7 +755,6 @@ export interface OverviewCreditsRow {
   total: number;
   unredeemed: number;
   redeemed: number;
-  banned: number;
 }
 
 export interface OverviewResponse {
@@ -860,7 +865,6 @@ export interface CreditTier {
   accounts: number;
   available: number;
   redeemed: number;
-  banned: number;
   disabled: number;
 }
 
@@ -878,12 +882,9 @@ export interface CreditTierListResponse {
 export interface Settings {
   siteName: string;
   siteSubtitle: string;
-  pickupConcurrency: number;
-  pickupMaxMessages: number;
   defaultFormat: DeliverFormat;
   redeemLimitPerCard: number;
   announcement: string;
-  teamGlobalSocksProxy: string;
 }
 
 export type SettingsPatch = Partial<Settings>;

@@ -73,6 +73,7 @@ test('账密导入没有代理时不建账号', async (t) => {
   await assert.rejects(
     () => f.accounts.importAccounts({
       content: 'seller@example.com----secret-pass----JBSWY3DPEHPK3PXP',
+      remark: '测试批次',
       subscriptionTag: 'Plus',
     }),
     (error) => {
@@ -100,6 +101,7 @@ test('账密导入只排队，成功后才发卡且文件不带代理', async (t
   };
   const imported = await f.accounts.importAccounts({
     content: 'seller@example.com----secret-pass----JBSWY3DPEHPK3PXP',
+    remark: '测试批次',
     subscriptionTag: 'Plus',
     proxy: 'socks5://user:pass@127.0.0.1:1080',
   });
@@ -111,11 +113,110 @@ test('账密导入只排队，成功后才发卡且文件不带代理', async (t
   const account = await f.prisma.account.findFirst();
   assert.equal(account.subscriptionTag, 'Plus');
   assert.equal(account.credits, 0);
+  assert.equal(account.remark, '测试批次');
   const raw = JSON.parse(account.rawJson);
   assert.equal(JSON.parse(raw.notes).gpt.password, 'secret-pass');
   assert.equal(raw.proxy, undefined);
   assert.equal(calls[0].includes('socks5://'), true);
   assert.equal(String(account.rawJson).includes('socks5://'), false);
+});
+
+test('账号已入库后排队提取不再登录', async (t) => {
+  const f = await fixture(t);
+  const calls = [];
+  f.accounts.extractClient = async (body) => {
+    calls.push(body.email);
+    return {
+      ok: true,
+      temporary: false,
+      accessToken: token({ chatgpt_plan_type: 'plus', chatgpt_account_id: 'personal-1' }),
+      refreshToken: 'rt-from-login',
+      accountId: 'personal-1',
+      planType: 'plus',
+    };
+  };
+  const queued = await f.accounts.importAccounts({
+    content: 'queued@example.com----secret-pass----JBSWY3DPEHPK3PXP',
+    remark: '先排队',
+    subscriptionTag: 'Plus',
+    proxy: 'socks5://127.0.0.1:1080',
+  });
+  assert.equal(queued.queued, 1);
+  const plus = token({ chatgpt_plan_type: 'plus', chatgpt_account_id: 'personal-1' });
+  const json = await f.accounts.importAccounts({
+    content: JSON.stringify([{ email: 'queued@example.com', access_token: plus, refresh_token: 'rt-json' }]),
+    remark: '后入库',
+    subscriptionTag: 'Plus',
+  });
+  assert.equal(json.imported, 1);
+  const job = await f.prisma.extractJob.findFirst({ where: { email: 'queued@example.com', status: 'queued' } });
+  await runExtractJob(f.accounts, job.id);
+  assert.deepEqual(calls, []);
+  const saved = await f.prisma.extractJob.findUnique({ where: { id: job.id } });
+  assert.equal(saved.status, 'failed');
+  assert.equal(saved.code, 'DUPLICATE');
+  const account = await f.prisma.account.findFirst({ where: { email: 'queued@example.com' } });
+  assert.equal(account.refreshToken, 'rt-json');
+  assert.equal(await f.prisma.account.count({ where: { email: 'queued@example.com' } }), 1);
+});
+
+test('同一邮箱两个提取任务只登录一次', async (t) => {
+  const f = await fixture(t);
+  let release = () => undefined;
+  const gate = new Promise((resolve) => {
+    release = resolve;
+  });
+  const calls = [];
+  f.accounts.extractClient = async () => {
+    calls.push('login');
+    await gate;
+    return {
+      ok: true,
+      temporary: false,
+      accessToken: token({ chatgpt_plan_type: 'plus', chatgpt_account_id: 'personal-1' }),
+      refreshToken: 'rt-from-login',
+      accountId: 'personal-1',
+      planType: 'plus',
+    };
+  };
+  await f.accounts.importAccounts({
+    content: 'race@example.com----secret-pass----JBSWY3DPEHPK3PXP',
+    remark: '并发',
+    subscriptionTag: 'Plus',
+    proxy: 'socks5://127.0.0.1:1080',
+  });
+  const first = await f.prisma.extractJob.findFirst({ where: { email: 'race@example.com' } });
+  const running = runExtractJob(f.accounts, first.id);
+  const started = Date.now();
+  while (calls.length === 0 && Date.now() - started < 5000) {
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  assert.equal(calls.length, 1);
+  const second = await f.prisma.extractJob.create({
+    data: {
+      batchId: first.batchId,
+      email: first.email,
+      subscriptionTag: first.subscriptionTag,
+      passwordCipher: first.passwordCipher,
+      totpCipher: first.totpCipher,
+      proxyCipher: first.proxyCipher,
+      status: 'queued',
+      keyPrefix: first.keyPrefix,
+      keyGroups: first.keyGroups,
+      keyLength: first.keyLength,
+    },
+  });
+  const other = runExtractJob(f.accounts, second.id);
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  assert.equal(calls.length, 1);
+  release();
+  await Promise.all([running, other]);
+  assert.equal(calls.length, 1);
+  assert.equal(await f.prisma.account.count({ where: { email: 'race@example.com' } }), 1);
+  const duplicate = await f.prisma.extractJob.findUnique({ where: { id: second.id } });
+  assert.equal(duplicate.status, 'failed');
+  assert.equal(duplicate.code, 'DUPLICATE');
+  assert.equal((await f.prisma.extractJob.findUnique({ where: { id: first.id } })).status, 'succeeded');
 });
 
 test('5X 个人文件不入库', async (t) => {
@@ -130,6 +231,7 @@ test('5X 个人文件不入库', async (t) => {
   });
   await f.accounts.importAccounts({
     content: 'team@example.com----secret-pass----JBSWY3DPEHPK3PXP',
+    remark: '测试批次',
     subscriptionTag: '5X Team',
     proxy: 'socks5://127.0.0.1:1080',
   });
@@ -141,7 +243,7 @@ test('5X 个人文件不入库', async (t) => {
   assert.equal(await f.prisma.account.count(), 0);
 });
 
-test('账密对不上不登录，匹配后作废才重登一次', async (t) => {
+test('账密对不上不登录，对上后没有可用代理也不刷新', async (t) => {
   const f = await fixture(t);
   const access = token({ chatgpt_plan_type: 'plus', chatgpt_account_id: 'personal-1' });
   const account = await f.prisma.account.create({
@@ -193,7 +295,13 @@ test('账密对不上不登录，匹配后作废才重登一次', async (t) => {
   assert.equal(miss.results[0].message, '找不到对应的已交付账号');
   assert.equal(String(miss.results[0].card).includes('wrong-pass'), false);
 
-  f.redeem.refresher = { refresh: async () => ({ ok: false, invalidCredential: true, error: 'invalid_grant' }) };
+  let refreshes = 0;
+  f.redeem.refresher = {
+    refresh: async () => {
+      refreshes += 1;
+      return { ok: false, invalidCredential: true, error: 'invalid_grant' };
+    },
+  };
   f.redeem.extractClient = async () => {
     calls += 1;
     return { ok: false, temporary: true, code: 'UPSTREAM', message: '稍后' };
@@ -203,7 +311,7 @@ test('账密对不上不登录，匹配后作废才重登一次', async (t) => {
     data: {
       passwordCipher: encryptSecret('stored-pass'),
       totpCipher: encryptSecret('JBSWY3DPEHPK3PXP'),
-      proxyCipher: encryptSecret('socks5://127.0.0.1:1080'),
+      proxyCipher: 'unused',
     },
   });
   const hit = await f.redeem.reclaim({
@@ -211,45 +319,51 @@ test('账密对不上不登录，匹配后作废才重登一次', async (t) => {
     format: 'sub2api',
     ip: '203.0.113.11',
   });
-  assert.equal(calls, 1);
-  assert.equal(hit.results[0].message, '登录暂时失败，请稍后重试');
+  assert.equal(calls, 0);
+  assert.equal(refreshes, 0);
+  assert.equal(hit.results[0].ok, false);
+  assert.equal(hit.results[0].message, '重新登录缺少可用密码或代理，请联系管理员');
+  const kept = await f.prisma.account.findUnique({ where: { id: account.id } });
+  assert.equal(kept.cardDisabled, false);
+  assert.equal(kept.banStatus, 'unknown');
+  assert.equal(kept.refreshToken, 'old-refresh');
+  assert.equal(kept.accessToken, access);
+  assert.equal(JSON.stringify(hit).includes('stored-pass'), false);
 
-  await assert.rejects(
-    () => f.redeem.reclaim({
-      cards: [account.cardKey],
-      lines: ['buyer@example.com----stored-pass----JBSWY3DPEHPK3PXP'],
-      format: 'sub2api',
-    }),
-    (error) => {
-      assert.equal(error.message, '不能同时提交卡密和账密');
-      return true;
+  f.redeem.refresher = { refresh: async () => ({ ok: false, invalidCredential: false, error: 'invalid_client' }) };
+  const untouched = await f.prisma.account.create({
+    data: {
+      name: 'other@example.com',
+      email: 'other@example.com',
+      credits: 0,
+      subscriptionTag: 'Plus',
+      accessToken: access,
+      refreshToken: 'keep-refresh',
+      rawSource: 'sub2api',
+      rawJson: JSON.stringify({
+        email: 'other@example.com',
+        access_token: access,
+        notes: JSON.stringify({ gpt: { password: 'other-pass' }, two_factor: { secret: 'JBSWY3DPEHPK3PXP' } }),
+      }),
+      cardKey: 'CARD-OTHER',
+      redeemStatus: 'redeemed',
+      redeemedByCard: 'CARD-OTHER',
+      stockKind: 'standard',
+      banStatus: 'unknown',
+      updatedAt: new Date(),
     },
-  );
-
-  const next = token({ chatgpt_plan_type: 'plus', chatgpt_account_id: 'personal-1' });
-  f.redeem.extractClient = async (body) => {
-    calls += 1;
-    assert.equal(body.password, 'stored-pass');
-    assert.equal(body.proxy, 'socks5://127.0.0.1:1080');
-    assert.equal(body.workspaceId || '', '');
-    return { ok: true, temporary: false, accessToken: next, refreshToken: 'refresh-new' };
-  };
-  const saved = await f.redeem.reclaim({
-    lines: ['buyer@example.com----stored-pass----JBSWY3DPEHPK3PXP'],
+  });
+  const rejected = await f.redeem.reclaim({
+    lines: ['other@example.com----other-pass----JBSWY3DPEHPK3PXP'],
     format: 'sub2api',
     ip: '203.0.113.12',
   });
-  assert.equal(calls, 2);
-  assert.equal(saved.results[0].ok, true);
-  const delivered = `${saved.results[0].content || ''}\n${saved.mergedContent || ''}`;
-  assert.equal(delivered.includes('stored-pass'), false);
-  assert.equal(delivered.includes('JBSWY3DPEHPK3PXP'), false);
-  assert.equal(delivered.includes('socks5://'), false);
-  assert.equal(delivered.includes('refresh-new'), true);
-  const row = await f.prisma.account.findUnique({ where: { id: account.id } });
-  assert.equal(row.refreshToken, 'refresh-new');
-  assert.equal(row.accessToken, next);
-  assert.notEqual(row.refreshToken, 'old-refresh');
+  assert.equal(calls, 0);
+  assert.equal(rejected.results[0].ok, false);
+  const other = await f.prisma.account.findUnique({ where: { id: untouched.id } });
+  assert.equal(other.cardDisabled, false);
+  assert.equal(other.banStatus, 'unknown');
+  assert.equal(other.refreshToken, 'keep-refresh');
 });
 
 test('凭据找回只恢复对上的那一条，且不交出卡密', async (t) => {
@@ -314,26 +428,28 @@ test('凭据找回只恢复对上的那一条，且不交出卡密', async (t) =
     ip: '203.0.113.40',
   });
   const body = JSON.stringify(hit);
-  assert.deepEqual(refreshed, ['old-extra']);
-  assert.equal(hit.results[0].ok, true);
+  assert.deepEqual(refreshed, []);
+  assert.equal(hit.results[0].ok, false);
   assert.equal(hit.results[0].card, '第1行');
-  assert.equal(hit.results[0].accountCount, 1);
+  assert.equal(hit.results[0].message, '重新登录缺少可用密码或代理，请联系管理员');
   assert.equal(body.includes('CARD-PRIMARY'), false);
   assert.equal(body.includes('CARD-EXTRA'), false);
   assert.equal(body.includes('old-primary'), false);
-  assert.equal(body.includes('new-old-extra'), true);
+  assert.equal(body.includes('new-old-extra'), false);
   assert.equal(body.includes('primary@example.com'), false);
   const extraRow = await f.prisma.account.findUnique({ where: { id: extra.id } });
   const primaryRow = await f.prisma.account.findUnique({ where: { id: primary.id } });
-  assert.equal(extraRow.refreshToken, 'new-old-extra');
+  assert.equal(extraRow.refreshToken, 'old-extra');
   assert.equal(primaryRow.refreshToken, 'old-primary');
 
   refreshed.length = 0;
   const byCard = await f.redeem.reclaim({ cards: [primary.cardKey], format: 'sub2api' });
   assert.equal(byCard.results[0].ok, true);
   assert.equal(String(byCard.results[0].content).includes('primary@example.com'), true);
-  assert.equal(String(byCard.results[0].content).includes('extra@example.com'), true);
+  assert.equal(String(byCard.results[0].content).includes('extra@example.com'), false);
   assert.equal(refreshed.includes('old-primary'), true);
+  assert.equal(refreshed.includes('old-extra'), false);
+  assert.equal(refreshed.includes('new-old-extra'), false);
 });
 
 test('5X Team 不能靠标记卖出个人文件', async (t) => {
@@ -346,6 +462,7 @@ test('5X Team 不能靠标记卖出个人文件', async (t) => {
       { email: 'bad-team@example.com', access_token: personal, refresh_token: 'rt-bad' },
       { email: 'good-team@example.com', access_token: business, refresh_token: 'rt-good' },
     ]),
+    remark: '测试批次',
     subscriptionTag: '5X Team',
   });
   assert.equal(imported.imported, 1);
@@ -358,6 +475,7 @@ test('5X Team 不能靠标记卖出个人文件', async (t) => {
 
   const plusImport = await f.accounts.importAccounts({
     content: JSON.stringify([{ email: 'bare@example.com', access_token: missingPlan, refresh_token: 'rt-bare' }]),
+    remark: '测试批次',
     subscriptionTag: 'Plus',
   });
   assert.equal(plusImport.imported, 0);
@@ -398,9 +516,11 @@ test('5X Team 不能靠标记卖出个人文件', async (t) => {
   assert.equal((await f.prisma.account.findUnique({ where: { id: tagged.id } })).remoteWorkspaceId, null);
 });
 
-test('密码错误后不再登录，也不把账号标成失效', async (t) => {
+
+test('入库后找回登录一次，不刷新且不停用', async (t) => {
   const f = await fixture(t);
-  const access = token({ chatgpt_plan_type: 'plus', chatgpt_account_id: 'personal-1' });
+  const access = token({ chatgpt_plan_type: 'plus', chatgpt_account_id: 'personal-1', email: 'buyer@example.com' });
+  const refreshedAccess = token({ chatgpt_plan_type: 'plus', chatgpt_account_id: 'personal-1', email: 'buyer@example.com' });
   const account = await f.prisma.account.create({
     data: {
       name: 'buyer@example.com',
@@ -437,14 +557,31 @@ test('密码错误后不再登录，也不把账号标成失效', async (t) => {
     },
   });
   let calls = 0;
-  f.redeem.refresher = { refresh: async () => ({ ok: false, invalidCredential: true, error: 'invalid_grant' }) };
-  f.redeem.extractClient = async () => {
+  let refreshes = 0;
+  f.redeem.refresher = {
+    refresh: async (value) => {
+      refreshes += 1;
+      assert.equal(value, 'old-refresh');
+      return {
+        ok: true,
+        credentials: {
+          accessToken: refreshedAccess,
+          refreshToken: 'rotated-refresh',
+          idToken: refreshedAccess,
+        },
+      };
+    },
+  };
+  f.redeem.extractClient = async (input) => {
     calls += 1;
+    assert.equal(input.password, 'stored-pass');
+    assert.equal(input.otpPolicy, 'reclaim');
+    assert.equal(input.mailboxAccountId, undefined);
     return {
-      ok: false,
-      temporary: false,
-      code: 'FAILED',
-      message: '授权失败：邮箱或密码不正确｜若你这行里出现超过 4 个连续短横线，请确认密码里是不是真的带 -',
+      ok: true,
+      accessToken: token({ chatgpt_plan_type: 'plus', email: 'buyer@example.com' }),
+      refreshToken: 'login-refresh',
+      idToken: token({ chatgpt_plan_type: 'plus', email: 'buyer@example.com' }),
     };
   };
   const first = await f.redeem.reclaim({
@@ -453,18 +590,24 @@ test('密码错误后不再登录，也不把账号标成失效', async (t) => {
     ip: '203.0.113.50',
   });
   assert.equal(calls, 1);
-  assert.equal(first.results[0].message, '凭据已作废，重新登录失败，请联系管理员');
+  assert.equal(refreshes, 0);
+  assert.equal(first.results[0].ok, true);
+  assert.equal(first.results[0].message, '已重新登录原卡密账号');
   const job = await f.prisma.extractJob.findFirst({ where: { accountId: account.id } });
-  assert.equal(job.code, 'PASSWORD_REJECTED');
   assert.equal(job.status, 'succeeded');
-  assert.notEqual((await f.prisma.account.findUnique({ where: { id: account.id } })).banStatus, 'invalid');
+  const saved = await f.prisma.account.findUnique({ where: { id: account.id } });
+  assert.equal(saved.cardDisabled, false);
+  assert.equal(saved.banStatus, 'unknown');
+  assert.equal(saved.refreshToken, 'login-refresh');
   const second = await f.redeem.reclaim({
     lines: ['buyer@example.com----stored-pass----JBSWY3DPEHPK3PXP'],
     format: 'sub2api',
     ip: '203.0.113.51',
   });
   assert.equal(calls, 1);
-  assert.equal(second.results[0].message, '凭据已作废，重新登录失败，请联系管理员');
+  assert.equal(refreshes, 0);
+  assert.equal(second.results[0].ok, true);
+  assert.equal(second.results[0].message, '凭据已重新登录过，本次没有再次登录');
 });
 
 test('缺套餐和限流分类在入库前就被拦住', () => {
@@ -594,20 +737,53 @@ test('对上的暂存仍可交付，对不上的不能兑换、导出或覆盖',
     where: { id: team.id },
     data: { expiresAt: new Date(0), accessToken: business, refreshToken: 'rt-team-live' },
   });
-  f.mailbox.refreshOpenAiToken = async () => ({
-    ok: true,
-    accessToken: personal,
-    refreshToken: 'rt-personal-refresh',
-    expiresAt: new Date(Date.now() + 3600000),
-  });
+  let openAiCalls = 0;
+  f.mailbox.refreshOpenAiToken = async () => {
+    openAiCalls += 1;
+    return {
+      ok: true,
+      accessToken: personal,
+      refreshToken: 'rt-personal-refresh',
+      expiresAt: new Date(Date.now() + 3600000),
+    };
+  };
   const rejected = await f.accounts.refreshStatus({ ids: [team.id], targets: ['redeem'] });
+  assert.equal(openAiCalls, 0);
   assert.equal(rejected.redeem.failed, 1);
-  assert.match(rejected.items[0].error, /订阅标记/);
+  assert.equal(rejected.items[0].error, '已兑换账号不在后台轮换凭据');
   const untouched = await f.prisma.account.findUnique({ where: { id: team.id } });
   assert.equal(untouched.accessToken, business);
   assert.equal(untouched.refreshToken, 'rt-team-live');
   assert.equal(untouched.stagedCredential, null);
   assert.notEqual(untouched.banStatus, 'invalid');
+
+  const unsold = await f.prisma.account.create({
+    data: {
+      name: 'team-unsold@example.com',
+      email: 'team-unsold@example.com',
+      credits: 0,
+      subscriptionTag: '5X Team',
+      planType: 'self_serve_business_prolite',
+      remoteWorkspaceId: 'ws-team',
+      accessToken: business,
+      refreshToken: 'rt-unsold',
+      rawSource: 'sub2api',
+      rawJson: JSON.stringify({ email: 'team-unsold@example.com' }),
+      cardKey: 'CARD-TEAM-UNSOLD',
+      redeemStatus: 'unredeemed',
+      stockKind: 'standard',
+      banStatus: 'unknown',
+      expiresAt: new Date(0),
+      updatedAt: new Date(),
+    },
+  });
+  const tagRejected = await f.accounts.refreshStatus({ ids: [unsold.id], targets: ['redeem'] });
+  assert.equal(tagRejected.redeem.failed, 1);
+  assert.match(tagRejected.items[0].error, /订阅标记/);
+  const unsoldKept = await f.prisma.account.findUnique({ where: { id: unsold.id } });
+  assert.equal(unsoldKept.accessToken, business);
+  assert.equal(unsoldKept.refreshToken, 'rt-unsold');
+  assert.notEqual(unsoldKept.banStatus, 'invalid');
 
   f.mailbox.refreshOpenAiToken = async () => ({
     ok: true,
@@ -615,10 +791,178 @@ test('对上的暂存仍可交付，对不上的不能兑换、导出或覆盖',
     refreshToken: 'rt-team-refreshed',
     expiresAt: new Date(Date.now() + 3600000),
   });
-  const accepted = await f.accounts.refreshStatus({ ids: [team.id], targets: ['redeem'] });
+  const accepted = await f.accounts.refreshStatus({ ids: [unsold.id], targets: ['redeem'] });
   assert.equal(accepted.redeem.failed, 0);
-  const refreshed = await f.prisma.account.findUnique({ where: { id: team.id } });
+  const refreshed = await f.prisma.account.findUnique({ where: { id: unsold.id } });
   assert.equal(refreshed.accessToken, rotatedBusiness);
   assert.equal(refreshed.refreshToken, 'rt-team-refreshed');
   assert.equal(refreshed.remoteWorkspaceId, 'ws-team');
+  const soldStill = await f.prisma.account.findUnique({ where: { id: team.id } });
+  assert.equal(soldStill.refreshToken, 'rt-team-live');
+});
+
+test('停用、Team、已成功提取和密码失败不再登录', async (t) => {
+  const f = await fixture(t);
+  const calls = [];
+  f.accounts.extractClient = async (body) => {
+    calls.push(body.email);
+    throw new Error('不应登录');
+  };
+  await f.prisma.account.create({
+    data: {
+      name: 'disabled@example.com',
+      email: 'disabled@example.com',
+      credits: 0,
+      cardKey: 'CARD-DISABLED-LOGIN',
+      cardDisabled: true,
+      stockKind: 'standard',
+      banStatus: 'invalid',
+      accessToken: 'kept',
+      refreshToken: 'rt-disabled',
+    },
+  });
+  await f.prisma.account.create({
+    data: {
+      name: 'team@example.com',
+      email: 'team@example.com',
+      credits: 0,
+      cardKey: 'CARD-TEAM-LOGIN',
+      stockKind: 'team',
+      accessToken: 'kept',
+      refreshToken: 'rt-team',
+    },
+  });
+  const loginLine = (email, remark) => f.accounts.importAccounts({
+    content: `${email}----secret-pass----JBSWY3DPEHPK3PXP`,
+    remark,
+    subscriptionTag: 'Plus',
+    proxy: 'socks5://127.0.0.1:1080',
+  });
+  const disabled = await loginLine('disabled@example.com', '停用后再提取');
+  const team = await loginLine('team@example.com', 'Team 后再提取');
+  assert.equal(disabled.queued, 0);
+  assert.equal(team.queued, 0);
+  assert.match(disabled.errors.map((item) => item.reason).join(' '), /邮箱已在库/);
+  assert.deepEqual(calls, []);
+
+  const tombstone = await loginLine('gone@example.com', '成功后删除');
+  assert.equal(tombstone.queued, 1);
+  await f.prisma.extractJob.update({
+    where: { id: tombstone.jobs[0].id },
+    data: { status: 'succeeded', accountId: null },
+  });
+  const again = await loginLine('gone@example.com', '删除后重提');
+  assert.equal(again.queued, 0);
+  await runExtractJob(f.accounts, tombstone.jobs[0].id);
+  assert.deepEqual(calls, []);
+  assert.equal((await f.prisma.extractJob.findUnique({ where: { id: tombstone.jobs[0].id } })).status, 'succeeded');
+
+  const failed = await loginLine('badpass@example.com', '密码已失败');
+  await f.prisma.extractJob.update({
+    where: { id: failed.jobs[0].id },
+    data: { status: 'failed', failureClass: 'permanent', code: 'invalid_username_or_password', message: '密码错误' },
+  });
+  const retry = await loginLine('badpass@example.com', '密码失败后再提取');
+  assert.equal(retry.queued, 0);
+  assert.match(retry.errors.map((item) => item.reason).join(' '), /密码登录已失败/);
+  await runExtractJob(f.accounts, failed.jobs[0].id);
+  assert.deepEqual(calls, []);
+});
+
+test('更早的密码失败不会被 50 条新失败盖住', async (t) => {
+  const f = await fixture(t);
+  const calls = [];
+  f.accounts.extractClient = async () => {
+    calls.push('login');
+    throw new Error('不应登录');
+  };
+  const old = await f.prisma.extractJob.create({
+    data: {
+      batchId: 'old-password',
+      email: 'hidden-pass@example.com',
+      subscriptionTag: 'Plus',
+      passwordCipher: 'stocked',
+      totpCipher: 'stocked',
+      proxyCipher: 'stocked',
+      status: 'failed',
+      failureClass: 'permanent',
+      code: 'FAILED',
+      message: '密码不正确',
+    },
+  });
+  for (let index = 0; index < 50; index += 1) {
+    await f.prisma.extractJob.create({
+      data: {
+        batchId: 'newer-retry',
+        email: 'hidden-pass@example.com',
+        subscriptionTag: 'Plus',
+        passwordCipher: 'stocked',
+        totpCipher: 'stocked',
+        proxyCipher: 'stocked',
+        status: 'failed',
+        failureClass: 'temporary',
+        code: 'RETRY',
+        message: '稍后重试',
+      },
+    });
+  }
+  const retry = await f.accounts.importAccounts({
+    content: 'hidden-pass@example.com----secret-pass----JBSWY3DPEHPK3PXP',
+    remark: '旧密码失败后再提取',
+    subscriptionTag: 'Plus',
+    proxy: 'socks5://127.0.0.1:1080',
+  });
+  assert.equal(retry.queued, 0);
+  assert.match(retry.errors.map((item) => item.reason).join(' '), /密码登录已失败/);
+  await runExtractJob(f.accounts, old.id);
+  assert.deepEqual(calls, []);
+});
+
+test('JSON 导入删除后不能再密码登录', async (t) => {
+  const f = await fixture(t);
+  const calls = [];
+  f.accounts.extractClient = async () => {
+    calls.push('login');
+    throw new Error('不应登录');
+  };
+  const imported = await f.accounts.importAccounts({
+    content: JSON.stringify([{
+      email: 'json-gone@example.com',
+      access_token: token({ chatgpt_plan_type: 'plus', chatgpt_account_id: 'personal-1' }),
+      refresh_token: 'rt-json',
+    }]),
+    remark: 'JSON 入库',
+    subscriptionTag: 'Plus',
+  });
+  assert.equal(imported.imported, 1);
+  const account = await f.prisma.account.findFirst({ where: { email: 'json-gone@example.com' } });
+  const stocked = await f.prisma.extractJob.findFirst({ where: { email: 'json-gone@example.com', code: 'STOCKED' } });
+  assert.equal(stocked.status, 'succeeded');
+  assert.equal(stocked.passwordCipher, 'stocked');
+  const listed = await f.accounts.listExtractJobs();
+  assert.equal(listed.items.some((item) => item.code === 'STOCKED'), false);
+  await f.accounts.batchDelete([account.id], false);
+  assert.equal(await f.prisma.account.count({ where: { email: 'json-gone@example.com' } }), 0);
+  const again = await f.accounts.importAccounts({
+    content: 'json-gone@example.com----secret-pass----JBSWY3DPEHPK3PXP',
+    remark: '删除后重提',
+    subscriptionTag: 'Plus',
+    proxy: 'socks5://127.0.0.1:1080',
+  });
+  assert.equal(again.queued, 0);
+  assert.match(again.errors.map((item) => item.reason).join(' '), /邮箱已在库或提取队列中/);
+  const forced = await f.prisma.extractJob.create({
+    data: {
+      batchId: 'forced',
+      email: 'json-gone@example.com',
+      subscriptionTag: 'Plus',
+      passwordCipher: 'stocked',
+      totpCipher: 'stocked',
+      proxyCipher: 'stocked',
+      status: 'queued',
+    },
+  });
+  await runExtractJob(f.accounts, forced.id);
+  assert.deepEqual(calls, []);
+  assert.equal((await f.prisma.extractJob.findUnique({ where: { id: forced.id } })).code, 'DUPLICATE');
 });

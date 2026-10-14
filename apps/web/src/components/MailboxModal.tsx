@@ -9,7 +9,7 @@ import type {
   PickupResult,
   UpdateAccountRequest,
 } from '../api/types';
-import { BAN_STATUS_META, REDEEM_STATUS_META, formatCredits } from '../utils/format';
+import { REDEEM_STATUS_META, formatCredits } from '../utils/format';
 import { useLatestRequest } from '../hooks/useLatestRequest';
 import CopyButton from './CopyButton';
 import MailBrowser from './MailBrowser';
@@ -54,7 +54,7 @@ function SecretRow({ label, value }: SecretRowProps) {
 }
 
 /**
- * 后台账号「取件」弹窗：邮箱凭据 + 最新邮件 + 封禁/额度分析。
+ * 后台账号「取件」弹窗：邮箱凭据 + 最新邮件 + 额度。
  */
 export default function MailboxModal({ open, account, onClose, onChanged }: MailboxModalProps) {
   const { message } = AntApp.useApp();
@@ -128,9 +128,9 @@ export default function MailboxModal({ open, account, onClose, onChanged }: Mail
         email: info.email || info.name,
         ok: currentData.pickup.ok,
         error: currentData.pickup.error,
-        banned: currentData.pickup.banned,
-        banReason: currentData.pickup.banReason,
-        banKeywords: currentData.pickup.banKeywords ?? [],
+        banned: false,
+        banReason: null,
+        banKeywords: [],
         credits: currentData.pickup.credits,
         creditsBalance: currentData.pickup.creditsBalance,
         latestCode: currentData.pickup.latestCode,
@@ -154,11 +154,9 @@ export default function MailboxModal({ open, account, onClose, onChanged }: Mail
         }${tier > 0 ? ` → 已定档 ${tier} 额度` : ''}`,
       );
     }
-    if (!pickup.banned) parts.push('未命中封禁关键词');
     return parts.join(' · ') || '取件成功，未发现验证码或额度信息（账号仍为待定档）';
   }, [pickup]);
 
-  const banMeta = info ? BAN_STATUS_META[info.banStatus] : null;
   const redeemMeta = info ? REDEEM_STATUS_META[info.redeemStatus] : null;
 
   return (
@@ -181,28 +179,6 @@ export default function MailboxModal({ open, account, onClose, onChanged }: Mail
         >
           标记为已兑换
         </Button>,
-        info?.banStatus === 'banned' ? (
-          <Button
-            key="ban"
-            loading={saving}
-            onClick={() => {
-              void patch({ banStatus: 'normal' }, '已标记为正常');
-            }}
-          >
-            标记为正常
-          </Button>
-        ) : (
-          <Button
-            key="ban"
-            danger
-            loading={saving}
-            onClick={() => {
-              void patch({ banStatus: 'banned' }, '已标记为已封禁');
-            }}
-          >
-            标记为已封禁
-          </Button>
-        ),
       ]}
     >
       <Spin spinning={loading} tip="正在取件…">
@@ -239,12 +215,6 @@ export default function MailboxModal({ open, account, onClose, onChanged }: Mail
                       }}
                     />
                   </Space>
-                </div>
-              </div>
-              <div>
-                <div className="pickup-summary__label">封禁状态</div>
-                <div className="pickup-summary__value">
-                  {banMeta ? <Tag color={banMeta.color}>{banMeta.label}</Tag> : '—'}
                 </div>
               </div>
               <div>
@@ -296,27 +266,6 @@ export default function MailboxModal({ open, account, onClose, onChanged }: Mail
                 },
               ]}
             />
-
-            {pickup?.banned ? (
-              <Alert
-                type="error"
-                showIcon
-                style={{ marginBottom: 12 }}
-                message="该账号命中封禁关键词"
-                description={
-                  <div>
-                    {pickup.banReason ? <div>{pickup.banReason}</div> : null}
-                    <div style={{ marginTop: 6 }}>
-                      {(pickup.banKeywords ?? []).map((word) => (
-                        <Tag color="error" key={word}>
-                          {word}
-                        </Tag>
-                      ))}
-                    </div>
-                  </div>
-                }
-              />
-            ) : null}
 
             {pickup?.ok ? (
               <Alert

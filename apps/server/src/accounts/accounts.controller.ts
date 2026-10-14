@@ -41,6 +41,11 @@ export class AccountsController {
         banStatus: query.banStatus,
         redeemStatus: query.redeemStatus,
         batchId: query.batchId,
+        batchRemark: query.batchRemark,
+        subscriptionTag: query.subscriptionTag,
+        subscriptionTagEmpty: query.subscriptionTagEmpty,
+        createdFrom: query.createdFrom,
+        createdTo: query.createdTo,
         status: query.status,
       } as AccountFilter,
       limit: Number(query.limit) || 2000,
@@ -116,8 +121,8 @@ export class AccountsController {
   }
 
   @Post('batch-delete')
-  batchDelete(@Body() body: { ids?: number[] }) {
-    return this.accounts.batchDelete(body?.ids || []);
+  batchDelete(@Body() body: { ids?: number[]; confirmRedeemed?: boolean }) {
+    return this.accounts.batchDelete(body?.ids || [], body?.confirmRedeemed === true);
   }
 
   @Post('refresh-status')

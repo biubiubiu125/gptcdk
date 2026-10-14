@@ -29,12 +29,6 @@ const CREDITS_COLUMNS: ColumnsType<OverviewCreditsRow> = [
     key: 'redeemed',
     render: (value: number) => formatNumber(value),
   },
-  {
-    title: '已封禁',
-    dataIndex: 'banned',
-    key: 'banned',
-    render: (value: number) => <span style={{ color: value > 0 ? '#D9534F' : undefined }}>{formatNumber(value)}</span>,
-  },
 ];
 
 const BATCH_COLUMNS: ColumnsType<OverviewBatch> = [
@@ -107,8 +101,6 @@ export default function DashboardPage() {
     { key: 'pending', title: '待定档', value: accounts?.pending ?? 0 },
     { key: 'unredeemed', title: '未兑换', value: accounts?.unredeemed ?? 0 },
     { key: 'redeemed', title: '已兑换', value: accounts?.redeemed ?? 0 },
-    { key: 'banned', title: '已封禁', value: accounts?.banned ?? 0 },
-    { key: 'invalid', title: '凭据失效', value: accounts?.invalid ?? 0 },
   ];
 
   return (

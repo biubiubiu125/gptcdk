@@ -103,7 +103,7 @@ HTTP 4xx/5xx，body：
 | `format` | `deliverFormat` | 是 | 交付格式 |
 | `limit` | number | 否 | 默认使用后台 `redeemLimitPerCard`（初始值 1），请求值不得超过该配置，配置最大 20；只影响文件格式的首次兑换。账密忽略该值 |
 
-文件格式首次兑换在同一事务中占用主账号和同档位附加账号，全部写入 `redeemedByCard`；交付转换失败会回滚占用。账密首次兑换只交付本卡账号，不占附加库存。重复兑换按归属返回同一集合；账密重复导出时，归属里任一账号停用、封禁或凭据失效，整卡失败，不输出密码。附加账号自己的卡密不能再次兑换或读取该账号邮箱。已交付账号禁止重置为未兑换或重新生成卡密；管理员物理删除账号会影响后续重复下载。旧数据归属恢复限制见 [升级说明](UPGRADE.md)。
+文件格式首次兑换在同一事务中占用主账号和同档位附加账号，全部写入 `redeemedByCard`；交付转换失败会回滚占用。账密首次兑换只交付本卡账号，不占附加库存。重复兑换按归属返回同一集合；账密重复导出时跳过停用、封禁或凭据失效的账号，全部不可用才整卡失败，不输出密码。附加账号自己的卡密不能再次兑换或读取该账号邮箱。已交付账号禁止重置为未兑换或重新生成卡密；管理员物理删除账号会影响后续重复下载。旧数据归属恢复限制见 [升级说明](UPGRADE.md)。
 
 响应：
 
@@ -187,7 +187,7 @@ HTTP 4xx/5xx，body：
 
 前台显式传 `format=email` 时，整次兑换或找回直接拒绝，不占库存，也不刷新凭据。未传格式且后台默认仍是 `email` 时，前台改用 `sub2api`。
 
-账密 `login`：普通库存只读 `notes.gpt.password` 和 `notes.two_factor.secret`，账号只用账号邮箱，不用邮箱取件地址顶替。Team 子号只读已保存密文。没有 ChatGPT 密码时返回「该卡密没有账密交付」。有 2FA 输出 `账号----密码----2FA`，没有则输出 `账号----密码`。首次兑换忽略 `limit`。重复导出或找回时，归属账号停用、封禁或失效则整卡失败。公开兑换和找回账密都不调用 OpenAI。
+账密 `login`：普通库存只读 `notes.gpt.password` 和 `notes.two_factor.secret`，账号只用账号邮箱，不用邮箱取件地址顶替。Team 子号只读已保存密文。没有 ChatGPT 密码时返回「该卡密没有账密交付」。有 2FA 输出 `账号----密码----2FA`，没有则输出 `账号----密码`。首次兑换忽略 `limit`。重复导出或找回时，停用、封禁或失效的账号跳过；全部不可用才整卡失败。公开兑换和找回账密都不调用 OpenAI。
 
 邮箱 TXT 只用于后台导出和取件，格式根据每个账号的登录信息决定：
 
@@ -213,7 +213,7 @@ HTTP 4xx/5xx，body：
 }
 ```
 
-响应形状与兑换相同。成功时 `firstRedeem` 为 `false`，`code` 为 `OK`。文件格式会刷新原账号凭据；响应写完才解除持有，连接提前断开不解除。账密只重新导出已保存的账号和密码，不调用 OpenAI，成功也不解除已有持有。显式 `format=email` 直接拒绝。
+响应形状与兑换相同。成功时 `firstRedeem` 为 `false`，`code` 为 `OK`。文件格式只处理 `Account.cardKey` 等于提交卡密的原账号，不包含附加账号。材料齐全且有可用 SOCKS 时登录该账号，成功文案是「已重新登录原卡密账号」。缺材料、没有可用 SOCKS，或协议服务第一次就返回未配置时，才刷新一次。5X Team 没有已保存空间编号时不登录、不刷新、不停用，文案是「该账号缺少原空间编号，已保留原文件。请联系管理员」。没有 refresh token 但材料齐全时仍然登录；材料也不齐全才返回「该卡缺少可刷新凭据」。已经持有且没有新暂存时不再登录、不再刷新。不接受顾客代理。顾客提交的新密码只用于匹配，不拿去登录或刷新。登录已经拿到新凭据后连接断开仍写入。响应写完才按本次交付账号解除持有，连接提前断开不解除，再次找回不再登录。密码或 2FA 失败不回退刷新、不停用，30 分钟内不再重复登录。带邮箱的密码验证在验证码和会话恢复都失败后同样冷却。邮箱验证码只取 OpenAI 或 ChatGPT 邮件里的验证码句，取件会继续翻后面的邮件，不只看最近 50 封。公网入口不提供内部邮箱回调。一次找回多张卡时，剩余时间不够完成下一次登录就停止，返回 `REQUEST_BUDGET`，文案是「本次请求时间不足，请稍后单独找回」，不刷新、不冷却，已完成的卡仍留在响应里。验证码被拒绝，或整次验证码尝试失败，同样冷却。验证码被限流，或停在邮箱验证页，同样冷却。找回验证码只认 6 位。令牌没有邮箱声明但订阅标记一致时仍然写入；声明了其他邮箱则不写入。找回取件换微软 token 和拉信共用 40 秒，协议回调等待盖住这段。令牌没有套餐声明但订阅标记一致时仍然写入；明确是 free、team 或商业套餐则不写入。首次提取缺套餐声明仍然拒绝。OpenAI `invalid_grant` 只在走到刷新时停用该账号并保留旧文件；卡主失败则停用原卡，文案是「凭据已作废，请联系管理员」，同一卡密再次找回返回「卡密已停用」。附加账号不登录、不刷新、不进本次文件，须用自己的卡密找回。凭证文件格式对上后用库存密码登录该条，不刷新、不解除已有持有。材料不齐时文案是「重新登录缺少可用密码或代理，请联系管理员」；协议未配置时文案是「重新登录暂时失败，请稍后重试」。不是可核对令牌的暂存不能覆盖已有订阅标记的账号。账密格式只重新导出已保存的账号和密码，不调用 OpenAI，成功也不解除已有持有。显式 `format=email` 直接拒绝。刷新已经换到新的 refresh token 但标记不一致时不写入、不停用、不解除持有，响应交出新凭据，文案是「新凭据与原空间不一致，未写入库存。请立即保存本次结果，旧刷新凭据可能已经失效」。没有换新 refresh token 时仍说已保留原文件，且不返回新文件。会话结束只出现在刷新路径，不停用，文案是「会话已结束，无法重新登录，请联系管理员」。
 
 失败 `code`：
 
@@ -225,12 +225,12 @@ HTTP 4xx/5xx，body：
 | `CARD_ALLOCATED` | 卡密归属不一致 |
 | `NO_STOCK` | 交付账号已停用、封禁或凭据失效 |
 | `REFRESH_MISSING` | 缺少可刷新凭据 |
-| `REFRESH_FAILED` | 刷新失败。若同一张卡已经写入一部分新凭据，`content` 仍返回已写入的文件 |
+| `REFRESH_FAILED` | 刷新失败，或新凭据与原空间不一致。若同一张卡已经写入一部分新凭据，`content` 仍返回已写入的文件 |
 | `PERSIST_FAILED` | 新凭据没有可靠落库。响应里仍带本次文件，必须立刻保存。已暂存时，再次找回不会拿旧凭据重新刷新 |
 
 同一张卡的找回、兑换重导出和后台刷新共用一把锁。找回正在向服务商换凭据时，兑换重导出会等待，不会把即将失效的旧凭据当作成功文件返回。
 
-成功找回会先保持持有标记。只有响应完整写出后才清除；连接中断或网关超时导致响应没送出时标记保留，再次找回不会重新轮换，并且不再继续刷新后续卡。组包异常时，失败文件仍包含这张卡上已经持有、本次没有轮换的账号。
+成功找回会先保持持有标记。登录已经拿到新凭据后即使连接断开也先落库。只有响应完整写出后才按本次交付账号清除；连接中断或网关超时导致响应没送出时标记保留，再次找回不会再登录，也不会拿旧凭据再刷新。组包异常重试成功时只返回本次原卡密账号；附加账号不进入失败文件。
 
 ### 1.3 `POST /api/public/pickup/resolve`
 
@@ -305,7 +305,7 @@ HTTP 4xx/5xx，body：
 
 ### 1.4 `POST /api/public/pickup/fetch`
 
-执行取件（官方直连 Outlook）。服务端并发上限 4，单账号超时 30s，最多返回最新 10 封邮件。
+执行取件（官方直连 Outlook）。服务端并发由 `PICKUP_CONCURRENCY` 控制，默认 4；单账号超时 30s。未传 `maxMessages` 时最多返回最新 30 封，上限 50。
 
 请求：
 
@@ -314,14 +314,14 @@ HTTP 4xx/5xx，body：
   "records": [
     { "key": "abc@outlook.com", "email": "abc@outlook.com", "line": "abc@outlook.com----pwd----clientid----rt...", "fromCard": null }
   ],
-  "maxMessages": 10,
+  "maxMessages": 30,
   "query": ""
 }
 ```
 
 - 提供 `line` 时只使用用户自带凭据，不关联库存；即使同时伪造 `key` 或 `fromCard` 也不会回写库内账号。
 - 不提供 `line` 时必须提供有效 `fromCard`，且 `key` 对应邮箱必须属于该卡交付的集合。仅凭邮箱不能查询库内凭据或取件。
-- 只有有效卡密取件且 `query` 为空时才回写库存状态；未发现封禁邮件不会清除已有 `banned` / `invalid` 状态。
+- 有效卡密取件且 `query` 为空时只写取件日志。公开响应不返回封禁关键词，`banned` 固定为 `false`，`banReason` 和 `banKeywords` 为空，也不回写账号的封禁、失效或停用字段。
 - 单次最多 20 条记录。
 
 响应：
@@ -436,14 +436,18 @@ HTTP 4xx/5xx，body：
 | --- | --- | --- |
 | `page` | number | 默认 1 |
 | `pageSize` | number | 默认 20，最大 200 |
-| `keyword` | string | 模糊匹配 账号名 / 邮箱 / 卡密 / 备注 |
+| `keyword` | string | 模糊匹配 账号名 / 邮箱 / 卡密 / 账号备注 / 批次备注 |
 | `credits` | number \| number[] | 额度筛选，多选逗号分隔 |
-| `banStatus` | string \| string[] | 封禁状态筛选 |
+| `banStatus` | string \| string[] | 已忽略，不筛选 |
 | `redeemStatus` | string \| string[] | 兑换状态筛选 |
+| `batchRemark` | string | 匹配账号备注或批次备注，包含关系 |
+| `subscriptionTag` | string \| string[] | 订阅标记，多选 |
+| `subscriptionTagEmpty` | `true` \| `1` \| `yes` | 只看未标记；和 `subscriptionTag` 同时传时取并集 |
+| `createdFrom` / `createdTo` | string | 导入时间。带时区的 ISO 时间按该瞬间比较。纯 `YYYY-MM-DD` 按服务器本地日，结束日含当天 23:59:59.999 |
 | `status` | `active` \| `disabled` | 卡密状态筛选（卡密管理页使用） |
 | `cardKey` | string | 精确卡密 |
 | `batchId` | string | 按导入批次筛选 |
-| `sortField` | string | `id` \| `name` \| `credits` \| `cardKey` \| `createdAt` \| `updatedAt` \| `banStatus` \| `banCheckedAt` \| `redeemStatus` \| `redeemedAt` \| `planType` |
+| `sortField` | string | `id` \| `name` \| `credits` \| `cardKey` \| `createdAt` \| `updatedAt` \| `banStatus` \| `banCheckedAt` \| `redeemStatus` \| `redeemedAt` \| `planType` \| `subscriptionTag` |
 | `sortOrder` | string | `ascend` \| `descend`（也接受 `asc` / `desc`） |
 
 响应：
@@ -459,9 +463,6 @@ HTTP 4xx/5xx，body：
       "creditStatus": "ready",
       "cardKey": "CARD-XXXXX-XXXXX-XXXXX",
       "createdAt": "2026-02-11T08:00:00.000Z",
-      "banStatus": "normal",
-      "banReason": null,
-      "banCheckedAt": "2026-02-11T08:10:00.000Z",
       "redeemStatus": "redeemed",
       "redeemedAt": "2026-02-11T08:12:33.000Z",
       "redeemCount": 1,
@@ -469,6 +470,8 @@ HTTP 4xx/5xx，body：
       "hasMailbox": true,
       "batchId": "b_20260211_080000",
       "remark": null,
+      "batchRemark": "2月批次",
+      "subscriptionTag": "Plus",
       "updatedAt": "2026-02-11T08:12:33.000Z"
     }
   ],
@@ -479,11 +482,8 @@ HTTP 4xx/5xx，body：
     "total": 1280,
     "unredeemed": 942,
     "redeemed": 338,
-    "banned": 12,
-    "invalid": 3,
-    "unknown": 20,
     "pending": 96,
-    "byCredits": [{ "credits": 40, "total": 400, "unredeemed": 300, "redeemed": 100, "banned": 4 }]
+    "byCredits": [{ "credits": 40, "total": 400, "unredeemed": 300, "redeemed": 100 }]
   }
 }
 ```
@@ -514,7 +514,7 @@ HTTP 4xx/5xx，body：
 | `content` / `files` | 二选一 | 至少一个 |
 | `prefix` | 否 | 卡密前缀，默认 `CARD` |
 | `skipDuplicate` | 否 | 默认 `true`，按 `email + 邮箱凭据` 去重，已存在则跳过 |
-| `remark` | 否 | 批次备注 |
+| `remark` | 是 | 批次备注。去空白后不能空，最多 200 字；写入批次、每个账号和提取任务 |
 | `keyLength` / `keyGroups` | 否 | 卡密随机段长度/段数，默认 5/3 |
 
 > **没有 `credits` 字段**：额度不手填。导入的账号一律记为「待定档」（`credits = 0`），
@@ -561,10 +561,10 @@ HTTP 4xx/5xx，body：
 ### 3.4 `PATCH /api/admin/accounts/:id`
 
 ```json
-{ "remark": "备注", "credits": 200, "banStatus": "banned", "redeemStatus": "unredeemed" }
+{ "remark": "备注", "credits": 200, "redeemStatus": "unredeemed" }
 ```
 
-响应：更新后的单个账号对象（同 3.1 items 元素）。
+响应：更新后的单个账号对象（同 3.1 items 元素）。`banStatus` 会被忽略，不返回 400，也不写库。
 
 > `credits` 是**兜底纠错通道**（正常流程由取件自动定档，后台 UI 不暴露）。
 > 传 `0` 可把账号退回「待定档」，此时该卡不再可兑换。
@@ -573,10 +573,10 @@ HTTP 4xx/5xx，body：
 ### 3.5 `POST /api/admin/accounts/batch-delete`
 
 ```json
-{ "ids": [1,2,3] }
+{ "ids": [1,2,3], "confirmRedeemed": false }
 ```
 
-响应 `{ "deleted": 3 }`
+选中含已兑换或已有交付归属的账号，且 `confirmRedeemed` 不是 `true` 时，返回 409 `CONFLICT`，整批不删。未确认删除的条件是仍未兑换且没有交付归属；检查后才兑换的账号会留下，响应 `{ "deleted": 1, "redeemed": 0, "kept": 1 }`，`kept` 是仍在库里的选中行。确认后才物理删除已兑换行。
 
 ### 3.6 `POST /api/admin/accounts/:id/copy-card`
 
@@ -588,7 +588,7 @@ HTTP 4xx/5xx，body：
 
 ### 3.7 `POST /api/admin/accounts/refresh-status`
 
-刷新封禁状态、兑换状态，并可按邮箱取件**自动定档**。两种模式：
+检查未兑换账号凭据，并可按邮箱取件处理没有标记的历史库存。`ban` 目标会被忽略；只传 `ban` 时返回空结果，不取件。默认目标是 `redeem`。两种模式：
 
 **模式 A（指定账号）**
 
@@ -604,7 +604,7 @@ HTTP 4xx/5xx，body：
 
 | 字段 | 说明 |
 | --- | --- |
-| `targets` | `ban`（封禁）/ `redeem`（兑换）/ `credits`（取件定档）；可多选，`ban` 与 `credits` 共用同一次取件请求 |
+| `targets` | `redeem`（检查凭据）/ `credits`（取件定档）。`ban` 被去掉，不返回 `ban` 统计 |
 | `limit` | 模式 B 单轮最多处理条数，默认 100，最大 500 |
 | `cursor` | 只处理 `id > cursor` 的账号；配合响应里的 `nextCursor` 循环调用，直到 `nextCursor` 为 `null`（避免「取件成功但没命中额度」的账号被同一轮反复取件） |
 | `filter.credits` | 传 `[0]` 即只处理「待定档」账号 |
@@ -617,7 +617,6 @@ HTTP 4xx/5xx，body：
   "requested": 2,
   "processed": 2,
   "nextCursor": 128,
-  "ban": { "banned": 1, "normal": 1, "invalid": 0, "failed": 0 },
   "redeem": { "redeemed": 1, "unredeemed": 1, "failed": 0 },
   "credits": { "hit": 1, "pending": 1, "failed": 0 },
   "items": [
@@ -626,13 +625,12 @@ HTTP 4xx/5xx，body：
 }
 ```
 
-`ban` / `redeem` / `credits` 三块统计只在对应 `targets` 被请求时返回。
+`redeem` / `credits` 统计只在对应目标被请求时返回。`ban` 不再返回。
 
 判定规则：
 
-- **封禁状态**：邮箱取件 → 扫描最新 10 封邮件的 `subject + bodyPreview + body`，命中封禁关键词（`account deactivated` / `suspended` / `disabled` / `permanently deleted` / `账户已停用` / `账号已被封禁` 等）→ `banned`；取件成功且未命中 → `normal`；OAuth 换 token 失败（`invalid_grant` / `unauthorized_client`）→ `invalid`（凭据失效，非封禁）；网络错误 → 保持原状态并返回 `error`。
-- **额度定档**：同一次取件结果里命中额度关键字（`we've added N credits` / `添加了 N 额度` / `N クレジット` / `N créditos` …）→ 写回 `Account.credits = floor(N ÷ 25)`，计入 `hit`；取件成功但没命中 → 保持原值（导入时为 `0` = 待定档），计入 `pending`；取件失败 → `failed`。**未命中的账号不会被清空已有档位。**
-- **凭据检查（兼容参数 `redeem`）**：读取 `Account.expiresAt`，缺失时读取 `access_token` 的 JWT `exp`；仅在确认过期时使用账号自己的 OpenAI `refresh_token` 刷新，不使用微软邮箱 token。成功只条件更新 OAuth 字段，不将正常轮换推断为已兑换，也不覆盖封禁状态。只有 OpenAI 返回 `invalid_grant` 才把账号标为 `invalid`（保留已有 `banned`）并计入 `failed`；HTTP 400/401、`invalid_client`、`unauthorized_client` 和地区限制只返回 `error`，不改封禁状态。当前凭据和暂存都写不进去时，`items[].unsavedCredential` 带上本次新的 access token、refresh token、id token 和过期时间，供管理员立即保存；有效期未知或缺少刷新凭据返回原因。汇总状态与返回 `items` 均使用刷新后的数据库记录。
+- **额度定档**：`credits` 目标仍会取件。命中额度关键字（`we've added N credits` / `添加了 N 额度` / `N クレジット` / `N créditos` …）计入 `hit`；取件成功但没命中计入 `pending`；取件失败计入 `failed`。只有订阅标记为空的账号才把档位写回 `Account.credits`，已有标记的账号不写。没命中不覆盖已有档位。取件不再写封禁、失效或停用。邮箱 `invalid_grant` 也不写这些字段。
+- **凭据检查（兼容参数 `redeem`）**：已兑换或已有 `redeemedByCard` 的账号不调用 OpenAI，不提交暂存凭据，不轮换 refresh token。过期时 `error` 为「已兑换账号不在后台轮换凭据」。检查过程中变成已兑换的，不覆盖当前凭据、不停用卡密，也不提交暂存凭据，不返回新 token，仍返回同一句。未兑换账号从提交暂存、请求 OpenAI 到写回都持有该账号的刷新锁，其他卡不能在这段时间把这份凭据领走；等锁释放后再领，拿到的是写回后的凭据。未兑换账号读取 `Account.expiresAt`，缺失时读取 `access_token` 的 JWT `exp`；仅在确认过期时使用账号自己的 OpenAI `refresh_token` 刷新，不使用微软邮箱 token。成功只条件更新仍未兑换的 OAuth 字段，不将正常轮换推断为已兑换，也不覆盖已有封禁状态。未兑换账号只有 OpenAI 返回 `invalid_grant` 才把账号标为 `invalid`、停用卡密（保留已有 `banned`）并计入 `failed`；HTTP 400/401、`invalid_client`、`unauthorized_client` 和地区限制只返回 `error`，不改封禁或停用。当前凭据和暂存都写不进去时，`items[].unsavedCredential` 带上本次新的 access token、refresh token、id token 和过期时间，供管理员立即保存；有效期未知或缺少刷新凭据返回原因。汇总状态与返回 `items` 均使用刷新后的数据库记录。
 
 ### 3.8 `GET /api/admin/accounts/:id/mailbox`
 
@@ -759,8 +757,8 @@ HTTP 4xx/5xx，body：
 
 ### 3.13 系统设置
 
-- `GET /api/admin/settings` → `{ "siteName": "gptcdk", "siteSubtitle": "SECURE DELIVERY", "pickupConcurrency": 4, "pickupMaxMessages": 30, "defaultFormat": "sub2api", "redeemLimitPerCard": 1, "announcement": "" }`
-- `PATCH /api/admin/settings` → 部分更新，返回全量设置
+- `GET /api/admin/settings` → `{ "siteName": "gptcdk", "siteSubtitle": "SECURE DELIVERY", "defaultFormat": "sub2api", "redeemLimitPerCard": 1, "announcement": "" }`
+- `PATCH /api/admin/settings` → 部分更新，返回全量设置。`pickupConcurrency`、`pickupMaxMessages`、`teamGlobalSocksProxy` 会被忽略，旧行不删除、不解密
 
 ---
 
@@ -924,7 +922,7 @@ SCOPE        = https://outlook.office.com/IMAP.AccessAsUser.All https://outlook.
 4. 验证码提取：先按上下文锚点 `(验证码|校验码|code|verification(\s+code)?|one-time password)[^0-9]{0,45}(\d{4,8})`，再在 60 字上下文内找 6 位数字，兜底取第一个 6 位数字。
 5. **额度提取（= 账号档位的唯一来源）**：多语言关键词（`we've added N credits` / `添加了 N 额度` / `N クレジット` / `N créditos` / `N credits vào` 等）命中后取 `N`：
    - 展示用余额 `balance = N / 25`
-   - **账号档位 `credits = floor(N / 25)`**，命中即写回 `Account.credits`；没命中保持原值（导入时为 `0` = 待定档，不进兑换池）
+   - **账号档位 `credits = floor(N / 25)`**。未标记账号命中即写回 `Account.credits`；已有订阅标记的账号不写。没命中保持原值（导入时为 `0` = 待定档，不进兑换池）
    - 进制常量在 `apps/server/src/common/credits.ts`（`CREDITS_PER_TIER = 25`），前后台共用
 6. 封禁关键词：`account deactivated|suspended|disabled|permanently deleted|账户已停用|账号已封禁|帳號已停用` 等。
 7. 并发 4，`Promise.all` worker 池；失败不阻塞其它账号。

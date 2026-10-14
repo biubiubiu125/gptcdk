@@ -140,6 +140,9 @@ export async function initializeSchema(prisma: PrismaClient): Promise<void> {
       CONSTRAINT "TeamJob_workspaceRowId_fkey" FOREIGN KEY ("workspaceRowId") REFERENCES "TeamWorkspace" ("id") ON DELETE CASCADE ON UPDATE CASCADE
     )`);
     await tx.$executeRawUnsafe('CREATE INDEX IF NOT EXISTS "TeamJob_workspaceRowId_status_idx" ON "TeamJob"("workspaceRowId", "status")');
+    await tx.$executeRawUnsafe(
+      `UPDATE "Account" SET "cardDisabled" = true WHERE "banStatus" IN ('banned', 'invalid') AND "cardDisabled" = false`,
+    );
   }, { timeout: 30000 });
 }
 

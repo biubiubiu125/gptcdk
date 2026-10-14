@@ -13,6 +13,7 @@ export interface TokenRefreshResult {
   credentials?: RefreshedCredentials;
   error?: string;
   invalidCredential?: boolean;
+  sessionEnded?: boolean;
 }
 
 /** 找回接口只依赖这个方法，测试可以换成不访问网络的假实现。 */
@@ -31,7 +32,12 @@ export class TokenRefreshClient implements TokenRefresher {
   async refresh(refreshToken: string): Promise<TokenRefreshResult> {
     const result = await this.mailbox.refreshOpenAiToken(refreshToken);
     if (!result.ok || !result.accessToken) {
-      return { ok: false, error: result.error || '刷新失败', invalidCredential: result.invalidCredential === true };
+      return {
+        ok: false,
+        error: result.error || '刷新失败',
+        invalidCredential: result.invalidCredential === true,
+        sessionEnded: result.sessionEnded === true,
+      };
     }
     return {
       ok: true,

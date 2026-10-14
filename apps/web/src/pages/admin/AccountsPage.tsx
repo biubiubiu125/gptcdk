@@ -9,6 +9,7 @@ import {
   Form,
   Input,
   InputNumber,
+  DatePicker,
   Modal,
   Popconfirm,
   Radio,
@@ -19,7 +20,6 @@ import {
   Table,
   Tabs,
   Tag,
-  Tooltip,
   Upload,
 } from 'antd';
 import type { TableProps } from 'antd';
@@ -50,7 +50,6 @@ import {
   stopExtractJob,
   refreshAccountStatus,
   updateAccount,
-  MAIL_CREDITS_PER_TIER,
 } from '../../api/client';
 import {
   DELIVER_FORMAT_OPTIONS,
@@ -58,7 +57,6 @@ import {
   AccountRow,
   AccountSortField,
   AccountSummary,
-  BanStatus,
   CreditTier,
   DeliverFormat,
   ExtractJobRow,
@@ -76,9 +74,6 @@ import MailboxModal from '../../components/MailboxModal';
 import { useLatestRequest } from '../../hooks/useLatestRequest';
 import { copyCardKeys, reportCardCopy, type CardCopyScope } from '../../utils/cardCopy';
 import {
-  BAN_STATUS_META,
-  BAN_STATUS_OPTIONS,
-  CREDIT_STATUS_META,
   REDEEM_STATUS_META,
   REDEEM_STATUS_OPTIONS,
   formatBytes,
@@ -86,6 +81,7 @@ import {
   formatDateTime,
   formatNumber,
 } from '../../utils/format';
+import dayjs from 'dayjs';
 
 const { TextArea } = Input;
 
@@ -106,22 +102,12 @@ function subscriptionTagError(value: string): string {
   return '';
 }
 
-function resolveSubscriptionTag(selected?: string, custom?: string): string {
-  return String(custom || '').trim() || String(selected || '').trim();
-}
-
 const PAGE_SIZE_DEFAULT = 20;
 const IMPORT_MAX_FILE_SIZE = 20 * 1024 * 1024;
-/** 待定档（额度还没从邮件里定出来）在筛选器里的哨兵值 */
-const PENDING_CREDITS = 0;
-
 const EMPTY_SUMMARY: AccountSummary = {
   total: 0,
   unredeemed: 0,
   redeemed: 0,
-  banned: 0,
-  invalid: 0,
-  unknown: 0,
   pending: 0,
   byCredits: [],
 };
@@ -129,8 +115,6 @@ const EMPTY_SUMMARY: AccountSummary = {
 const SORT_PRESETS: Array<{ value: string; label: string; field: AccountSortField; order: SortOrder }> = [
   { value: 'createdAt-descend', label: '导入时间↓', field: 'createdAt', order: 'descend' },
   { value: 'createdAt-ascend', label: '导入时间↑', field: 'createdAt', order: 'ascend' },
-  { value: 'credits-descend', label: '额度↓', field: 'credits', order: 'descend' },
-  { value: 'credits-ascend', label: '额度↑', field: 'credits', order: 'ascend' },
   { value: 'id-descend', label: '编号↓', field: 'id', order: 'descend' },
   { value: 'id-ascend', label: '编号↑', field: 'id', order: 'ascend' },
 ];
@@ -138,19 +122,23 @@ const SORT_PRESETS: Array<{ value: string; label: string; field: AccountSortFiel
 const EXPORT_ITEMS = DELIVER_FORMAT_OPTIONS.map((item) => ({ key: item.value, label: item.label }));
 
 interface AccountFilters {
-  credits: number[];
-  banStatus: BanStatus[];
   redeemStatus: RedeemStatus[];
   keyword: string;
+  batchRemark: string;
+  subscriptionTag: string[];
+  subscriptionTagEmpty: boolean;
+  createdFrom?: string;
+  createdTo?: string;
   sortField?: AccountSortField;
   sortOrder?: SortOrder;
 }
 
 const INITIAL_FILTERS: AccountFilters = {
-  credits: [],
-  banStatus: [],
   redeemStatus: [],
   keyword: '',
+  batchRemark: '',
+  subscriptionTag: [],
+  subscriptionTagEmpty: false,
 };
 
 /* ==================================================================== *
@@ -162,7 +150,6 @@ interface ImportFormValues {
   remark?: string;
   skipDuplicate: boolean;
   subscriptionTag: string;
-  customSubscriptionTag?: string;
   proxy?: string;
   rememberProxy?: boolean;
   useRememberedProxy?: boolean;
@@ -196,11 +183,12 @@ function ImportAccountsModal({ open, tiers, onClose, onImported }: ImportAccount
   const [submitting, setSubmitting] = useState(false);
   const [result, setResult] = useState<ImportResponse | null>(null);
   const [jobs, setJobs] = useState<ExtractJobRow[]>([]);
+  const [jobBatchId, setJobBatchId] = useState<string | null>(null);
   const [proxyReady, setProxyReady] = useState(false);
 
-  const loadJobs = useCallback(async () => {
+  const loadJobs = useCallback(async (batchId: string) => {
     try {
-      const data = await listExtractJobs();
+      const data = await listExtractJobs(batchId);
       setJobs(data.items);
     } catch {
       /* 提取任务列表失败时不打断导入 */
@@ -214,13 +202,18 @@ function ImportAccountsModal({ open, tiers, onClose, onImported }: ImportAccount
       setFiles([]);
       setTab('paste');
       setJobs([]);
+      setJobBatchId(null);
       return;
     }
     void extractProxyReady().then((data) => setProxyReady(data.ready)).catch(() => setProxyReady(false));
-    void loadJobs();
-    const timer = window.setInterval(() => void loadJobs(), 3000);
+  }, [open]);
+
+  useEffect(() => {
+    if (!open || !jobBatchId) return;
+    void loadJobs(jobBatchId);
+    const timer = window.setInterval(() => void loadJobs(jobBatchId), 3000);
     return () => window.clearInterval(timer);
-  }, [loadJobs, open]);
+  }, [jobBatchId, loadJobs, open]);
 
   const tierHint = useMemo(() => {
     const values = tiers
@@ -273,17 +266,17 @@ function ImportAccountsModal({ open, tiers, onClose, onImported }: ImportAccount
         files: files.length > 0 ? files.map(({ name, content: text }) => ({ name, content: text })) : undefined,
         prefix: values.prefix?.trim() || 'CARD',
         source: tab,
-        remark: values.remark?.trim() || undefined,
+        remark: values.remark?.trim(),
         skipDuplicate: values.skipDuplicate,
         keyGroups: values.keyGroups,
         keyLength: values.keyLength,
-        subscriptionTag: resolveSubscriptionTag(values.subscriptionTag, values.customSubscriptionTag),
+        subscriptionTag: values.subscriptionTag,
         proxy: values.proxy,
         rememberProxy: values.rememberProxy,
         useRememberedProxy: values.useRememberedProxy,
       });
       setResult(response);
-      void loadJobs();
+      if (response.batchId) setJobBatchId(response.batchId);
       void message.success(`导入完成：成功 ${response.imported} 个，排队 ${response.queued ?? 0} 个`);
       onImported(response);
     } catch (error) {
@@ -426,18 +419,7 @@ function ImportAccountsModal({ open, tiers, onClose, onImported }: ImportAccount
           <Form.Item name="subscriptionTag" label="订阅标记" rules={[{ required: true, message: '请选择订阅标记' }]}>
             <Select options={SUBSCRIPTION_TAG_OPTIONS} />
           </Form.Item>
-          <Form.Item
-            name="customSubscriptionTag"
-            label="自定义短标记"
-            extra="填写后优先使用。32 字以内，不能包含斜杠。5X Team 仍按空间 token 核对。"
-            rules={[{ validator: async (_, value) => {
-              const reason = subscriptionTagError(String(value || ''));
-              if (reason) throw new Error(reason);
-            } }]}
-          >
-            <Input maxLength={32} placeholder="例如 Pro5x" />
-          </Form.Item>
-          <Form.Item name="proxy" label="提取 SOCKS 代理">
+          <Form.Item name="proxy" label="提取认证文件 SOCKS 代理">
             <Input.Password placeholder="socks5://user:pass@host:port" autoComplete="new-password" />
           </Form.Item>
           <Form.Item name="useRememberedProxy" label={proxyReady ? '使用已记住代理（已保存）' : '使用已记住代理'} valuePropName="checked">
@@ -449,8 +431,15 @@ function ImportAccountsModal({ open, tiers, onClose, onImported }: ImportAccount
           <Form.Item name="prefix" label="卡密前缀">
             <Input placeholder="CARD" />
           </Form.Item>
-          <Form.Item name="remark" label="批次备注">
-            <Input placeholder="例如 2月批次" />
+          <Form.Item
+            name="remark"
+            label="批次备注"
+            rules={[
+              { required: true, whitespace: true, message: '请填写批次备注' },
+              { max: 200, message: '批次备注不能超过 200 字' },
+            ]}
+          >
+            <Input maxLength={200} placeholder="例如 2月批次" />
           </Form.Item>
           <Form.Item name="keyGroups" label="卡密段数">
             <InputNumber style={{ width: '100%' }} min={2} max={5} precision={0} />
@@ -475,7 +464,7 @@ function ImportAccountsModal({ open, tiers, onClose, onImported }: ImportAccount
         style={{ marginTop: 12 }}
         pagination={false}
         dataSource={jobs.slice(0, 20)}
-        locale={{ emptyText: <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无提取任务" /> }}
+        locale={{ emptyText: <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description={jobBatchId ? '本次导入还没有提取任务' : '提交后只显示本次导入'} /> }}
         columns={[
           { title: '邮箱', dataIndex: 'email', ellipsis: true },
           {
@@ -493,7 +482,7 @@ function ImportAccountsModal({ open, tiers, onClose, onImported }: ImportAccount
                 type="link"
                 size="small"
                 onClick={() => {
-                  void stopExtractJob(job.id).then(() => loadJobs()).catch((error) => message.error(errorMessage(error)));
+                  void stopExtractJob(job.id).then(() => { if (jobBatchId) return loadJobs(jobBatchId); }).catch((error) => message.error(errorMessage(error)));
                 }}
               >
                 停止
@@ -595,8 +584,8 @@ function RefreshStatusModal({
   const { message } = AntApp.useApp();
   const hasSelection = selectedIds.length > 0;
 
-  const [refreshBan, setRefreshBan] = useState(true);
   const [refreshRedeem, setRefreshRedeem] = useState(true);
+  const [refreshCredits, setRefreshCredits] = useState(false);
   const [scope, setScope] = useState<'selected' | 'filter'>('filter');
   const [limit, setLimit] = useState(100);
   const [running, setRunning] = useState(false);
@@ -611,8 +600,8 @@ function RefreshStatusModal({
 
   const handleRun = async () => {
     const targets: RefreshTarget[] = [];
-    if (refreshBan) targets.push('ban');
     if (refreshRedeem) targets.push('redeem');
+    if (refreshCredits) targets.push('credits');
 
     if (targets.length === 0) {
       void message.warning('请至少选择一个刷新目标');
@@ -657,14 +646,17 @@ function RefreshStatusModal({
         <div>
           <div style={{ fontSize: 12.5, fontWeight: 600, marginBottom: 8 }}>执行目标</div>
           <Space direction="vertical" size={4}>
-            <Checkbox checked={refreshBan} onChange={(event) => setRefreshBan(event.target.checked)}>
-              刷新封禁状态
-            </Checkbox>
             <Checkbox
               checked={refreshRedeem}
               onChange={(event) => setRefreshRedeem(event.target.checked)}
             >
               检查账号凭据
+            </Checkbox>
+            <Checkbox
+              checked={refreshCredits}
+              onChange={(event) => setRefreshCredits(event.target.checked)}
+            >
+              取件定档
             </Checkbox>
           </Space>
         </div>
@@ -712,16 +704,15 @@ function RefreshStatusModal({
             <div style={{ fontSize: 12.5, color: '#2C3A35' }}>
               请求 {result.requested} 条 · 实际处理 {result.processed} 条
             </div>
-            {result.ban ? (
-              <div style={{ marginTop: 6, fontSize: 12.5, color: '#6B7A74' }}>
-                封禁：已封禁 {result.ban.banned} · 正常 {result.ban.normal} · 凭据失效{' '}
-                {result.ban.invalid} · 失败 {result.ban.failed}
-              </div>
-            ) : null}
             {result.redeem ? (
               <div style={{ marginTop: 6, fontSize: 12.5, color: '#6B7A74' }}>
                 兑换：已兑换 {result.redeem.redeemed} · 未兑换 {result.redeem.unredeemed} · 失败{' '}
                 {result.redeem.failed}
+              </div>
+            ) : null}
+            {result.credits ? (
+              <div style={{ marginTop: 6, fontSize: 12.5, color: '#6B7A74' }}>
+                定档：命中 {result.credits.hit} · 待定 {result.credits.pending} · 失败 {result.credits.failed}
               </div>
             ) : null}
             {result.items.some((item) => item.error) ? (
@@ -781,6 +772,7 @@ export default function AccountsPage() {
   const [loading, setLoading] = useState(false);
 
   const [tiers, setTiers] = useState<CreditTier[]>([]);
+  const [knownTags, setKnownTags] = useState<string[]>([]);
   const [selectedIds, setSelectedIds] = useState<number[]>([]);
   const [extraColumns, setExtraColumns] = useState<string[]>([]);
 
@@ -792,7 +784,7 @@ export default function AccountsPage() {
   const [deleting, setDeleting] = useState(false);
   const [retagOpen, setRetagOpen] = useState(false);
   const [retagging, setRetagging] = useState(false);
-  const [retagForm] = Form.useForm<{ subscriptionTag?: string; customSubscriptionTag?: string }>();
+  const [retagForm] = Form.useForm<{ subscriptionTag?: string }>();
   const [copyingKeys, setCopyingKeys] = useState(false);
   const [remarkForm] = Form.useForm<{ remark?: string }>();
 
@@ -809,18 +801,28 @@ export default function AccountsPage() {
     void loadTiers();
   }, [loadTiers]);
 
+  const listFilter = useMemo<AccountListQuery>(
+    () => ({
+      keyword: filters.keyword || undefined,
+      redeemStatus: filters.redeemStatus.length > 0 ? filters.redeemStatus : undefined,
+      batchRemark: filters.batchRemark || undefined,
+      subscriptionTag: filters.subscriptionTag.length > 0 ? filters.subscriptionTag : undefined,
+      subscriptionTagEmpty: filters.subscriptionTagEmpty || undefined,
+      createdFrom: filters.createdFrom,
+      createdTo: filters.createdTo,
+    }),
+    [filters],
+  );
+
   const query = useMemo<AccountListQuery>(
     () => ({
+      ...listFilter,
       page,
       pageSize,
-      keyword: filters.keyword || undefined,
-      credits: filters.credits.length > 0 ? filters.credits : undefined,
-      banStatus: filters.banStatus.length > 0 ? filters.banStatus : undefined,
-      redeemStatus: filters.redeemStatus.length > 0 ? filters.redeemStatus : undefined,
       sortField: filters.sortField,
       sortOrder: filters.sortOrder,
     }),
-    [filters, page, pageSize],
+    [filters.sortField, filters.sortOrder, listFilter, page, pageSize],
   );
 
   const load = useCallback(async () => {
@@ -832,6 +834,7 @@ export default function AccountsPage() {
       setRows(response.items ?? []);
       setTotal(response.total ?? 0);
       setSummary(response.summary ?? EMPTY_SUMMARY);
+      setKnownTags(response.subscriptionTags ?? []);
     } catch (error) {
       if (!isCurrent(request)) return;
       void message.error(errorMessage(error));
@@ -847,19 +850,10 @@ export default function AccountsPage() {
     return invalidate;
   }, [invalidate, load]);
 
-  const creditSelectOptions = useMemo(() => {
-    const options =
-      tiers.length > 0
-        ? tiers.map((item) => ({ value: item.credits, label: item.label || formatCredits(item.credits) }))
-        : summary.byCredits.map((item) => ({ value: item.credits, label: formatCredits(item.credits) }));
-    const known = new Set(options.map((item) => item.value));
-    if ((summary.pending > 0 || known.has(PENDING_CREDITS)) && !known.has(PENDING_CREDITS)) {
-      options.unshift({ value: PENDING_CREDITS, label: '待定档' });
-    }
-    return options.map((item) =>
-      item.value === PENDING_CREDITS ? { ...item, label: '待定档' } : item,
-    );
-  }, [summary.byCredits, summary.pending, tiers]);
+  const tagOptions = useMemo(() => {
+    const values = new Set([...SUBSCRIPTION_TAG_OPTIONS.map((item) => item.value), ...knownTags]);
+    return [...values].map((value) => ({ value, label: value }));
+  }, [knownTags]);
 
   const sortValue = filters.sortField && filters.sortOrder ? `${filters.sortField}-${filters.sortOrder}` : undefined;
 
@@ -910,7 +904,7 @@ export default function AccountsPage() {
 
   const handleRetag = async () => {
     const values = await retagForm.validateFields();
-    const tag = resolveSubscriptionTag(values.subscriptionTag, values.customSubscriptionTag);
+    const tag = String(values.subscriptionTag || '').trim();
     const reason = subscriptionTagError(tag);
     if (!tag || reason) {
       void message.error(reason || '请选择订阅标记');
@@ -931,16 +925,33 @@ export default function AccountsPage() {
     }
   };
 
-  const handleBatchDelete = async () => {
+  const handleBatchDelete = async (confirmRedeemed = false) => {
     if (selectedIds.length === 0) return;
     setDeleting(true);
     try {
-      const response = await batchDeleteAccounts(selectedIds);
-      void message.success(`已删除 ${response.deleted ?? 0} 个账号`);
+      const response = await batchDeleteAccounts(selectedIds, confirmRedeemed);
+      const kept = response.kept ?? 0;
+      if (kept > 0) {
+        void message.warning(`已删除 ${response.deleted ?? 0} 个账号，${kept} 个在删除前已兑换，未删除`);
+      } else {
+        void message.success(`已删除 ${response.deleted ?? 0} 个账号`);
+      }
       setSelectedIds([]);
       await load();
     } catch (error) {
-      void message.error(errorMessage(error));
+      const text = errorMessage(error);
+      if (!confirmRedeemed && text.includes('已兑换')) {
+        Modal.confirm({
+          title: '选中包含已兑换账号',
+          content: '删除后这些卡密不能再找回。确认连已兑换一起删除？',
+          okText: '确认删除',
+          cancelText: '取消',
+          okButtonProps: { danger: true },
+          onOk: () => handleBatchDelete(true),
+        });
+        return;
+      }
+      void message.error(text);
     } finally {
       setDeleting(false);
     }
@@ -964,12 +975,7 @@ export default function AccountsPage() {
         ids: ids.length > 0 ? ids : undefined,
         filter:
           scope === 'filtered'
-            ? {
-                keyword: filters.keyword || undefined,
-                credits: filters.credits.length > 0 ? filters.credits : undefined,
-                banStatus: filters.banStatus.length > 0 ? filters.banStatus : undefined,
-                redeemStatus: filters.redeemStatus.length > 0 ? filters.redeemStatus : undefined,
-              }
+            ? listFilter
             : undefined,
       });
       reportCardCopy(outcome, message, scope);
@@ -994,12 +1000,7 @@ export default function AccountsPage() {
     try {
       const { blob, filename } = await exportAccountsBlob({
         format,
-        filter: {
-          credits: filters.credits.length > 0 ? filters.credits : undefined,
-          banStatus: filters.banStatus.length > 0 ? filters.banStatus : undefined,
-          redeemStatus: filters.redeemStatus.length > 0 ? filters.redeemStatus : undefined,
-          keyword: filters.keyword || undefined,
-        },
+        filter: listFilter,
         includeCardKey: true,
         filename: `accounts-${format}`,
       });
@@ -1067,31 +1068,6 @@ export default function AccountsPage() {
         ),
       },
       {
-        title: '额度',
-        dataIndex: 'credits',
-        key: 'credits',
-        width: 130,
-        sorter: true,
-        sortOrder: sortOrderFor('credits'),
-        render: (value: number, record) => {
-          const pending = record.creditStatus === 'pending' || !(value > 0);
-          if (pending) {
-            return (
-              <Tooltip title="额度来自邮箱取件命中的额度关键字；还没命中时为待定档，不进兑换池">
-                <Tag color={CREDIT_STATUS_META.pending.color}>
-                  {CREDIT_STATUS_META.pending.label}
-                </Tag>
-              </Tooltip>
-            );
-          }
-          return (
-            <Tooltip title={`邮件已命中 ${value * MAIL_CREDITS_PER_TIER} credits`}>
-              <Tag color="green">{formatCredits(value)}</Tag>
-            </Tooltip>
-          );
-        },
-      },
-      {
         title: '卡密',
         dataIndex: 'cardKey',
         key: 'cardKey',
@@ -1122,28 +1098,21 @@ export default function AccountsPage() {
         render: (value: string) => formatDateTime(value),
       },
       {
-        title: '封禁状态',
-        dataIndex: 'banStatus',
-        key: 'banStatus',
+        title: '批次备注',
+        dataIndex: 'batchRemark',
+        key: 'batchRemark',
         width: 180,
+        ellipsis: true,
+        render: (value: string | null) => value || <span style={{ color: '#98A5A0' }}>—</span>,
+      },
+      {
+        title: '订阅标记',
+        dataIndex: 'subscriptionTag',
+        key: 'subscriptionTag',
+        width: 140,
         sorter: true,
-        sortOrder: sortOrderFor('banStatus'),
-        render: (value: BanStatus, record) => {
-          const meta = BAN_STATUS_META[value] ?? BAN_STATUS_META.unknown;
-          const tag = <Tag color={meta.color}>{meta.label}</Tag>;
-          return (
-            <div>
-              {value === 'banned' && record.banReason ? (
-                <Tooltip title={record.banReason}>{tag}</Tooltip>
-              ) : (
-                tag
-              )}
-              {value === 'banned' && record.banCheckedAt ? (
-                <div className="table-sub">封禁时间：{formatDateTime(record.banCheckedAt)}</div>
-              ) : null}
-            </div>
-          );
-        },
+        sortOrder: sortOrderFor('subscriptionTag'),
+        render: (value: string | null) => value ? <Tag>{value}</Tag> : <Tag>未标记</Tag>,
       },
       {
         title: '兑换状态',
@@ -1269,47 +1238,62 @@ export default function AccountsPage() {
     }));
   };
 
-  const refreshFilterPayload: RefreshFilterPayload = {
-    credits: filters.credits.length > 0 ? filters.credits : undefined,
-    banStatus: filters.banStatus.length > 0 ? filters.banStatus : undefined,
-    redeemStatus: filters.redeemStatus.length > 0 ? filters.redeemStatus : undefined,
-    keyword: filters.keyword || undefined,
-  };
+  const refreshFilterPayload: RefreshFilterPayload = listFilter;
 
   const summaryCells = [
     { key: 'total', label: '账号总数', value: summary.total },
     { key: 'pending', label: '待定档', value: summary.pending },
     { key: 'unredeemed', label: '未兑换', value: summary.unredeemed },
     { key: 'redeemed', label: '已兑换', value: summary.redeemed },
-    { key: 'banned', label: '已封禁', value: summary.banned },
-    { key: 'invalid', label: '凭据失效', value: summary.invalid },
   ];
 
   return (
     <>
       <div className="admin-toolbar">
         <Space wrap>
-          <Select
-            mode="multiple"
+          <Input
             allowClear
-            placeholder="额度筛选"
-            style={{ minWidth: 180 }}
-            value={filters.credits}
-            options={creditSelectOptions}
-            onChange={(value: number[]) => {
-              setFilters((previous) => ({ ...previous, credits: value }));
+            placeholder="批次备注"
+            style={{ width: 160 }}
+            value={filters.batchRemark}
+            onChange={(event) => {
+              setFilters((previous) => ({ ...previous, batchRemark: event.target.value }));
               setPage(1);
             }}
           />
           <Select
             mode="multiple"
             allowClear
-            placeholder="封禁状态筛选"
+            placeholder="订阅标记"
             style={{ minWidth: 180 }}
-            value={filters.banStatus}
-            options={BAN_STATUS_OPTIONS}
-            onChange={(value: BanStatus[]) => {
-              setFilters((previous) => ({ ...previous, banStatus: value }));
+            value={filters.subscriptionTag}
+            options={tagOptions}
+            onChange={(value: string[]) => {
+              setFilters((previous) => ({ ...previous, subscriptionTag: value }));
+              setPage(1);
+            }}
+          />
+          <Checkbox
+            checked={filters.subscriptionTagEmpty}
+            onChange={(event) => {
+              setFilters((previous) => ({ ...previous, subscriptionTagEmpty: event.target.checked }));
+              setPage(1);
+            }}
+          >
+            只看未标记
+          </Checkbox>
+          <DatePicker.RangePicker
+            value={
+              filters.createdFrom || filters.createdTo
+                ? [filters.createdFrom ? dayjs(filters.createdFrom) : null, filters.createdTo ? dayjs(filters.createdTo) : null]
+                : null
+            }
+            onChange={(values) => {
+              setFilters((previous) => ({
+                ...previous,
+                createdFrom: values?.[0]?.startOf('day').format('YYYY-MM-DDTHH:mm:ss.SSSZ'),
+                createdTo: values?.[1]?.endOf('day').format('YYYY-MM-DDTHH:mm:ss.SSSZ'),
+              }));
               setPage(1);
             }}
           />
@@ -1405,7 +1389,7 @@ export default function AccountsPage() {
           </Button>
           <Popconfirm
             title={`删除选中的 ${selectedIds.length} 个账号？`}
-            description="删除后不可恢复。"
+            description="未兑换会直接删除。若包含已兑换，会先拦住并要求再次确认。"
             okText="删除"
             cancelText="取消"
             okButtonProps={{ danger: true }}
@@ -1526,17 +1510,6 @@ export default function AccountsPage() {
           <Form.Item name="subscriptionTag" label="订阅标记" rules={[{ required: true, message: '请选择订阅标记' }]}>
             <Select options={SUBSCRIPTION_TAG_OPTIONS} />
           </Form.Item>
-          <Form.Item
-            name="customSubscriptionTag"
-            label="自定义短标记"
-            extra="填写后优先使用。5X Team 会按 token 核对空间，对不上的行不会改。"
-            rules={[{ validator: async (_, value) => {
-              const reason = subscriptionTagError(String(value || ''));
-              if (reason) throw new Error(reason);
-            } }]}
-          >
-            <Input maxLength={32} placeholder="例如 Pro5x" />
-          </Form.Item>
         </Form>
       </Modal>
 
@@ -1553,9 +1526,12 @@ export default function AccountsPage() {
         destroyOnClose
       >
         <Form form={remarkForm} layout="vertical" preserve={false} style={{ marginTop: 12 }}>
-          <Form.Item name="remark" label="备注">
-            <TextArea rows={3} placeholder="内部备注，可留空" />
+          <Form.Item name="remark" label="账号备注">
+            <TextArea rows={3} placeholder="只改这一行的账号备注，可留空" />
           </Form.Item>
+          <div style={{ marginTop: -8, marginBottom: 8, fontSize: 11.5, color: '#98A5A0' }}>
+            列表优先显示批次备注。批次备注还在时，这里的修改不会盖过它。
+          </div>
           <div style={{ fontSize: 11.5, color: '#98A5A0' }}>
             当前额度 <b>{formatCredits(remarkTarget?.credits ?? 0)}</b>
             ：档位由邮箱取件命中额度关键字自动得出，不在这里手工修改。

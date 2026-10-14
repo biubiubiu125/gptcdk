@@ -60,12 +60,9 @@ export default function SettingsPage() {
       const updated = await updateSettings({
         siteName: values.siteName,
         siteSubtitle: values.siteSubtitle,
-        pickupConcurrency: values.pickupConcurrency,
-        pickupMaxMessages: values.pickupMaxMessages,
         defaultFormat: values.defaultFormat,
         redeemLimitPerCard: values.redeemLimitPerCard,
         announcement: values.announcement ?? '',
-        teamGlobalSocksProxy: values.teamGlobalSocksProxy ?? '',
       });
       form.setFieldsValue(updated);
       void message.success('设置已保存');
@@ -119,8 +116,6 @@ export default function SettingsPage() {
               initialValues={{
                 siteName: 'gptcdk',
                 siteSubtitle: 'SECURE DELIVERY',
-                pickupConcurrency: 4,
-                pickupMaxMessages: 30,
                 defaultFormat: 'sub2api',
                 redeemLimitPerCard: 1,
                 announcement: '',
@@ -143,34 +138,12 @@ export default function SettingsPage() {
                 </Col>
               </Row>
 
-              <Row gutter={16}>
-                <Col xs={24} md={8}>
-                  <Form.Item name="pickupConcurrency" label="取件并发">
-                    <InputNumber style={{ width: '100%' }} min={1} max={20} precision={0} />
-                  </Form.Item>
-                </Col>
-                <Col xs={24} md={8}>
-                  <Form.Item name="pickupMaxMessages" label="单账号取件邮件数">
-                    <InputNumber style={{ width: '100%' }} min={1} max={50} precision={0} />
-                  </Form.Item>
-                </Col>
-                <Col xs={24} md={8}>
-                  <Form.Item name="redeemLimitPerCard" label="每卡兑换上限">
-                    <InputNumber style={{ width: '100%' }} min={1} max={20} precision={0} />
-                  </Form.Item>
-                </Col>
-              </Row>
+              <Form.Item name="redeemLimitPerCard" label="每卡兑换上限">
+                <InputNumber style={{ width: '100%' }} min={1} max={20} precision={0} />
+              </Form.Item>
 
               <Form.Item name="defaultFormat" label="默认交付格式">
                 <Select options={FORMAT_OPTIONS} />
-              </Form.Item>
-
-              <Form.Item
-                name="teamGlobalSocksProxy"
-                label="Team 全局 SOCKS"
-                extra="只在子号和母号都没填代理时使用。留空不会直连。"
-              >
-                <Input placeholder="socks5://用户:密码@主机:端口" autoComplete="off" />
               </Form.Item>
 
               <Form.Item name="announcement" label="公告">

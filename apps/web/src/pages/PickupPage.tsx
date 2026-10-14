@@ -70,11 +70,10 @@ export default function PickupPage() {
 
   const runSummary = useMemo(() => {
     const success = results.filter((item) => item.ok).length;
-    const banned = results.filter((item) => item.banned).length;
     const withCredits = results.filter(
       (item) => typeof item.credits === 'number' && item.credits > 0,
     ).length;
-    return { success, failed: results.length - success, banned, withCredits };
+    return { success, failed: results.length - success, withCredits };
   }, [results]);
 
   const handleResolve = useCallback(async () => {
@@ -433,7 +432,7 @@ export default function PickupPage() {
 
               <h2 className="console__title">开始取件</h2>
               <p className="console__subtitle">
-                官方直连 Outlook 取最新邮件，自动提取验证码、额度与封禁关键词。
+                官方直连 Outlook 取最新邮件，自动提取验证码和额度。
               </p>
 
               <div className="console__field-grid">
@@ -496,8 +495,8 @@ export default function PickupPage() {
 
               <div className="console__empty pickup-summary-box">
                 {results.length === 0
-                  ? '取件结果会按账号展示验证码、额度与封禁检测结果。'
-                  : `成功 ${runSummary.success} · 失败 ${runSummary.failed} · 已封禁 ${runSummary.banned} · 命中额度 ${runSummary.withCredits}`}
+                  ? '取件结果会按账号展示验证码和额度。'
+                  : `成功 ${runSummary.success} · 失败 ${runSummary.failed} · 命中额度 ${runSummary.withCredits}`}
               </div>
             </aside>
           </div>

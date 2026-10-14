@@ -13,7 +13,6 @@ import CardsPage from './pages/admin/CardsPage';
 import DashboardPage from './pages/admin/DashboardPage';
 import LoginPage from './pages/admin/LoginPage';
 import SettingsPage from './pages/admin/SettingsPage';
-import TeamPage from './pages/admin/TeamPage';
 import TiersPage from './pages/admin/TiersPage';
 
 function LegacyAdminRedirect() {
@@ -62,7 +61,6 @@ export default function App() {
         <Route index element={<Navigate to="/biubiubiu/accounts" replace />} />
         <Route path="dashboard" element={<DashboardPage />} />
         <Route path="accounts" element={<AccountsPage />} />
-        <Route path="team" element={<TeamPage />} />
         <Route path="cards" element={<CardsPage />} />
         <Route path="tiers" element={<TiersPage />} />
         <Route path="settings" element={<SettingsPage />} />

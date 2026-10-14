@@ -49,6 +49,33 @@ export interface AnalyzeResult {
   kind: 'code' | 'credits' | 'ban' | 'normal';
 }
 
+const VERIFICATION_CODE_PATTERN =
+  /(?:验证码|校验码|認証コード|確認コード|verification(?:\s+code)?|security\s*code|\bcode\b|one[-\s]?time(?:\s+password)?|código)[^0-9]{0,45}\b(\d{6})\b/i;
+
+/** 只认地址主机名，不认显示名，也不接受 openai.com.evil.com。 */
+export function isOpenAiSender(from: string | null | undefined): boolean {
+  const text = String(from || '').trim().toLowerCase();
+  const bracket = text.match(/<([^>]+)>/);
+  const address = (bracket?.[1] || text).trim();
+  const at = address.lastIndexOf('@');
+  if (at < 0) return false;
+  const host = address.slice(at + 1).replace(/[>\s].*$/, '').replace(/\.$/, '');
+  return host === 'openai.com' || host.endsWith('.openai.com') || host === 'chatgpt.com' || host.endsWith('.chatgpt.com');
+}
+
+/** 找回验证码只认 6 位验证码句式，不把短数字或正文第一串数字当验证码。 */
+export function verificationCode(message: { subject?: string; bodyPreview?: string; bodyHtml?: string }): string | null {
+  const body = message.bodyHtml ? htmlToText(message.bodyHtml) : '';
+  const source = [message.subject, message.bodyPreview, body]
+    .map((value) => String(value ?? ''))
+    .join(' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!source) return null;
+  const anchored = source.match(VERIFICATION_CODE_PATTERN);
+  return anchored ? anchored[1] : null;
+}
+
 @Injectable()
 export class MailAnalyzerService {
   private readonly logger = new Logger(MailAnalyzerService.name);

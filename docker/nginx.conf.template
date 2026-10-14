@@ -27,6 +27,11 @@ server {
         add_header Content-Type text/plain;
     }
 
+    # 协议邮箱回调只走容器内网，不经过公网入口。
+    location /api/internal/ {
+        return 404;
+    }
+
     # 后端接口
     location /api/ {
         proxy_pass http://gptcdk_api;
@@ -36,8 +41,9 @@ server {
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
         proxy_set_header Connection "";
-        proxy_read_timeout 300s;
-        proxy_send_timeout 300s;
+        # 单卡两次登录最多 720 秒，要盖住验证码等待。多卡由服务端在剩余时间不够时停止新的登录，这里留 60 秒写库和响应。
+        proxy_read_timeout 780s;
+        proxy_send_timeout 780s;
         proxy_buffering off;
         proxy_request_buffering off;
     }

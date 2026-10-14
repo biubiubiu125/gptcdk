@@ -6,7 +6,7 @@ import type { MailMessage, PickupResult } from '../api/types';
 import { formatDateTime, formatShortTime } from '../utils/format';
 import CopyButton from './CopyButton';
 
-export type MailFilter = 'all' | 'success' | 'failed' | 'banned' | 'credits';
+export type MailFilter = 'all' | 'success' | 'failed' | 'credits';
 
 export interface MailBrowserProps {
   /** 取件结果（每个元素为一个账号及其邮件） */
@@ -63,7 +63,7 @@ function buildSrcDoc(message: MailMessage): string {
 export default function MailBrowser({
   results,
   loading = false,
-  emptyText = '取件结果会按账号展示验证码、额度与封禁检测结果。',
+  emptyText = '取件结果会按账号展示验证码与额度。',
   listHeight = 620,
   frameHeight = 460,
 }: MailBrowserProps) {
@@ -77,7 +77,6 @@ export default function MailBrowser({
       all: results.length,
       success: results.filter((item) => item.ok).length,
       failed: results.filter((item) => !item.ok).length,
-      banned: results.filter((item) => item.banned).length,
       credits: results.filter((item) => typeof item.credits === 'number' && item.credits > 0).length,
     }),
     [results],
@@ -89,7 +88,6 @@ export default function MailBrowser({
     return results.filter((result) => {
       if (filter === 'success' && !result.ok) return false;
       if (filter === 'failed' && result.ok) return false;
-      if (filter === 'banned' && !result.banned) return false;
       if (filter === 'credits' && !(typeof result.credits === 'number' && result.credits > 0)) {
         return false;
       }
@@ -180,7 +178,6 @@ export default function MailBrowser({
     { label: `全部 ${counts.all}`, value: 'all' },
     { label: `成功 ${counts.success}`, value: 'success' },
     { label: `失败 ${counts.failed}`, value: 'failed' },
-    { label: `已封禁 ${counts.banned}`, value: 'banned' },
     { label: `有额度 ${counts.credits}`, value: 'credits' },
   ];
 
@@ -226,7 +223,6 @@ export default function MailBrowser({
                 <span className="mail-account__index">{index + 1}</span>
                 <span className="mail-account__email ellipsis">{result.email || result.key}</span>
                 {!result.ok ? <Tag color="error">失败</Tag> : null}
-                {result.banned ? <Tag color="error">已封禁</Tag> : null}
                 {typeof result.credits === 'number' && result.credits > 0 ? (
                   <Tag color="blue">+{result.credits}</Tag>
                 ) : null}
@@ -254,7 +250,6 @@ export default function MailBrowser({
                       {result.email || result.key}
                     </span>
                     <span className="mail-group__tags">
-                      {result.banned ? <Tag color="error">已封禁</Tag> : null}
                       {typeof result.credits === 'number' && result.credits > 0 ? (
                         <Tag color="blue">+{result.credits} credits</Tag>
                       ) : null}
@@ -292,7 +287,6 @@ export default function MailBrowser({
                           {typeof item.credits === 'number' && item.credits > 0 ? (
                             <Tag color="blue">+{item.credits} credits</Tag>
                           ) : null}
-                          {result.banned ? <Tag color="error">已封禁</Tag> : null}
                           {item.isRead === false ? <Tag>未读</Tag> : null}
                         </span>
                       </button>
@@ -339,29 +333,6 @@ export default function MailBrowser({
               <div className="mail-detail__to">
                 收件人：{activeResult.email || activeResult.key}
               </div>
-
-              {activeResult.banned ? (
-                <Alert
-                  type="error"
-                  showIcon
-                  style={{ marginTop: 12 }}
-                  message="该账号命中封禁关键词"
-                  description={
-                    <div>
-                      {activeResult.banReason ? <div>{activeResult.banReason}</div> : null}
-                      {(activeResult.banKeywords ?? []).length > 0 ? (
-                        <div style={{ marginTop: 6 }}>
-                          {(activeResult.banKeywords ?? []).map((word) => (
-                            <Tag color="error" key={word}>
-                              {word}
-                            </Tag>
-                          ))}
-                        </div>
-                      ) : null}
-                    </div>
-                  }
-                />
-              ) : null}
 
               {!activeResult.ok ? (
                 <Alert

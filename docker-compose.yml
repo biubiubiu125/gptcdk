@@ -74,6 +74,7 @@ services:
     environment:
       TZ: "${TZ:-Asia/Shanghai}"
       PROTOCOL_WORKER_TOKEN: "${PROTOCOL_WORKER_TOKEN:-}"
+      PROTOCOL_MAILBOX_URL: "${PROTOCOL_MAILBOX_URL:-http://server:3000}"
     networks:
       - gptcdk-protocol
 

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { App as AntApp, Button, Select, Tag } from 'antd';
 import { Input } from 'antd';
 
@@ -23,7 +23,7 @@ const MAX_LINES = 20;
 const DEFAULT_FORMAT: DeliverFormat = 'sub2api';
 
 /**
- * 401 找回。卡密找回刷新已交付文件；账密找回只匹配本站已交付记录。
+ * 401 找回。材料齐全的文件找回登录原卡密账号；账密格式只导出已存账密。
  */
 export default function ReclaimPage() {
   const { message } = AntApp.useApp();
@@ -33,6 +33,9 @@ export default function ReclaimPage() {
   const [format, setFormat] = useState<DeliverFormat>(DEFAULT_FORMAT);
   const [submitting, setSubmitting] = useState(false);
   const [response, setResponse] = useState<RedeemResponse | null>(null);
+  const abortRef = useRef<AbortController | null>(null);
+
+  useEffect(() => () => abortRef.current?.abort(), []);
 
   useEffect(() => {
     let cancelled = false;
@@ -72,12 +75,16 @@ export default function ReclaimPage() {
       void message.error(`单次最多找回 ${MAX_LINES} 条账密`);
       return;
     }
+    abortRef.current?.abort();
+    const controller = new AbortController();
+    abortRef.current = controller;
     setSubmitting(true);
     try {
-      const data = await reclaimCards(mode === 'card' ? { cards, format } : { lines, format });
+      const data = await reclaimCards(mode === 'card' ? { cards, format } : { lines, format }, controller.signal);
       setResponse(data);
       void message.success(`找回完成：成功 ${data.summary.success} 张，失败 ${data.summary.failed} 张`);
     } catch (error) {
+      if (error instanceof DOMException && error.name === 'AbortError') return;
       void message.error(errorMessage(error));
     } finally {
       setSubmitting(false);
@@ -108,7 +115,7 @@ export default function ReclaimPage() {
             <div className="eyebrow">CREDENTIAL RECLAIM</div>
             <h1 className="redeem-title">401 找回</h1>
             <p className="redeem-lead">
-              卡密找回会刷新已交付文件。账密找回只匹配本站已交付记录，请填写邮箱、密码和 2FA 密钥，不要填写 6 位动态码。
+              卡密找回会登录已兑换的原卡密账号；缺材料或没有可用代理时才刷新一次。账密找回只匹配本站已交付记录，凭证文件对上后用库存密码登录，账密格式只导出已存账密。请填写邮箱、密码和 2FA 密钥，不要填写 6 位动态码。
             </p>
             <p className="footnote">
               <span className="footnote__mark">+</span>
@@ -121,7 +128,7 @@ export default function ReclaimPage() {
               <span className="console__eyebrow">RECLAIM</span>
               <span className="console__pill">{mode === 'card' ? '卡密' : '账密'}</span>
             </div>
-            <h2 className="console__title">{mode === 'credential' || format === 'login' ? '导出并下载' : '刷新并下载'}</h2>
+            <h2 className="console__title">{format === 'login' ? '导出并下载' : '登录并下载'}</h2>
             <p className="console__subtitle">{mode === 'card' ? `一次最多 ${MAX_CARDS} 张。` : `一次最多 ${MAX_LINES} 条。`}成功与失败分开显示。</p>
             <div style={{ marginBottom: 12 }}>
               <Select

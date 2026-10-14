@@ -50,18 +50,20 @@ export class PublicController {
         userAgent: request.headers['user-agent'],
         shouldStop: () => aborted,
       });
-      // 账密不刷新凭据。成功也不能解除文件找回留下的持有，否则下一次文件找回会把没送到的凭据再轮换掉。
-      if (!aborted && result?.format !== 'login') {
-        const cards: string[] = [];
+      // 账密格式和凭据行找回都不解除持有。卡密文件找回成功后才按本次交付账号解除。
+      if (!aborted && result?.format !== 'login' && !hasCredentialInput(body)) {
+        const accountIds: number[] = [];
         if (Array.isArray(result?.results)) {
           for (const item of result.results) {
-            if (item?.ok !== true || typeof item.card !== 'string') continue;
-            const key = item.card.trim();
-            if (key) cards.push(key);
+            if (item?.ok !== true || !Array.isArray(item.accounts)) continue;
+            for (const account of item.accounts) {
+              const id = Number(account?.id);
+              if (Number.isInteger(id) && id > 0) accountIds.push(id);
+            }
           }
         }
         response.on('finish', () => {
-          void this.service.releaseDeliveredHolds(cards);
+          void this.service.releaseDeliveredHolds(accountIds);
         });
       }
       return result;
@@ -113,4 +115,10 @@ export class PublicController {
 
 function clientIp(request: Request): string {
   return clientAddress(request.headers, request.ip || request.socket?.remoteAddress || '');
+}
+
+function hasCredentialInput(body: Record<string, unknown> | undefined): boolean {
+  if (typeof body?.credential === 'string' && body.credential.trim()) return true;
+  if (typeof body?.lines === 'string') return body.lines.split(/\r?\n/).some((line) => line.trim());
+  return Array.isArray(body?.lines) && body.lines.some((line) => String(line ?? '').trim());
 }

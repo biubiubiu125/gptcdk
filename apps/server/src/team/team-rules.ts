@@ -25,28 +25,6 @@ export function normalizeTotpSecret(value: string): string {
   return normalized;
 }
 
-export function kickTargets(
-  members: Array<{ id?: string | null; email?: string | null; role?: string | null }> | null | undefined,
-  motherEmail?: string | null,
-): Array<{ id: string; email: string; role: string }> {
-  const mother = String(motherEmail || '').trim().toLowerCase();
-  return (Array.isArray(members) ? members : []).flatMap((item) => {
-    const id = String(item?.id || '').trim();
-    const role = String(item?.role || '').trim();
-    const email = String(item?.email || '').trim();
-    if (role !== 'standard-user' || !id) return [];
-    if (mother && email.toLowerCase() === mother) return [];
-    return [{ id, email, role }];
-  });
-}
-
-export function sameMemberIds(left: string[], right: string[]): boolean {
-  const normalize = (values: string[]) => [...new Set(values.map((item) => String(item || '').trim()).filter(Boolean))].sort();
-  const a = normalize(left);
-  const b = normalize(right);
-  return a.length === b.length && a.every((item, index) => item === b[index]);
-}
-
 export function parseTeamLine(raw: string): TeamLineResult {
   const text = String(raw || '').trim();
   if (!text) return { ok: false, message: '空行' };
@@ -152,18 +130,7 @@ export function resolveSocks(child?: string | null, mother?: string | null, glob
   return null;
 }
 
-export function normalizeSocks(value: string): string {
-  const text = String(value || '').trim();
-  if (!text) throw new Error('没有可用的 SOCKS 代理');
-  if (/^https?:\/\//i.test(text)) throw new Error('只接受 SOCKS 代理');
-  if (text.startsWith('socks5://') || text.startsWith('socks5h://')) return text;
-  const parts = text.split(':');
-  if (parts.length === 4 && /^\d+$/.test(parts[1]) && parts[0] && parts[2] && parts[3]) {
-    return `socks5://${encodeURIComponent(parts[2])}:${encodeURIComponent(parts[3])}@${parts[0]}:${parts[1]}`;
-  }
-  if (parts.length === 2 && /^\d+$/.test(parts[1]) && parts[0]) return `socks5://${parts[0]}:${parts[1]}`;
-  throw new Error('SOCKS 代理格式应为 socks5:// 或 host:port:user:pass');
-}
+export { normalizeSocks } from '../common/socks';
 
 export function confirmedAbsent(beforeIds: string[], afterIds: string[], targetIds: string[]): string[] {
   const before = new Set(beforeIds);

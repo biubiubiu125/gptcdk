@@ -4,7 +4,7 @@
 
 import dayjs from 'dayjs';
 
-import type { BanStatus, CardStatus, CreditStatus, MessageKind, RedeemStatus } from '../api/types';
+import type { CardStatus, CreditStatus, MessageKind, RedeemStatus } from '../api/types';
 
 /* ------------------------------------------------------------------ *
  * 时间
@@ -112,13 +112,6 @@ export interface StatusMeta {
   tone: 'ok' | 'warn' | 'danger' | 'info' | 'idle';
 }
 
-export const BAN_STATUS_META: Record<BanStatus, StatusMeta> = {
-  unknown: { label: '未检测', color: 'default', tone: 'idle' },
-  normal: { label: '正常', color: 'success', tone: 'ok' },
-  banned: { label: '已封禁', color: 'error', tone: 'danger' },
-  invalid: { label: '凭据失效', color: 'warning', tone: 'warn' },
-};
-
 export const REDEEM_STATUS_META: Record<RedeemStatus, StatusMeta> = {
   unredeemed: { label: '未兑换', color: 'default', tone: 'idle' },
   redeemed: { label: '已兑换', color: 'processing', tone: 'info' },
@@ -141,14 +134,6 @@ export const MESSAGE_KIND_META: Record<MessageKind, StatusMeta> = {
   ban: { label: '封禁', color: 'error', tone: 'danger' },
   normal: { label: '普通', color: 'default', tone: 'idle' },
 };
-
-/** 封禁状态下拉选项 */
-export const BAN_STATUS_OPTIONS: Array<{ value: BanStatus; label: string }> = [
-  { value: 'unknown', label: '未知' },
-  { value: 'normal', label: '正常' },
-  { value: 'banned', label: '已封禁' },
-  { value: 'invalid', label: '凭据失效' },
-];
 
 /** 兑换状态下拉选项 */
 export const REDEEM_STATUS_OPTIONS: Array<{ value: RedeemStatus; label: string }> = [

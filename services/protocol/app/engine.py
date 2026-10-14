@@ -117,6 +117,8 @@ ERROR_HINTS = {
         "邮箱或密码不正确｜若你这行里出现超过 4 个连续短横线，"
         "请确认密码里是不是真的带 '-'"
     ),
+    "email_verification_required": "重新登录需要邮箱验证，但没有可用邮箱，请联系管理员",
+    "email_otp_provider_required": "重新登录需要邮箱验证，但没有可用邮箱，请联系管理员",
     "rate_limit_exceeded": "登录被 OpenAI 限流了，等几分钟再试这个账号",
 }
 
@@ -136,7 +138,8 @@ def _failure_reason(result: dict) -> str:
     status = protocol.get("last_status") or result.get("status") or ""
     hint = ERROR_HINTS.get(detail)
     if hint:
-        return hint
+        from app.extract import preserve_login_code
+        return preserve_login_code(detail, hint)
     if (
         is_phone_required(detail)
         or is_phone_required(page)
@@ -193,6 +196,7 @@ def authorize_account(
     workspace_id: str = "",
     on_step=None,
     allow_cookie_only: bool = False,
+    mail_client=None,
 ):
     """密码和 2FA 登录。返回仍带着登录 cookie 的客户端，以及 PKCE token。"""
     def emit(step: str, message: str = "") -> None:
@@ -214,6 +218,8 @@ def authorize_account(
     )
     # 共用同一个干净会话，保证登录 cookie 与授权流程连续
     oauth_client.session = chatgpt_client.session
+    from app.cancel import wrap_session
+    wrap_session(chatgpt_client.session)
     mfa_verified = {"ok": False}
     original_mfa = getattr(oauth_client, "_oauth_complete_totp_mfa_for_continue", None)
 
@@ -248,6 +254,7 @@ def authorize_account(
             email=account.email,
             password=account.password,
             mfa_client=mfa_client,
+            mail_client=mail_client,
         )
     except Exception as exc:  # noqa: BLE001 - 统一转成站点可读错误
         if is_phone_required(exc):

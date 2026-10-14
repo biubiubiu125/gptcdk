@@ -8,6 +8,8 @@ export interface AccountExtractRequest {
   proxy: string;
   subscriptionTag: string;
   workspaceId?: string | null;
+  mailboxAccountId?: number;
+  otpPolicy?: 'reclaim';
 }
 
 export interface AccountExtractResult {
@@ -27,7 +29,11 @@ export interface AccountExtractResult {
 
 export type AccountExtractClient = (input: AccountExtractRequest, signal?: AbortSignal) => Promise<AccountExtractResult>;
 
-export function normalizeExtractResult(tag: string, parsed: WorkerResponse): AccountExtractResult {
+export function normalizeExtractResult(
+  tag: string,
+  parsed: WorkerResponse,
+  options: { allowMissingPlan?: boolean } = {},
+): AccountExtractResult {
   const cleaned = stripSecrets(parsed as unknown as Record<string, unknown>);
   const code = String(cleaned.code || (cleaned.ok ? 'OK' : 'UPSTREAM'));
   const message = String(cleaned.message || (cleaned.ok ? '提取完成' : '提取失败')).slice(0, 180);
@@ -45,7 +51,7 @@ export function normalizeExtractResult(tag: string, parsed: WorkerResponse): Acc
     accessToken: typeof cleaned.accessToken === 'string' ? cleaned.accessToken : undefined,
     refreshToken: typeof cleaned.refreshToken === 'string' ? cleaned.refreshToken : undefined,
     remoteWorkspaceId: typeof cleaned.remoteWorkspaceId === 'string' ? cleaned.remoteWorkspaceId : undefined,
-  });
+  }, options.allowMissingPlan === true);
   if (!accepted.ok) return { ok: false, temporary: accepted.temporary, code: accepted.code, message: accepted.message };
   return {
     ok: true,
@@ -72,8 +78,12 @@ export async function postAccountExtract(input: AccountExtractRequest, signal?: 
       proxy: input.proxy,
       subscriptionTag: input.subscriptionTag,
       workspaceId: input.workspaceId || undefined,
+      ...(input.mailboxAccountId ? { mailboxAccountId: input.mailboxAccountId } : {}),
+      ...(input.otpPolicy ? { otpPolicy: input.otpPolicy } : {}),
     }, signal);
-    return normalizeExtractResult(input.subscriptionTag, parsed);
+    return normalizeExtractResult(input.subscriptionTag, parsed, {
+      allowMissingPlan: input.otpPolicy === 'reclaim',
+    });
   } catch (error) {
     const aborted = error instanceof Error && error.name === 'AbortError';
     return {

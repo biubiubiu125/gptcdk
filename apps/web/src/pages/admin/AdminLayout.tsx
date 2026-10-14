@@ -11,7 +11,6 @@ import {
   SettingOutlined,
   TagsOutlined,
   TeamOutlined,
-  UsergroupAddOutlined,
   UserOutlined,
 } from '@ant-design/icons';
 
@@ -24,7 +23,6 @@ const { Content, Header, Sider } = Layout;
 const PAGE_TITLES: Record<string, string> = {
   '/biubiubiu/dashboard': '数据概览',
   '/biubiubiu/accounts': '账号列表',
-  '/biubiubiu/team': '5x Team',
   '/biubiubiu/cards': '卡密管理',
   '/biubiubiu/tiers': '额度档位',
   '/biubiubiu/settings': '系统设置',
@@ -33,7 +31,6 @@ const PAGE_TITLES: Record<string, string> = {
 const MENU_ITEMS: MenuProps['items'] = [
   { key: '/biubiubiu/dashboard', icon: <DashboardOutlined />, label: '数据概览' },
   { key: '/biubiubiu/accounts', icon: <TeamOutlined />, label: '账号列表' },
-  { key: '/biubiubiu/team', icon: <UsergroupAddOutlined />, label: '5x Team' },
   { key: '/biubiubiu/cards', icon: <KeyOutlined />, label: '卡密管理' },
   { key: '/biubiubiu/tiers', icon: <TagsOutlined />, label: '额度档位' },
   { key: '/biubiubiu/settings', icon: <SettingOutlined />, label: '系统设置' },

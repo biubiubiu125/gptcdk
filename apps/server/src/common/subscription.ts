@@ -1,5 +1,5 @@
 import { createHash, timingSafeEqual } from 'crypto';
-import { decryptSecret } from '../team/team-crypto';
+import { decryptSecret } from './secret-box';
 import { parseTeamLines } from '../team/team-rules';
 
 export const BUSINESS_PLAN = 'self_serve_business_prolite';
@@ -72,6 +72,13 @@ export function personalPlanAllowed(payload: Record<string, unknown> | null): bo
   return true;
 }
 
+function reclaimPlanAllowed(payload: Record<string, unknown> | null): boolean {
+  if (claim(payload, 'chatgpt_plan_type')) return personalPlanAllowed(payload);
+  const accountId = claim(payload, 'chatgpt_account_id');
+  const workspaceId = claim(payload, 'chatgpt_workspace_id') || claim(payload, 'workspace_id');
+  return !(accountId && workspaceId && accountId !== workspaceId);
+}
+
 export function tokenFitsStoredWorkspace(
   account: { remoteWorkspaceId?: string | null },
   accessToken: string,
@@ -137,7 +144,8 @@ export function credentialMatchesSellerTag(
   const tag = String(account.subscriptionTag || '').trim();
   if (!tag) return tokenFitsStoredWorkspace(account, accessToken);
   if (isTeamSellerTag(tag)) return teamDeliveryReady({ remoteWorkspaceId: account.remoteWorkspaceId, accessToken });
-  if (!personalPlanAllowed(decodeJwtPayload(accessToken))) return false;
+  const payload = decodeJwtPayload(accessToken);
+  if (!payload || !reclaimPlanAllowed(payload)) return false;
   return tokenFitsStoredWorkspace(account, accessToken);
 }
 
@@ -158,6 +166,7 @@ export function refreshedSellerFields(
 export function acceptExtractResult(
   tag: string,
   result: { ok?: boolean; accessToken?: string; refreshToken?: string; remoteWorkspaceId?: string | null },
+  allowMissingPlan = false,
 ): { ok: boolean; code: string; message: string; temporary: boolean } {
   if (!result.ok || !result.accessToken || !result.refreshToken) {
     return { ok: false, code: 'REFRESH_MISSING', message: '没有拿到可用凭据', temporary: true };
@@ -168,7 +177,8 @@ export function acceptExtractResult(
     }
     return { ok: true, code: 'OK', message: '提取完成', temporary: false };
   }
-  if (!personalPlanAllowed(decodeJwtPayload(result.accessToken))) {
+  const claims = decodeJwtPayload(result.accessToken);
+  if (!(allowMissingPlan ? reclaimPlanAllowed(claims) : personalPlanAllowed(claims))) {
     return { ok: false, code: 'PLAN_MISMATCH', message: '个人订阅核对失败', temporary: false };
   }
   return { ok: true, code: 'OK', message: '提取完成', temporary: false };
@@ -273,6 +283,52 @@ export function noteCredentialMiss(ip: string | undefined, now = Date.now()): vo
 
 export function resetCredentialMisses(): void {
   misses.clear();
+}
+
+const LOGIN_COOLDOWN_MS = 30 * 60 * 1000;
+
+/** 会话结束不是 invalid_grant，不能当成凭据作废。 */
+export function refreshSessionEnded(code: string, description = ''): boolean {
+  const text = `${code || ''} ${description || ''}`.toLowerCase();
+  return text.includes('refresh_token_invalidated')
+    || text.includes('session has ended')
+    || text.includes('please log in again');
+}
+
+/** 只认 token 声明里的邮箱，不认协议响应回显。 */
+export function emailFromToken(token: string | null | undefined): string | null {
+  const payload = decodeJwtPayload(String(token || ''));
+  if (!payload) return null;
+  const direct = typeof payload.email === 'string' ? payload.email.trim() : '';
+  if (direct.includes('@')) return direct.toLowerCase();
+  for (const key of ['https://api.openai.com/profile', 'https://api.openai.com/auth']) {
+    const nested = payload[key];
+    if (!nested || typeof nested !== 'object' || Array.isArray(nested)) continue;
+    const email = (nested as Record<string, unknown>).email;
+    if (typeof email === 'string' && email.includes('@')) return email.trim().toLowerCase();
+  }
+  return null;
+}
+
+export function tokenEmail(accessToken?: string | null, idToken?: string | null): string | null {
+  return emailFromToken(accessToken) || emailFromToken(idToken);
+}
+
+export function loginFailureCooling(createdAt: Date, now = Date.now()): boolean {
+  return now - createdAt.getTime() < LOGIN_COOLDOWN_MS;
+}
+
+export function isPasswordOrTotpFailure(code: string, message: string): boolean {
+  if (isPasswordFailure(code, message)) return true;
+  const text = `${code || ''} ${message || ''}`.toLowerCase();
+  return /mfa_totp|动态码未通过|2fa 动态码/.test(text);
+}
+
+/** 代理或出口失败才换下一个代理。密码和 2FA 失败不算。 */
+export function isProxyOrEgressFailure(code: string, message: string): boolean {
+  if (isPasswordOrTotpFailure(code, message)) return false;
+  const text = `${code || ''} ${message || ''}`.toLowerCase();
+  return /bad_proxy|no_proxy|\bproxy\b|socks|egress|出口|代理|cloudflare|econnrefused|connection refused|tunnel failed/.test(text);
 }
 
 export async function loadStoredLogin(

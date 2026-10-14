@@ -48,515 +48,6 @@ class TeamFlowTest(unittest.TestCase):
         self.assertEqual(first["oai-language"], "en-US")
         self.assertEqual(first["User-Agent"], "TestAgent/1")
 
-    def test_members_come_from_items_not_the_first_id_list(self):
-        data = {
-            "errors": [{"id": "not-a-person"}],
-            "items": [{"id": "user-1", "email": "a@b.c", "role": "standard-user"}],
-            "total": 1,
-        }
-        people = worker.member_page(data)
-        self.assertEqual(people[0]["id"], "user-1")
-
-    def test_missing_total_is_not_complete(self):
-        urls = []
-
-        def fake_retry(http, method, url, headers=None, payload=None, form=None):
-            urls.append(url)
-            if "/users?" in url:
-                return FakeResponse(200, {"items": [{"id": "u1", "email": "a@b.c", "role": "account-owner"}]})
-            if "/invites" in url:
-                return FakeResponse(200, {"items": []})
-            if "seat_type_counts" in url:
-                return FakeResponse(200, {})
-            if "/subscriptions" in url:
-                return FakeResponse(200, {"seats_entitled": 5, "will_renew": True, "active_until": "2026-10-01T00:00:00Z"})
-            raise AssertionError(url)
-
-        original = worker.request_with_retry
-        worker.request_with_retry = fake_retry
-        try:
-            result = worker.snapshot(object(), "token", "ws-1")
-        finally:
-            worker.request_with_retry = original
-        self.assertFalse(result["complete"])
-        self.assertTrue(any("/users/seat_type_counts" in url for url in urls))
-
-    def test_numeric_string_total_can_complete_but_junk_cannot(self):
-        def run(total):
-            def fake_retry(http, method, url, headers=None, payload=None, form=None):
-                if "/users?" in url:
-                    return FakeResponse(200, {"items": [{"id": "u1", "email": "a@b.c", "role": "account-owner"}], "total": total})
-                if "/invites" in url:
-                    return FakeResponse(200, {"items": []})
-                if "seat_type_counts" in url:
-                    return FakeResponse(200, {})
-                if "/subscriptions" in url:
-                    return FakeResponse(200, {"seats_entitled": 5})
-                raise AssertionError(url)
-
-            original = worker.request_with_retry
-            worker.request_with_retry = fake_retry
-            try:
-                return worker.snapshot(object(), "token", "ws-1")
-            finally:
-                worker.request_with_retry = original
-
-        self.assertTrue(run("1")["complete"])
-        self.assertFalse(run("many")["complete"])
-        self.assertFalse(run(True)["complete"])
-
-    def test_total_mismatch_is_not_complete(self):
-        def fake_retry(http, method, url, headers=None, payload=None, form=None):
-            if "/users?" in url:
-                return FakeResponse(200, {"items": [{"id": "u1", "email": "a@b.c", "role": "account-owner"}], "total": 3})
-            if "/invites" in url:
-                return FakeResponse(200, {"items": []})
-            if "seat_type_counts" in url:
-                return FakeResponse(200, {})
-            if "/subscriptions" in url:
-                return FakeResponse(200, {"seats_entitled": 5})
-            raise AssertionError(url)
-
-        original = worker.request_with_retry
-        worker.request_with_retry = fake_retry
-        try:
-            result = worker.snapshot(object(), "token", "ws-1")
-        finally:
-            worker.request_with_retry = original
-        self.assertFalse(result["complete"])
-
-    def test_non_2xx_member_page_is_not_complete(self):
-        def fake_retry(http, method, url, headers=None, payload=None, form=None):
-            if "/users?" in url:
-                return FakeResponse(404, {"error": "missing", "seats_entitled": 99})
-            if "/invites" in url:
-                return FakeResponse(200, {"items": []})
-            if "seat_type_counts" in url:
-                return FakeResponse(200, {})
-            if "/subscriptions" in url:
-                return FakeResponse(200, {"seats_entitled": 5})
-            raise AssertionError(url)
-
-        original = worker.request_with_retry
-        worker.request_with_retry = fake_retry
-        try:
-            result = worker.snapshot(object(), "token", "ws-1")
-        finally:
-            worker.request_with_retry = original
-        self.assertFalse(result["complete"])
-        self.assertEqual(result["members"], [])
-
-    def test_subscription_error_does_not_supply_seats(self):
-        def fake_retry(http, method, url, headers=None, payload=None, form=None):
-            if "/users?" in url:
-                return FakeResponse(200, {"items": [{"id": "u1", "email": "a@b.c", "role": "account-owner"}], "total": 1})
-            if "/invites" in url:
-                return FakeResponse(404, {"items": [], "seats_entitled": 99})
-            if "seat_type_counts" in url:
-                return FakeResponse(200, {})
-            if "/subscriptions" in url:
-                return FakeResponse(404, {"seats_entitled": 99, "will_renew": False})
-            raise AssertionError(url)
-
-        original = worker.request_with_retry
-        worker.request_with_retry = fake_retry
-        try:
-            result = worker.snapshot(object(), "token", "ws-1")
-        finally:
-            worker.request_with_retry = original
-        self.assertTrue(result["complete"])
-        self.assertIsNone(result["seatsEntitled"])
-        self.assertFalse(result["subscriptionRead"])
-        self.assertTrue(result["invitesTruncated"])
-
-    def snapshot_with(self, users, subscriptions, counts=None):
-        def fake_retry(http, method, url, headers=None, payload=None, form=None):
-            if "/users?" in url:
-                return FakeResponse(200, users)
-            if "/invites" in url:
-                return FakeResponse(200, {"items": []})
-            if "seat_type_counts" in url:
-                if isinstance(counts, dict) and "status" in counts:
-                    return FakeResponse(counts["status"], counts.get("body") or {})
-                return FakeResponse(200, counts if counts is not None else {})
-            if "/subscriptions" in url:
-                return FakeResponse(200, subscriptions)
-            raise AssertionError(url)
-
-        original = worker.request_with_retry
-        worker.request_with_retry = fake_retry
-        try:
-            return worker.snapshot(object(), "token", "ws-1")
-        finally:
-            worker.request_with_retry = original
-
-    def test_premium_seat_ignores_standard_subscription_and_counts(self):
-        result = self.snapshot_with(
-            {"items": [{"id": "u1", "email": "a@b.c", "role": "account-owner", "seat_type": "default"}], "total": 1},
-            [
-                {"seat_type": "prolite", "seats_entitled": 20, "seats_in_use": 9, "will_renew": False, "active_until": "2026-01-01T00:00:00Z"},
-                {"seat_type": "default", "seats_entitled": 5, "seats_in_use": 2, "will_renew": True, "active_until": "2026-10-01T00:00:00Z"},
-            ],
-            {"seat_type_counts": {"default": 50, "prolite": 9}},
-        )
-        self.assertEqual(result["seatsEntitled"], 5)
-        self.assertEqual(result["seatsInUse"], 2)
-        self.assertTrue(result["willRenew"])
-        self.assertEqual(result["activeUntil"], "2026-10-01T00:00:00Z")
-        self.assertTrue(result["subscriptionRead"])
-        self.assertEqual(result["members"][0]["seatType"], "default")
-
-    def test_typed_standard_only_is_zero_premium_not_unread(self):
-        result = self.snapshot_with(
-            {"items": [{"id": "u1", "email": "a@b.c", "role": "standard-user", "seat_type": "prolite"}], "total": 1},
-            {"items": [{"seat_type": "prolite", "seats_entitled": 8, "will_renew": True, "active_until": "2026-12-01T00:00:00Z"}]},
-            {"seat_type_counts": {"prolite": 8, "default": 4}},
-        )
-        self.assertEqual(result["seatsEntitled"], 0)
-        self.assertEqual(result["seatsInUse"], 0)
-        self.assertIsNone(result["willRenew"])
-        self.assertIsNone(result["activeUntil"])
-        self.assertTrue(result["subscriptionRead"])
-        self.assertEqual(result["members"][0]["seatType"], "prolite")
-
-    def test_typed_nodes_ignore_untyped_seat_totals(self):
-        result = self.snapshot_with(
-            {"items": [{"id": "u1", "email": "a@b.c", "role": "account-owner"}], "total": 1},
-            {"seats_entitled": 99, "items": [{"seat_type": "default", "seats_entitled": 3, "seats_in_use": 1}]},
-        )
-        self.assertEqual(result["seatsEntitled"], 3)
-        self.assertEqual(result["seatsInUse"], 1)
-
-    def test_unlabeled_subscriptions_are_not_treated_as_premium(self):
-        users = {"items": [{"id": "u1", "email": "a@b.c", "role": "account-owner"}], "total": 1}
-        result = self.snapshot_with(
-            users,
-            [
-                {"id": "sub-standard", "plan_type": "team", "billing_period": "monthly", "seats_in_use": 9, "seats_entitled": 20, "will_renew": False, "active_until": "2026-01-01T00:00:00Z"},
-                {"id": "sub-premium", "plan_type": "team", "billing_period": "monthly", "seats_in_use": 2, "seats_entitled": 5, "will_renew": True, "active_until": "2026-10-01T00:00:00Z"},
-            ],
-            {"seat_type_counts": {"default": 5, "prolite": 9}},
-        )
-        self.assertIsNone(result["seatsEntitled"])
-        self.assertIsNone(result["seatsInUse"])
-        self.assertIsNone(result["willRenew"])
-        self.assertIsNone(result["activeUntil"])
-        self.assertTrue(result["subscriptionRead"])
-        self.assertFalse(result["premiumKnown"])
-        self.assertTrue(result["complete"])
-
-    def test_unlabeled_total_is_not_premium_when_other_seat_types_exist(self):
-        result = self.snapshot_with(
-            {"items": [{"id": "u1", "email": "a@b.c", "role": "account-owner"}], "total": 1},
-            {"id": "sub", "plan_type": "team", "billing_period": "monthly", "seats_entitled": 14, "seats_in_use": 11, "will_renew": True, "active_until": "2026-10-01T00:00:00Z"},
-            {"seat_type_counts": {"default": 5, "prolite": 9, "usage_based": 0, "automation": 0}},
-        )
-        self.assertIsNone(result["seatsEntitled"])
-        self.assertIsNone(result["seatsInUse"])
-        self.assertIsNone(result["willRenew"])
-        self.assertIsNone(result["activeUntil"])
-        self.assertFalse(result["premiumKnown"])
-
-    def test_unlabeled_fields_are_not_mixed_across_subscriptions(self):
-        result = self.snapshot_with(
-            {"items": [{"id": "u1", "email": "a@b.c", "role": "account-owner"}], "total": 1},
-            [{"seats_entitled": 20}, {"seats_in_use": 1, "will_renew": True}],
-            {},
-        )
-        self.assertIsNone(result["seatsEntitled"])
-        self.assertIsNone(result["seatsInUse"])
-        self.assertIsNone(result["willRenew"])
-        self.assertFalse(result["premiumKnown"])
-
-    def test_single_unlabeled_subscription_stays_when_counts_are_only_premium(self):
-        result = self.snapshot_with(
-            {"items": [{"id": "u1", "email": "a@b.c", "role": "account-owner"}], "total": 1},
-            {"plan_type": "team", "seats_entitled": 5, "seats_in_use": 2, "will_renew": True, "active_until": "2026-10-01T00:00:00Z"},
-            {"seat_type_counts": {"default": 5, "prolite": 0}},
-        )
-        self.assertEqual(result["seatsEntitled"], 5)
-        self.assertEqual(result["seatsInUse"], 2)
-        self.assertTrue(result["willRenew"])
-        self.assertTrue(result["premiumKnown"])
-
-    def test_seat_count_transport_error_keeps_snapshot(self):
-        def fake_retry(http, method, url, headers=None, payload=None, form=None):
-            if "/users?" in url:
-                return FakeResponse(200, {"items": [{"id": "u1", "email": "a@b.c", "role": "account-owner"}], "total": 1})
-            if "/invites" in url:
-                return FakeResponse(200, {"items": []})
-            if "seat_type_counts" in url:
-                raise OSError("counts down")
-            if "/subscriptions" in url:
-                return FakeResponse(200, {"seats_entitled": 5, "seats_in_use": 1, "will_renew": True, "active_until": "2026-10-01T00:00:00Z"})
-            raise AssertionError(url)
-
-        original = worker.request_with_retry
-        worker.request_with_retry = fake_retry
-        try:
-            result = worker.snapshot(object(), "token", "ws-1")
-        finally:
-            worker.request_with_retry = original
-        self.assertTrue(result["complete"])
-        self.assertIsNone(result["seatsEntitled"])
-        self.assertIsNone(result["seatsInUse"])
-        self.assertIsNone(result["willRenew"])
-        self.assertIsNone(result["activeUntil"])
-        self.assertTrue(result["subscriptionRead"])
-        self.assertFalse(result["premiumKnown"])
-
-    def test_counts_http_error_does_not_treat_unlabeled_total_as_premium(self):
-        result = self.snapshot_with(
-            {"items": [{"id": "u1", "email": "a@b.c", "role": "account-owner"}], "total": 1},
-            {"plan_type": "team", "seats_entitled": 14, "seats_in_use": 2, "will_renew": True, "active_until": "2026-10-01T00:00:00Z"},
-            {"status": 500, "body": {"error": "down"}},
-        )
-        self.assertTrue(result["complete"])
-        self.assertTrue(result["subscriptionRead"])
-        self.assertFalse(result["premiumKnown"])
-        self.assertIsNone(result["seatsEntitled"])
-
-    def test_unreadable_counts_does_not_treat_unlabeled_total_as_premium(self):
-        subscription = {"plan_type": "team", "seats_entitled": 14, "seats_in_use": 2, "will_renew": True}
-        users = {"items": [{"id": "u1", "email": "a@b.c", "role": "account-owner"}], "total": 1}
-        for counts in ({}, {"default": 5, "prolite": 8}, {"seat_type_counts": {"prolite": "9"}}):
-            result = self.snapshot_with(users, subscription, counts)
-            self.assertTrue(result["complete"], counts)
-            self.assertFalse(result["premiumKnown"], counts)
-            self.assertIsNone(result["seatsEntitled"], counts)
-
-    def test_typed_premium_survives_counts_failure(self):
-        result = self.snapshot_with(
-            {"items": [{"id": "u1", "email": "a@b.c", "role": "account-owner", "seat_type": "default"}], "total": 1},
-            {"seat_type": "default", "seats_entitled": 5, "seats_in_use": 1, "will_renew": True, "active_until": "2026-10-01T00:00:00Z"},
-            {"status": 401, "body": {"error": "no counts"}},
-        )
-        self.assertTrue(result["complete"])
-        self.assertEqual(result["seatsEntitled"], 5)
-        self.assertEqual(result["seatsInUse"], 1)
-        self.assertTrue(result["premiumKnown"])
-
-    def test_invite_stays_on_premium_seat_even_if_body_asks_for_standard(self):
-        captured = {}
-
-        def fake_retry(http, method, url, headers=None, payload=None, form=None):
-            captured["payload"] = payload
-            return FakeResponse(200, {"account_invites": [{"email_address": "ok@example.com"}], "errored_emails": []})
-
-        originals = (worker.open_session, worker.precheck, worker.living_access, worker.exchange_workspace, worker.request_with_retry)
-        worker.open_session = lambda proxy: SimpleNamespace(headers={}, oai_device_id="device")
-        worker.precheck = lambda http: None
-        worker.living_access = lambda http, session, workspace_id: "personal-at"
-        worker.exchange_workspace = lambda http, token, workspace_id: {"accessToken": "workspace-at"}
-        worker.request_with_retry = fake_retry
-        try:
-            worker.team_invite({
-                "session": {"accessToken": "personal-at"},
-                "workspaceId": "ws-1",
-                "emails": ["ok@example.com"],
-                "seat_type": "prolite",
-                "proxy": "socks5://127.0.0.1:1080",
-            })
-        finally:
-            worker.open_session, worker.precheck, worker.living_access, worker.exchange_workspace, worker.request_with_retry = originals
-        self.assertEqual(captured["payload"]["seat_type"], "default")
-        self.assertEqual(captured["payload"]["role"], "standard-user")
-
-    def test_onboard_request_and_accept_stay_empty(self):
-        bodies = []
-
-        def fake_retry(http, method, url, headers=None, payload=None, form=None):
-            if url.endswith("/invites/request") or url.endswith("/invites/accept"):
-                bodies.append(payload)
-                return FakeResponse(200, {})
-            if "/accounts/check/" in url:
-                return FakeResponse(200, {})
-            if "exchange_workspace_token" in url:
-                return FakeResponse(200, {"accessToken": jwt_with_account("ws-team", "user-9", "team"), "email": "kid@example.com"})
-            raise AssertionError(url)
-
-        originals = (worker.login_child, worker.request_with_retry, worker.precheck, worker.open_session)
-        worker.login_child = lambda *args, **kwargs: (SimpleNamespace(headers={}, oai_device_id="child"), {"access_token": "codex-at"})
-        worker.request_with_retry = fake_retry
-        worker.precheck = lambda http: None
-        worker.open_session = lambda proxy: SimpleNamespace(closed=False, close=lambda: None)
-        try:
-            worker.team_onboard({
-                "email": "kid@example.com",
-                "password": "secret",
-                "totp": "JBSWY3DPEHPK3PXP",
-                "workspaceId": "ws-team",
-                "seat_type": "prolite",
-                "proxy": "socks5://127.0.0.1:1080",
-            })
-        finally:
-            worker.login_child, worker.request_with_retry, worker.precheck, worker.open_session = originals
-        self.assertEqual(bodies, [{}, {}])
-
-    def test_invites_are_paged(self):
-        urls = []
-
-        def fake_retry(http, method, url, headers=None, payload=None, form=None):
-            urls.append(url)
-            if "/users?" in url:
-                return FakeResponse(200, {"items": [{"id": "u1", "email": "a@b.c", "role": "account-owner"}]})
-            if "/invites?" in url and "offset=0" in url:
-                return FakeResponse(200, {"items": [{"id": f"i{n}", "email": f"u{n}@b.c", "role": "standard-user"} for n in range(100)]})
-            if "/invites?" in url and "offset=100" in url:
-                return FakeResponse(200, {"items": [{"id": "last", "email": "last@b.c", "role": "standard-user"}]})
-            if "seat_type_counts" in url:
-                return FakeResponse(200, {})
-            if "/subscriptions" in url:
-                return FakeResponse(200, {"seats_entitled": 5})
-            raise AssertionError(url)
-
-        original = worker.request_with_retry
-        worker.request_with_retry = fake_retry
-        try:
-            result = worker.snapshot(object(), "token", "ws-1")
-        finally:
-            worker.request_with_retry = original
-        self.assertTrue(any("offset=100" in url and "/invites" in url for url in urls))
-        self.assertTrue(any(item["email"] == "last@b.c" for item in result["invites"]))
-
-    def test_invite_count_keeps_only_the_emails_not_rejected(self):
-        ok, bad = worker.invite_emails({"account_invites": 2, "errored_emails": ["c@b.c"]}, ["a@b.c", "b@b.c", "c@b.c"])
-        self.assertEqual(bad, ["c@b.c"])
-        self.assertEqual(ok, ["a@b.c", "b@b.c"])
-
-    def test_invite_count_does_not_guess_when_it_does_not_match(self):
-        ok, _bad = worker.invite_emails({"account_invites": 2, "errored_emails": []}, ["a@b.c", "b@b.c", "c@b.c"])
-        self.assertEqual(ok, [])
-
-    def test_invite_4xx_body_keeps_successes_and_seat_full(self):
-        response = FakeResponse(400, {
-            "account_invites": [{"email_address": "ok@example.com"}],
-            "errored_emails": ["full@example.com"],
-            "error": {"code": "seat_true_up_pending"},
-        })
-        outcome = worker.invite_outcome(response, ["ok@example.com", "full@example.com"])
-        self.assertEqual(outcome["successes"], ["ok@example.com"])
-        self.assertEqual(outcome["errored"], ["full@example.com"])
-        self.assertTrue(outcome["seatFull"])
-        self.assertFalse(outcome["stopped"])
-
-    def test_invite_401_true_up_stops_for_seats_and_keeps_session(self):
-        for payload in (
-            {"error": {"code": "seat_true_up_pending"}, "account_invites": [{"email_address": "ok@example.com"}], "errored_emails": ["full@example.com"]},
-            {"error": "true-up"},
-            {"detail": "seat true_up required"},
-        ):
-            status, result = self.invite_with(FakeResponse(401, payload))
-            self.assertEqual(status, 200, payload)
-            self.assertTrue(result["ok"], payload)
-            self.assertTrue(result["seatFull"], payload)
-            self.assertFalse(result["stopped"], payload)
-            self.assertNotEqual(result.get("code"), "SESSION_EXPIRED", payload)
-            self.assertNotIn("session 已失效", result.get("message") or "", payload)
-        status, result = self.invite_with(FakeResponse(401, {
-            "account_invites": [{"email_address": "ok@example.com"}],
-            "errored_emails": ["full@example.com"],
-            "error": {"code": "seat_true_up_pending"},
-        }))
-        self.assertEqual(result["successes"], ["ok@example.com"])
-        self.assertEqual(result["errored"], ["full@example.com"])
-
-    def test_invite_401_workspace_stop_is_not_session_expired(self):
-        status, result = self.invite_with(FakeResponse(403, {"error": {"code": "deactivated_workspace"}}))
-        self.assertEqual(status, 200)
-        self.assertTrue(result["stopped"])
-        self.assertFalse(result["seatFull"])
-        self.assertNotEqual(result.get("code"), "SESSION_EXPIRED")
-
-    def test_invite_401_token_revoked_still_expires_session(self):
-        with self.assertRaises(TeamCallError) as caught:
-            self.invite_with(FakeResponse(401, {"error": "token_revoked"}))
-        self.assertEqual(caught.exception.code, "SESSION_EXPIRED")
-
-    def test_invite_html_403_stays_egress_blocked(self):
-        with self.assertRaises(TeamCallError) as caught:
-            self.invite_with(FakeResponse(403, "<html>seat_true_up_pending</html>"))
-        self.assertEqual(caught.exception.code, "EGRESS_BLOCKED")
-
-    def test_invite_plain_true_up_does_not_throw(self):
-        response = FakeResponse(401, {"error": "placeholder"})
-        response.text = "true-up"
-        response.headers = {"content-type": "text/plain"}
-        response.json = lambda: (_ for _ in ()).throw(ValueError("not json"))
-        status, result = self.invite_with(response)
-        self.assertEqual(status, 200)
-        self.assertTrue(result["ok"])
-        self.assertTrue(result["seatFull"])
-        self.assertNotIn("session 已失效", result.get("message") or "")
-
-    def test_invite_5xx_true_up_stays_upstream(self):
-        with self.assertRaises(TeamCallError) as caught:
-            self.invite_with(FakeResponse(500, {"error": "seat_true_up_pending"}))
-        self.assertEqual(caught.exception.code, "UPSTREAM")
-
-    def test_invite_post_marks_sent_even_when_rejected(self):
-        status, result = self.invite_with(FakeResponse(200, {
-            "account_invites": [],
-            "errored_emails": ["ok@example.com", "full@example.com"],
-        }))
-        self.assertEqual(status, 200)
-        self.assertTrue(result["inviteSent"])
-        status, result = self.invite_with(FakeResponse(401, {"error": "true-up"}))
-        self.assertTrue(result["inviteSent"])
-
-    def test_invite_post_error_marks_sent_for_the_handler(self):
-        with self.assertRaises(TeamCallError) as caught:
-            self.invite_with(FakeResponse(403, "<html>blocked</html>"))
-        self.assertEqual(caught.exception.code, "EGRESS_BLOCKED")
-        self.assertTrue(caught.exception.invite_sent)
-        status, payload = worker.error_payload(caught.exception)
-        self.assertEqual(payload["code"], "EGRESS_BLOCKED")
-        self.assertTrue(payload["inviteSent"])
-        self.assertNotIn("session 已失效", payload["message"])
-
-    def test_invite_precheck_failure_is_not_sent(self):
-        originals = (worker.open_session, worker.precheck)
-        worker.open_session = lambda proxy: SimpleNamespace(headers={}, oai_device_id="device")
-
-        def blocked(http):
-            raise TeamCallError("BANNED_EGRESS", "出口在封禁地区，已停止")
-
-        worker.precheck = blocked
-        try:
-            with self.assertRaises(TeamCallError) as caught:
-                worker.team_invite({
-                    "session": {"accessToken": "personal-at"},
-                    "workspaceId": "ws-1",
-                    "emails": ["ok@example.com"],
-                    "proxy": "socks5://127.0.0.1:1080",
-                })
-        finally:
-            worker.open_session, worker.precheck = originals
-        self.assertEqual(caught.exception.code, "BANNED_EGRESS")
-        self.assertFalse(getattr(caught.exception, "invite_sent", False))
-        status, payload = worker.error_payload(caught.exception)
-        self.assertNotIn("inviteSent", payload)
-
-    def invite_with(self, response):
-        def fake_retry(http, method, url, headers=None, payload=None, form=None):
-            return response
-
-        originals = (worker.open_session, worker.precheck, worker.living_access, worker.exchange_workspace, worker.request_with_retry)
-        worker.open_session = lambda proxy: SimpleNamespace(headers={}, oai_device_id="device")
-        worker.precheck = lambda http: None
-        worker.living_access = lambda http, session, workspace_id: "personal-at"
-        worker.exchange_workspace = lambda http, token, workspace_id: {"accessToken": "workspace-at"}
-        worker.request_with_retry = fake_retry
-        try:
-            return worker.team_invite({
-                "session": {"accessToken": "personal-at", "sessionToken": "sess"},
-                "workspaceId": "ws-1",
-                "emails": ["ok@example.com", "full@example.com"],
-                "proxy": "socks5://127.0.0.1:1080",
-            })
-        finally:
-            worker.open_session, worker.precheck, worker.living_access, worker.exchange_workspace, worker.request_with_retry = originals
-
     def test_empty_token_stays_up_and_rejects_calls(self):
         original_token = worker.TOKEN
         original_server = worker.ThreadingHTTPServer
@@ -582,323 +73,13 @@ class TeamFlowTest(unittest.TestCase):
         headers = worker.browser_headers("", "ws", "/path", "https://chatgpt.com/", object())
         self.assertNotIn("Authorization", headers)
 
-    def test_usage_429_is_rate_limit_and_sends_version(self):
-        captured = {}
 
-        def fake_open(proxy):
-            return SimpleNamespace(headers={})
 
-        def fake_precheck(http):
-            return None
 
-        def fake_retry(http, method, url, headers=None, payload=None, form=None):
-            captured["headers"] = headers
-            return FakeResponse(429, {"error": "rate"})
 
-        originals = (worker.open_session, worker.precheck, worker.request_with_retry)
-        worker.open_session = fake_open
-        worker.precheck = fake_precheck
-        worker.request_with_retry = fake_retry
-        try:
-            _status, result = worker.team_usage({"accessToken": "child-at", "workspaceId": "ws-1", "proxy": "socks5://127.0.0.1:1080"})
-        finally:
-            worker.open_session, worker.precheck, worker.request_with_retry = originals
-        self.assertNotEqual(result.get("usageStatus"), "exhausted")
-        self.assertIsNot(result.get("limitReached"), True)
-        self.assertEqual(result.get("code"), "RATE_LIMITED")
-        self.assertEqual(captured["headers"].get("Version"), "0.146.0")
 
-    def test_onboard_joins_on_the_login_session_and_returns_workspace_file(self):
-        login_session = SimpleNamespace(headers={"Accept-Language": "en-US", "User-Agent": "ua"}, oai_device_id="child-device")
-        calls = []
 
-        def fake_login(email, password, totp, proxy, workspace_id=""):
-            self.assertEqual(email, "kid@example.com")
-            return login_session, {"access_token": "codex-at", "refresh_token": "codex-rt"}
 
-        def fake_retry(http, method, url, headers=None, payload=None, form=None):
-            calls.append((url, headers.get("Authorization"), http))
-            if url.endswith("/api/auth/session"):
-                raise AssertionError("上车不能用空 bearer 取网页 session")
-            if "exchange_workspace_token" in url:
-                self.assertIs(http, login_session)
-                self.assertIn("codex-at", headers.get("Authorization", ""))
-                token = jwt_with_account("ws-team", "user-9", "team")
-                return FakeResponse(200, {"accessToken": token, "email": "kid@example.com"})
-            if url.endswith("/invites/request") or url.endswith("/invites/accept") or "/accounts/check/" in url:
-                self.assertIs(http, login_session)
-                self.assertIn("codex-at", headers.get("Authorization", ""))
-                return FakeResponse(200, {})
-            raise AssertionError(url)
-
-        originals = (worker.login_child, worker.request_with_retry, worker.precheck, worker.open_session)
-        worker.login_child = fake_login
-        worker.request_with_retry = fake_retry
-        worker.precheck = lambda http: None
-        probe = SimpleNamespace(closed=False)
-        probe.close = lambda: setattr(probe, "closed", True)
-        worker.open_session = lambda proxy: probe
-        try:
-            _status, result = worker.team_onboard({
-                "email": "kid@example.com",
-                "password": "secret",
-                "totp": "JBSWY3DPEHPK3PXP",
-                "workspaceId": "ws-team",
-                "proxy": "socks5://127.0.0.1:1080",
-            })
-        finally:
-            worker.login_child, worker.request_with_retry, worker.precheck, worker.open_session = originals
-        self.assertTrue(probe.closed)
-        self.assertTrue(result["ok"])
-        self.assertEqual(result["accountId"], "ws-team")
-        self.assertEqual(result["planType"], "team")
-        self.assertNotIn("accounts", result["raw"])
-        self.assertEqual(result["raw"]["credentials"]["chatgpt_account_id"], "ws-team")
-        self.assertNotIn("codex-at", json.dumps(result))
-
-    def test_kick_retries_with_login_then_mother(self):
-        calls = []
-        login_session = SimpleNamespace(headers={"Accept-Language": "en-US", "User-Agent": "ua"}, oai_device_id="child-device")
-
-        def fake_open(proxy):
-            return SimpleNamespace(headers={}, oai_device_id="mother-device", name="mother")
-
-        def fake_login(email, password, totp, proxy, workspace_id=""):
-            return login_session, {"access_token": "codex-at", "refresh_token": "rt"}
-
-        def fake_retry(http, method, url, headers=None, payload=None, form=None):
-            calls.append((method, url, headers.get("Authorization"), http))
-            if method == "DELETE" and "stored-at" in headers.get("Authorization", ""):
-                return FakeResponse(401, {"error": "token_revoked"})
-            if url.endswith("/api/auth/session"):
-                raise AssertionError("自退不能用空 bearer 取网页 session")
-            if "exchange_workspace_token" in url and http is login_session:
-                self.assertIn("codex-at", headers.get("Authorization", ""))
-                return FakeResponse(200, {"accessToken": jwt_with_account("ws-team", "user-9", "team")})
-            if method == "DELETE" and http is login_session:
-                return FakeResponse(204, {})
-            raise AssertionError((method, url))
-
-        originals = (worker.open_session, worker.precheck, worker.login_child, worker.request_with_retry)
-        worker.open_session = fake_open
-        worker.precheck = lambda http: None
-        worker.login_child = fake_login
-        worker.request_with_retry = fake_retry
-        try:
-            _status, result = worker.team_kick({
-                "workspaceId": "ws-team",
-                "userId": "user-9",
-                "accessToken": "stored-at",
-                "password": "secret",
-                "totp": "JBSWY3DPEHPK3PXP",
-                "email": "kid@example.com",
-                "session": {"accessToken": "mother-at"},
-                "proxy": "socks5://127.0.0.1:1080",
-            })
-        finally:
-            worker.open_session, worker.precheck, worker.login_child, worker.request_with_retry = originals
-        self.assertTrue(result["ok"])
-        deletes = [item for item in calls if item[0] == "DELETE"]
-        self.assertEqual(len(deletes), 2)
-        self.assertIn("stored-at", deletes[0][2])
-        self.assertIs(deletes[1][3], login_session)
-        self.assertNotIn("mother-at", deletes[1][2])
-
-    def test_kick_gateonly_rejects_token_for_another_workspace(self):
-        deletes = []
-
-        def fake_retry(http, method, url, headers=None, payload=None, form=None):
-            auth = (headers or {}).get("Authorization", "")
-            if method == "DELETE" and "stored-at" in auth:
-                return FakeResponse(401, {"error": "token_revoked"})
-            if method == "GET" and ("exchange_workspace_token" in url or url.endswith("/api/auth/session")):
-                return FakeResponse(403, "<html>cloudflare</html>")
-            if method == "DELETE":
-                deletes.append(auth)
-                return FakeResponse(204, {})
-            raise AssertionError(url)
-
-        originals = (worker.open_session, worker.precheck, worker.login_child, worker.request_with_retry)
-        worker.open_session = lambda proxy: SimpleNamespace(get=lambda *args, **kwargs: None)
-        worker.precheck = lambda http: None
-        worker.request_with_retry = fake_retry
-        worker.login_child = lambda *args: (SimpleNamespace(), {"access_token": jwt_with_account("other-ws", "user-9", "team")})
-        try:
-            _status, result = worker.team_kick({
-                "workspaceId": "ws-team",
-                "userId": "user-9",
-                "accessToken": "stored-at",
-                "email": "kid@example.com",
-                "password": "chatgpt-pass",
-                "totp": "JBSWY3DPEHPK3PXP",
-                "proxy": "socks5://127.0.0.1:1080",
-            })
-        finally:
-            worker.open_session, worker.precheck, worker.login_child, worker.request_with_retry = originals
-        self.assertFalse(result["ok"])
-        self.assertEqual(deletes, [])
-
-    def test_already_member_accept_400_still_exchanges(self):
-        login_session = SimpleNamespace(headers={"Accept-Language": "en-US", "User-Agent": "ua"}, oai_device_id="child-device")
-
-        def fake_login(email, password, totp, proxy, workspace_id=""):
-            return login_session, {"access_token": "codex-at"}
-
-        def fake_retry(http, method, url, headers=None, payload=None, form=None):
-            if url.endswith("/api/auth/session"):
-                raise AssertionError("上车不能用空 bearer 取网页 session")
-            if url.endswith("/invites/accept"):
-                return FakeResponse(400, {"error": "already_member"})
-            if url.endswith("/invites/request") or "/accounts/check/" in url:
-                return FakeResponse(200, {})
-            if "exchange_workspace_token" in url:
-                return FakeResponse(200, {"accessToken": jwt_with_account("ws-team", "user-9", "team")})
-            raise AssertionError(url)
-
-        originals = (worker.login_child, worker.request_with_retry, worker.precheck, worker.open_session)
-        worker.login_child = fake_login
-        worker.request_with_retry = fake_retry
-        worker.precheck = lambda http: None
-        probe = SimpleNamespace(closed=False)
-        probe.close = lambda: setattr(probe, "closed", True)
-        worker.open_session = lambda proxy: probe
-        try:
-            _status, result = worker.team_onboard({
-                "email": "kid@example.com",
-                "password": "secret",
-                "totp": "JBSWY3DPEHPK3PXP",
-                "workspaceId": "ws-team",
-                "proxy": "socks5://127.0.0.1:1080",
-            })
-        finally:
-            worker.login_child, worker.request_with_retry, worker.precheck, worker.open_session = originals
-        self.assertTrue(probe.closed)
-        self.assertTrue(result["ok"])
-        self.assertEqual(result["accountId"], "ws-team")
-
-    def test_pasted_cookies_refresh_access_before_mother_calls(self):
-        jar = SimpleNamespace(items=[])
-
-        def set_cookie(name, value, domain=""):
-            jar.items.append((name, value, domain))
-
-        jar.set = set_cookie
-        http = SimpleNamespace(headers={}, oai_device_id="dev", cookies=jar)
-
-        def fake_retry(http, method, url, headers=None, payload=None, form=None):
-            auth = (headers or {}).get("Authorization")
-            if url.endswith("/api/auth/session"):
-                self.assertNotIn("Authorization", headers or {})
-                return FakeResponse(200, {"accessToken": "fresh-at"})
-            if "exchange_workspace_token" in url or "/users?" in url:
-                self.assertIn("fresh-at", auth or "")
-                self.assertNotIn("expired-at", auth or "")
-                if "/users?" in url:
-                    return FakeResponse(200, {"items": [{"id": "u1", "email": "a@b.c", "role": "account-owner"}]})
-                return FakeResponse(200, {"accessToken": "fresh-at"})
-            if "/invites" in url or "seat_type_counts" in url:
-                return FakeResponse(200, {"items": []} if "/invites" in url else {})
-            if "/subscriptions" in url:
-                return FakeResponse(200, {"seats_entitled": 5})
-            raise AssertionError(url)
-
-        originals = (worker.open_session, worker.precheck, worker.request_with_retry)
-        worker.open_session = lambda proxy: http
-        worker.precheck = lambda http: None
-        worker.request_with_retry = fake_retry
-        try:
-            _status, result = worker.team_snapshot({
-                "session": {
-                    "accessToken": "expired-at",
-                    "cookies": [{"name": "oai-did", "value": "cookie-1", "domain": "chatgpt.com"}],
-                },
-                "workspaceId": "ws-1",
-                "proxy": "socks5://127.0.0.1:1080",
-            })
-        finally:
-            worker.open_session, worker.precheck, worker.request_with_retry = originals
-        self.assertTrue(result["ok"])
-        self.assertTrue(any(name == "oai-did" and value == "cookie-1" for name, value, _domain in jar.items))
-        self.assertFalse(any(name == "__Secure-next-auth.session-token" for name, value, _domain in jar.items))
-
-    def test_session_token_replays_as_known_session_cookie(self):
-        jar = SimpleNamespace(items=[])
-
-        def set_cookie(name, value, domain=""):
-            jar.items.append((name, value, domain))
-
-        jar.set = set_cookie
-        http = SimpleNamespace(headers={}, oai_device_id="dev", cookies=jar)
-        session_calls = []
-
-        def fake_retry(http, method, url, headers=None, payload=None, form=None):
-            auth = (headers or {}).get("Authorization") or ""
-            if url.endswith("/api/auth/session") and "exchange_workspace_token" not in url:
-                session_calls.append(auth)
-                self.assertNotIn("Bearer", auth)
-                return FakeResponse(200, {"accessToken": "fresh-at"})
-            self.assertIn("fresh-at", auth)
-            self.assertNotIn("expired-at", auth)
-            self.assertNotIn("live-session", auth)
-            if "/users?" in url:
-                return FakeResponse(200, {"items": [{"id": "u1", "email": "a@b.c", "role": "account-owner"}]})
-            if "exchange_workspace_token" in url:
-                return FakeResponse(200, {"accessToken": "fresh-at"})
-            if "/invites" in url or "seat_type_counts" in url:
-                return FakeResponse(200, {"items": []} if "/invites" in url else {})
-            if "/subscriptions" in url:
-                return FakeResponse(200, {"seats_entitled": 5})
-            raise AssertionError(url)
-
-        originals = (worker.open_session, worker.precheck, worker.request_with_retry)
-        worker.open_session = lambda proxy: http
-        worker.precheck = lambda http: None
-        worker.request_with_retry = fake_retry
-        try:
-            _status, result = worker.team_snapshot({
-                "session": {"accessToken": "expired-at", "sessionToken": "live-session"},
-                "workspaceId": "ws-1",
-                "proxy": "socks5://127.0.0.1:1080",
-            })
-        finally:
-            worker.open_session, worker.precheck, worker.request_with_retry = originals
-        self.assertTrue(result["ok"])
-        self.assertEqual(session_calls, [""])
-        self.assertIn(("__Secure-next-auth.session-token", "live-session", ".chatgpt.com"), jar.items)
-
-    def test_self_kick_login_locks_the_workspace(self):
-        seen = {}
-
-        def fake_login(email, password, totp, proxy, workspace_id=""):
-            seen["workspace_id"] = workspace_id
-            return SimpleNamespace(headers={}, oai_device_id="d"), {"access_token": jwt_with_account("other-ws", "user-9", "team")}
-
-        def fake_retry(http, method, url, headers=None, payload=None, form=None):
-            auth = (headers or {}).get("Authorization", "")
-            if method == "DELETE" and "stored-at" in auth:
-                return FakeResponse(401, {"error": "token_revoked"})
-            if url.endswith("/api/auth/session"):
-                return FakeResponse(403, "<html>blocked</html>")
-            return FakeResponse(401, {"error": "no"})
-
-        originals = (worker.open_session, worker.precheck, worker.login_child, worker.request_with_retry)
-        worker.open_session = lambda proxy: SimpleNamespace(headers={}, oai_device_id="mother")
-        worker.precheck = lambda http: None
-        worker.request_with_retry = fake_retry
-        worker.login_child = fake_login
-        try:
-            worker.team_kick({
-                "workspaceId": "ws-team",
-                "userId": "user-9",
-                "accessToken": "stored-at",
-                "email": "kid@example.com",
-                "password": "chatgpt-pass",
-                "totp": "JBSWY3DPEHPK3PXP",
-                "proxy": "socks5://127.0.0.1:1080",
-            })
-        finally:
-            worker.open_session, worker.precheck, worker.login_child, worker.request_with_retry = originals
-        self.assertEqual(seen.get("workspace_id"), "ws-team")
 
     def test_authorize_url_uses_documented_scope_and_flags(self):
         stub_protocol_imports()
@@ -936,41 +117,6 @@ class TeamFlowTest(unittest.TestCase):
         self.assertEqual(seen["headers"].get("User-Agent"), "codex_cli_rs/0.146.0")
         self.assertNotIn("browser-ua", seen["headers"].get("User-Agent", ""))
 
-    def test_nested_user_is_a_member_and_unparsed_row_is_incomplete(self):
-        people = worker.member_page({"items": [{"user": {"id": "u2", "email": "b@c.d"}, "role": "standard-user"}]})
-        self.assertEqual(people[0]["id"], "u2")
-        self.assertEqual(people[0]["email"], "b@c.d")
-        self.assertEqual(people[0]["role"], "standard-user")
-
-        def fake_retry(http, method, url, headers=None, payload=None, form=None):
-            if "/users?" in url:
-                return FakeResponse(200, {"items": [{"user": {"email": "a@b.c"}}]})
-            if "/invites" in url:
-                return FakeResponse(200, {"items": []})
-            if "seat_type_counts" in url:
-                return FakeResponse(200, {"seat_type_counts": {"default": 1, "prolite": 0}})
-            if "/subscriptions" in url:
-                return FakeResponse(200, {"data": {"seats_entitled": 5, "will_renew": True}})
-            if "exchange_workspace_token" in url:
-                return FakeResponse(200, {"accessToken": "at"})
-            raise AssertionError(url)
-
-        originals = (worker.open_session, worker.precheck, worker.request_with_retry)
-        worker.open_session = lambda proxy: SimpleNamespace(headers={}, oai_device_id="dev")
-        worker.precheck = lambda http: None
-        worker.request_with_retry = fake_retry
-        try:
-            _status, result = worker.team_snapshot({
-                "session": {"accessToken": "at"},
-                "workspaceId": "ws-1",
-                "proxy": "socks5://127.0.0.1:1080",
-            })
-        finally:
-            worker.open_session, worker.precheck, worker.request_with_retry = originals
-        self.assertFalse(result["complete"])
-        self.assertEqual(result["seatsEntitled"], 5)
-        self.assertEqual(result["willRenew"], True)
-        self.assertEqual(result["members"], [])
 
     def test_documented_client_headers_are_forwarded_only_when_present(self):
         http = SimpleNamespace(headers={"Accept-Language": "en-US", "User-Agent": "ua", "oai-client-version": "1.2.3"}, oai_device_id="device-stable")
@@ -984,305 +130,14 @@ class TeamFlowTest(unittest.TestCase):
         for name in ("oai-client-build-number", "oai-client-version", "oai-session-id", "x-oai-is-client-observation", "x-oai-is-pending-updates"):
             self.assertNotIn(name, bare)
 
-    def test_onboard_stops_before_login_when_proxy_precheck_fails(self):
-        order = []
 
-        def fake_open(proxy):
-            order.append("open")
-            session = SimpleNamespace()
-            session.close = lambda: order.append("close")
-            return session
 
-        def fake_precheck(http):
-            order.append("precheck")
-            raise TeamCallError("EGRESS_BLOCKED", "出口预检失败，已停止")
 
-        def fake_login(*args, **kwargs):
-            order.append("login")
-            raise AssertionError("预检失败不能登录")
 
-        originals = (worker.open_session, worker.precheck, worker.login_child)
-        worker.open_session = fake_open
-        worker.precheck = fake_precheck
-        worker.login_child = fake_login
-        try:
-            _status, result = worker.team_onboard({
-                "email": "kid@example.com",
-                "password": "secret",
-                "totp": "JBSWY3DPEHPK3PXP",
-                "workspaceId": "ws-team",
-                "proxy": "socks5://127.0.0.1:1080",
-            })
-        finally:
-            worker.open_session, worker.precheck, worker.login_child = originals
-        self.assertFalse(result["ok"])
-        self.assertEqual(result["code"], "EGRESS_BLOCKED")
-        self.assertEqual(order, ["open", "precheck", "close"])
 
-    def test_kick_gateonly_cookie_delete_does_not_use_foreign_jwt(self):
-        jar = SimpleNamespace(items=[("oai-did", "cookie-1", "chatgpt.com")])
-        jar.set = lambda name, value, domain="": jar.items.append((name, value, domain))
-        login_session = SimpleNamespace(headers={}, oai_device_id="child", cookies=jar)
-        deletes = []
 
-        def fake_retry(http, method, url, headers=None, payload=None, form=None):
-            auth = (headers or {}).get("Authorization", "")
-            if method == "DELETE" and "stored-at" in auth:
-                return FakeResponse(401, {"error": "token_revoked"})
-            if method == "GET" and ("exchange_workspace_token" in url or url.endswith("/api/auth/session")):
-                return FakeResponse(403, "<html>cloudflare</html>")
-            if method == "DELETE":
-                deletes.append((url, auth, http))
-                return FakeResponse(204, {})
-            raise AssertionError(url)
 
-        originals = (worker.open_session, worker.precheck, worker.login_child, worker.request_with_retry)
-        worker.open_session = lambda proxy: SimpleNamespace(headers={}, oai_device_id="mother")
-        worker.precheck = lambda http: None
-        worker.login_child = lambda *args: (login_session, {"access_token": jwt_with_account("other-ws", "user-from-token", "team")})
-        worker.request_with_retry = fake_retry
-        try:
-            _status, result = worker.team_kick({
-                "workspaceId": "ws-team",
-                "userId": "user-9",
-                "accessToken": "stored-at",
-                "email": "kid@example.com",
-                "password": "chatgpt-pass",
-                "totp": "JBSWY3DPEHPK3PXP",
-                "proxy": "socks5://127.0.0.1:1080",
-            })
-        finally:
-            worker.open_session, worker.precheck, worker.login_child, worker.request_with_retry = originals
-        self.assertTrue(result["ok"])
-        self.assertEqual(len(deletes), 1)
-        self.assertIn("/accounts/ws-team/users/user-9", deletes[0][0])
-        self.assertNotIn("user-from-token", deletes[0][0])
-        self.assertNotIn("other-ws", deletes[0][1])
-        self.assertEqual(deletes[0][1], "")
-        self.assertIs(deletes[0][2], login_session)
 
-    def test_gateonly_cookie_delete_when_login_has_no_personal_token(self):
-        jar = SimpleNamespace(items=[("__Secure-next-auth.session-token", "session-cookie", ".chatgpt.com")])
-        login_session = SimpleNamespace(headers={}, oai_device_id="child", cookies=jar)
-        deletes = []
-
-        def fake_retry(http, method, url, headers=None, payload=None, form=None):
-            auth = (headers or {}).get("Authorization", "")
-            if method == "DELETE" and "stored-at" in auth:
-                return FakeResponse(401, {"error": "token_revoked"})
-            if method == "DELETE":
-                deletes.append((url, auth, http))
-                return FakeResponse(204, {})
-            raise AssertionError((method, url, auth))
-
-        originals = (worker.open_session, worker.precheck, worker.login_child, worker.request_with_retry)
-        worker.open_session = lambda proxy: SimpleNamespace(headers={}, oai_device_id="mother")
-        worker.precheck = lambda http: None
-        worker.login_child = lambda *args: (login_session, {})
-        worker.request_with_retry = fake_retry
-        try:
-            _status, result = worker.team_kick({
-                "workspaceId": "ws-team",
-                "userId": "user-9",
-                "accessToken": "stored-at",
-                "email": "kid@example.com",
-                "password": "chatgpt-pass",
-                "totp": "JBSWY3DPEHPK3PXP",
-                "session": {"accessToken": "mother-at"},
-                "proxy": "socks5://127.0.0.1:1080",
-            })
-        finally:
-            worker.open_session, worker.precheck, worker.login_child, worker.request_with_retry = originals
-        self.assertTrue(result["ok"])
-        self.assertNotIn("可能被限流", result.get("message") or "")
-        self.assertEqual(len(deletes), 1)
-        self.assertIn("/accounts/ws-team/users/user-9", deletes[0][0])
-        self.assertEqual(deletes[0][1], "")
-        self.assertIs(deletes[0][2], login_session)
-
-    def test_mother_fallback_warns_rate_limit(self):
-        class ReauthError(Exception):
-            pass
-
-        deletes = []
-
-        def fake_login(*args, **kwargs):
-            raise ReauthError("token 交换失败")
-
-        def fake_retry(http, method, url, headers=None, payload=None, form=None):
-            auth = (headers or {}).get("Authorization", "")
-            if "exchange_workspace_token" in url:
-                self.assertIn("mother-at", auth)
-                return FakeResponse(200, {"accessToken": "mother-workspace"})
-            if method == "DELETE":
-                deletes.append(auth)
-                return FakeResponse(204, {})
-            raise AssertionError((method, url))
-
-        originals = (worker.open_session, worker.precheck, worker.login_child, worker.request_with_retry)
-        worker.open_session = lambda proxy: SimpleNamespace(headers={}, oai_device_id="mother")
-        worker.precheck = lambda http: None
-        worker.login_child = fake_login
-        worker.request_with_retry = fake_retry
-        try:
-            _status, result = worker.team_kick({
-                "workspaceId": "ws-team",
-                "userId": "user-9",
-                "email": "kid@example.com",
-                "password": "chatgpt-pass",
-                "totp": "JBSWY3DPEHPK3PXP",
-                "session": {"accessToken": "mother-at"},
-                "proxy": "socks5://127.0.0.1:1080",
-            })
-        finally:
-            worker.open_session, worker.precheck, worker.login_child, worker.request_with_retry = originals
-        self.assertTrue(result["ok"])
-        self.assertIn("可能被限流", result.get("message") or "")
-        self.assertTrue(result.get("rateLimited"))
-        self.assertTrue(any("mother-workspace" in item or "mother-at" in item for item in deletes))
-
-    def test_kick_uses_saved_device_before_child_delete(self):
-        seen = []
-
-        def fake_precheck(http):
-            seen.append(("precheck", getattr(http, "oai_device_id", "")))
-
-        def fake_retry(http, method, url, headers=None, payload=None, form=None):
-            if method == "DELETE":
-                seen.append(("delete", (headers or {}).get("oai-device-id")))
-                return FakeResponse(204, {})
-            raise AssertionError(url)
-
-        originals = (worker.open_session, worker.precheck, worker.request_with_retry)
-        worker.open_session = lambda proxy: SimpleNamespace(headers={}, oai_device_id="random-device")
-        worker.precheck = fake_precheck
-        worker.request_with_retry = fake_retry
-        worker._bound.http = None
-        try:
-            _status, result = worker.team_kick({
-                "workspaceId": "ws-team",
-                "userId": "user-9",
-                "accessToken": "stored-at",
-                "deviceId": "saved-device",
-                "session": json.dumps({"oaiDeviceId": "from-session"}),
-                "proxy": "socks5://127.0.0.1:1080",
-            })
-            self.assertTrue(result["ok"])
-            self.assertEqual(seen, [("precheck", "saved-device"), ("delete", "saved-device")])
-            self.assertIsNone(getattr(worker._bound, "http", None))
-            seen.clear()
-            _status, session_only = worker.team_kick({
-                "workspaceId": "ws-team",
-                "userId": "user-9",
-                "accessToken": "stored-at",
-                "session": {"oaiDeviceId": "from-session"},
-                "proxy": "socks5://127.0.0.1:1080",
-            })
-        finally:
-            worker.open_session, worker.precheck, worker.request_with_retry = originals
-            worker._bound.http = None
-        self.assertTrue(session_only["ok"])
-        self.assertEqual(seen, [("precheck", "from-session"), ("delete", "from-session")])
-
-    def test_mother_fallback_session_expired_is_not_rate_limited(self):
-        def fake_retry(http, method, url, headers=None, payload=None, form=None):
-            if "exchange_workspace_token" in url:
-                return FakeResponse(401, {"error": "unauthorized"})
-            raise AssertionError(url)
-
-        originals = (worker.open_session, worker.precheck, worker.request_with_retry)
-        worker.open_session = lambda proxy: SimpleNamespace(headers={}, oai_device_id="mother")
-        worker.precheck = lambda http: None
-        worker.request_with_retry = fake_retry
-        try:
-            _status, result = worker.team_kick({
-                "workspaceId": "ws-team",
-                "userId": "user-9",
-                "session": {"accessToken": "mother-at"},
-                "proxy": "socks5://127.0.0.1:1080",
-            })
-        finally:
-            worker.open_session, worker.precheck, worker.request_with_retry = originals
-        self.assertFalse(result["ok"])
-        self.assertEqual(result.get("code"), "SESSION_EXPIRED")
-        self.assertNotIn("可能被限流", result.get("message") or "")
-        self.assertFalse(result.get("rateLimited"))
-
-    def test_mother_fallback_egress_block_is_not_rate_limited(self):
-        def fake_retry(http, method, url, headers=None, payload=None, form=None):
-            if "exchange_workspace_token" in url:
-                return FakeResponse(403, "<html>blocked</html>")
-            raise AssertionError(url)
-
-        originals = (worker.open_session, worker.precheck, worker.request_with_retry)
-        worker.open_session = lambda proxy: SimpleNamespace(headers={}, oai_device_id="mother")
-        worker.precheck = lambda http: None
-        worker.request_with_retry = fake_retry
-        try:
-            _status, result = worker.team_kick({
-                "workspaceId": "ws-team",
-                "userId": "user-9",
-                "session": {"accessToken": "mother-at"},
-                "proxy": "socks5://127.0.0.1:1080",
-            })
-        finally:
-            worker.open_session, worker.precheck, worker.request_with_retry = originals
-        self.assertFalse(result["ok"])
-        self.assertEqual(result.get("code"), "EGRESS_BLOCKED")
-        self.assertNotIn("可能被限流", result.get("message") or "")
-        self.assertFalse(result.get("rateLimited"))
-
-    def test_mother_fallback_http_500_is_not_rate_limited(self):
-        def fake_retry(http, method, url, headers=None, payload=None, form=None):
-            if "exchange_workspace_token" in url:
-                return FakeResponse(200, {"accessToken": "mother-workspace"})
-            if method == "DELETE":
-                return FakeResponse(500, {"error": "upstream"})
-            raise AssertionError(url)
-
-        originals = (worker.open_session, worker.precheck, worker.request_with_retry)
-        worker.open_session = lambda proxy: SimpleNamespace(headers={}, oai_device_id="mother")
-        worker.precheck = lambda http: None
-        worker.request_with_retry = fake_retry
-        try:
-            _status, result = worker.team_kick({
-                "workspaceId": "ws-team",
-                "userId": "user-9",
-                "session": {"accessToken": "mother-at"},
-                "proxy": "socks5://127.0.0.1:1080",
-            })
-        finally:
-            worker.open_session, worker.precheck, worker.request_with_retry = originals
-        self.assertFalse(result["ok"])
-        self.assertEqual(result.get("code"), "UPSTREAM")
-        self.assertIn("HTTP 500", result.get("message") or "")
-        self.assertNotIn("可能被限流", result.get("message") or "")
-        self.assertFalse(result.get("rateLimited"))
-
-    def test_mother_fallback_429_stays_rate_limited(self):
-        def fake_retry(http, method, url, headers=None, payload=None, form=None):
-            if "exchange_workspace_token" in url:
-                return FakeResponse(200, {"accessToken": "mother-workspace"})
-            if method == "DELETE":
-                return FakeResponse(429, {"error": "rate"})
-            raise AssertionError(url)
-
-        originals = (worker.open_session, worker.precheck, worker.request_with_retry)
-        worker.open_session = lambda proxy: SimpleNamespace(headers={}, oai_device_id="mother")
-        worker.precheck = lambda http: None
-        worker.request_with_retry = fake_retry
-        try:
-            _status, result = worker.team_kick({
-                "workspaceId": "ws-team",
-                "userId": "user-9",
-                "session": {"accessToken": "mother-at"},
-                "proxy": "socks5://127.0.0.1:1080",
-            })
-        finally:
-            worker.open_session, worker.precheck, worker.request_with_retry = originals
-        self.assertFalse(result["ok"])
-        self.assertTrue(result.get("rateLimited"))
-        self.assertIn("可能被限流", result.get("message") or "")
 
     def test_authorize_releases_cookies_when_personal_token_is_blocked(self):
         stub_protocol_imports()
@@ -1380,126 +235,23 @@ class TeamFlowTest(unittest.TestCase):
         finally:
             engine.ChatGPTClient, engine.OAuthClient = originals
 
-    def test_onboard_cookie_only_joins_without_fetching_plain_session(self):
-        login_session = SimpleNamespace(
-            headers={"Accept-Language": "en-US", "User-Agent": "ua"},
-            oai_device_id="child-device",
-            cookies=SimpleNamespace(items=[("__Secure-next-auth.session-token", "session-cookie")]),
-        )
-        calls = []
 
-        def fake_login(email, password, totp, proxy, workspace_id=""):
-            return login_session, {}
-
-        def fake_retry(http, method, url, headers=None, payload=None, form=None):
-            calls.append(url)
-            auth = (headers or {}).get("Authorization")
-            self.assertIs(http, login_session)
-            self.assertFalse(auth)
-            if url.endswith("/api/auth/session"):
-                raise AssertionError("上车不能用空 bearer 取网页 session")
-            if "exchange_workspace_token" in url:
-                return FakeResponse(200, {"accessToken": jwt_with_account("ws-team", "user-9", "team")})
-            if url.endswith("/invites/request") or url.endswith("/invites/accept") or "/accounts/check/" in url:
-                return FakeResponse(200, {})
-            raise AssertionError(url)
-
-        originals = (worker.login_child, worker.request_with_retry, worker.precheck, worker.open_session)
-        worker.login_child = fake_login
-        worker.request_with_retry = fake_retry
-        worker.precheck = lambda http: None
-        probe = SimpleNamespace(closed=False)
-        probe.close = lambda: setattr(probe, "closed", True)
-        worker.open_session = lambda proxy: probe
-        try:
-            _status, result = worker.team_onboard({
-                "email": "kid@example.com",
-                "password": "secret",
-                "totp": "JBSWY3DPEHPK3PXP",
-                "workspaceId": "ws-team",
-                "proxy": "socks5://127.0.0.1:1080",
-            })
-        finally:
-            worker.login_child, worker.request_with_retry, worker.precheck, worker.open_session = originals
-        self.assertTrue(probe.closed)
-        self.assertTrue(result["ok"])
-        self.assertEqual(result["accountId"], "ws-team")
-        self.assertTrue(any(url.endswith("/invites/request") for url in calls))
-        self.assertTrue(any(url.endswith("/invites/accept") for url in calls))
-        self.assertTrue(any("/accounts/check/" in url for url in calls))
-        self.assertTrue(any("exchange_workspace_token" in url for url in calls))
-
-    def test_onboard_without_token_or_cookies_still_fails(self):
-        login_session = SimpleNamespace(headers={}, oai_device_id="child-device", cookies=SimpleNamespace(items=[]))
-
-        def fake_retry(*args, **kwargs):
-            raise AssertionError("没有登录凭据不能发请求")
-
-        originals = (worker.login_child, worker.request_with_retry, worker.precheck, worker.open_session)
-        worker.login_child = lambda *args, **kwargs: (login_session, {})
-        worker.request_with_retry = fake_retry
-        worker.precheck = lambda http: None
-        probe = SimpleNamespace(closed=False)
-        probe.close = lambda: setattr(probe, "closed", True)
-        worker.open_session = lambda proxy: probe
-        try:
-            _status, result = worker.team_onboard({
-                "email": "kid@example.com",
-                "password": "secret",
-                "totp": "JBSWY3DPEHPK3PXP",
-                "workspaceId": "ws-team",
-                "proxy": "socks5://127.0.0.1:1080",
-            })
-        finally:
-            worker.login_child, worker.request_with_retry, worker.precheck, worker.open_session = originals
-        self.assertFalse(result["ok"])
-        self.assertEqual(result["code"], "AUTH")
-        self.assertIn("登录后没有拿到 ChatGPT session", result["message"])
-
-    def test_invite_id_rows_are_listed_and_not_truncated(self):
-        def snapshot_with(invite_payload):
-            def fake_retry(http, method, url, headers=None, payload=None, form=None):
-                if "/users?" in url:
-                    return FakeResponse(200, {"items": [{"id": "owner", "email": "mother@example.com", "role": "account-owner"}], "total": 1})
-                if "/invites?" in url:
-                    return FakeResponse(200, invite_payload)
-                if "seat_type_counts" in url:
-                    return FakeResponse(200, {})
-                if "/subscriptions" in url:
-                    return FakeResponse(200, {"seats_entitled": 5})
-                raise AssertionError(url)
-
-            original = worker.request_with_retry
-            worker.request_with_retry = fake_retry
-            try:
-                return worker.snapshot(object(), "token", "ws-1")
-            finally:
-                worker.request_with_retry = original
-
-        by_items = snapshot_with({"items": [{"invite_id": "inv-1", "email_address": "kid@example.com"}]})
-        self.assertFalse(by_items["invitesTruncated"])
-        self.assertEqual(by_items["invites"], [{"id": "inv-1", "email": "kid@example.com"}])
-        self.assertEqual([item["id"] for item in by_items["members"]], ["owner"])
-
-        by_key = snapshot_with({"invites": [{"invite_id": "inv-2", "email_address": "other@example.com"}]})
-        self.assertFalse(by_key["invitesTruncated"])
-        self.assertEqual(by_key["invites"], [{"id": "inv-2", "email": "other@example.com"}])
 
     def test_handler_logs_exception_class_without_body(self):
         import io
         from contextlib import redirect_stdout
 
-        original_route = worker.ROUTES["/internal/team/usage"]
+        original_route = worker.ROUTES["/internal/session/inspect"]
         original_token = worker.TOKEN
 
         def boom(_body):
             raise RuntimeError("secret-body-token")
 
-        worker.ROUTES["/internal/team/usage"] = boom
+        worker.ROUTES["/internal/session/inspect"] = boom
         worker.TOKEN = "team-token"
         sent = {}
         handler = worker.Handler.__new__(worker.Handler)
-        handler.path = "/internal/team/usage"
+        handler.path = "/internal/session/inspect"
         handler.headers = {"Authorization": "Bearer team-token", "Content-Length": "40"}
         handler.rfile = io.BytesIO(b'{"accessToken":"secret-body-token"}')
         handler._send = lambda status, payload: sent.update(status=status, payload=payload)
@@ -1508,21 +260,13 @@ class TeamFlowTest(unittest.TestCase):
             with redirect_stdout(buf):
                 handler.do_POST()
         finally:
-            worker.ROUTES["/internal/team/usage"] = original_route
+            worker.ROUTES["/internal/session/inspect"] = original_route
             worker.TOKEN = original_token
         self.assertEqual(sent["payload"]["message"], "协议服务处理失败")
         log = buf.getvalue()
         self.assertIn("RuntimeError", log)
-        self.assertIn("/internal/team/usage", log)
+        self.assertIn("/internal/session/inspect", log)
         self.assertNotIn("secret-body-token", log)
-
-    def test_active_until_keeps_seconds_and_ambiguous_text(self):
-        self.assertEqual(worker.normalize_active_until("2026-10-08T11:12:01Z"), "2026-10-08T11:12:01Z")
-        self.assertEqual(worker.normalize_active_until("2026-10-08T11:12:01.900Z"), "2026-10-08T11:12:01Z")
-        self.assertEqual(worker.normalize_active_until(1760000000), "2025-10-09T08:53:20Z")
-        self.assertEqual(worker.normalize_active_until(1760000000000), "2025-10-09T08:53:20Z")
-        self.assertEqual(worker.normalize_active_until("2026-10-08 11:12:01"), "2026-10-08 11:12:01")
-        self.assertIsNone(worker.normalize_active_until(None))
 
     def test_cookie_replay_json_401_is_session_expired_not_egress(self):
         response = FakeResponse(401, {"error": "unauthorized"})
@@ -1578,36 +322,6 @@ class TeamFlowTest(unittest.TestCase):
         })
         self.assertEqual(seen.get("__Secure-next-auth.session-token"), "newer-session")
 
-    def test_exchange_workspace_token_does_not_replace_personal_access(self):
-        http = SimpleNamespace(headers={}, oai_device_id="dev-1", cookies=SimpleNamespace(set=lambda *args, **kwargs: None))
-
-        def fake_retry(http, method, url, headers=None, payload=None, form=None):
-            if url.endswith("/api/auth/session") and "exchange_workspace_token" not in url:
-                return FakeResponse(200, {"accessToken": "personal-at", "sessionToken": "same-session"})
-            if "exchange_workspace_token" in url:
-                return FakeResponse(200, {"accessToken": "workspace-at", "sessionToken": "same-session"})
-            if "/users?" in url:
-                return FakeResponse(401, {"error": "unauthorized"})
-            raise AssertionError(url)
-
-        originals = (worker.open_session, worker.precheck, worker.request_with_retry)
-        worker.open_session = lambda proxy: http
-        worker.precheck = lambda proxy: None
-        worker.request_with_retry = fake_retry
-        try:
-            with self.assertRaises(TeamCallError) as caught:
-                worker.team_snapshot({
-                    "session": {"accessToken": "old-at", "sessionToken": "same-session"},
-                    "workspaceId": "ws-1",
-                    "proxy": "socks5://127.0.0.1:1080",
-                })
-        finally:
-            worker.open_session, worker.precheck, worker.request_with_retry = originals
-        self.assertEqual(caught.exception.code, "SESSION_EXPIRED")
-        update = worker.session_update_from(http) or {}
-        self.assertEqual(update.get("accessToken"), "personal-at")
-        self.assertNotEqual(update.get("accessToken"), "workspace-at")
-        self.assertEqual(update.get("sessionToken"), "same-session")
 
     def test_cookie_replay_html_401_stays_egress(self):
         original = worker.request_with_retry
@@ -1687,7 +401,7 @@ class WritebackFixTest(unittest.TestCase):
     def test_post_returns_cookie_rotated_by_bound_mother(self):
         import io
 
-        original_route = worker.ROUTES["/internal/team/snapshot"]
+        original_route = worker.ROUTES["/internal/session/inspect"]
         original_token = worker.TOKEN
         worker.TOKEN = "team-token"
         worker._bound.http = None
@@ -1704,10 +418,10 @@ class WritebackFixTest(unittest.TestCase):
             worker.remember_refresh(http, response.json(), response)
             return 200, {"ok": True, "complete": True, "members": []}
 
-        worker.ROUTES["/internal/team/snapshot"] = route
+        worker.ROUTES["/internal/session/inspect"] = route
         sent = {}
         handler = worker.Handler.__new__(worker.Handler)
-        handler.path = "/internal/team/snapshot"
+        handler.path = "/internal/session/inspect"
         body = b'{"workspaceId":"ws-1"}'
         handler.headers = {"Authorization": "Bearer team-token", "Content-Length": str(len(body))}
         handler.rfile = io.BytesIO(body)
@@ -1715,7 +429,7 @@ class WritebackFixTest(unittest.TestCase):
         try:
             handler.do_POST()
         finally:
-            worker.ROUTES["/internal/team/snapshot"] = original_route
+            worker.ROUTES["/internal/session/inspect"] = original_route
             worker.TOKEN = original_token
             worker._bound.http = None
         update = (sent.get("payload") or {}).get("sessionUpdate") or {}
@@ -1723,33 +437,6 @@ class WritebackFixTest(unittest.TestCase):
         self.assertEqual(update.get("accessToken"), "fresh-at")
         self.assertIsNone(getattr(worker._bound, "http", None))
 
-    def test_open_session_and_child_kick_do_not_bind_http(self):
-        stub_protocol_imports()
-        import vendor.lib.http_client as http_client
-
-        original_create = http_client.create_http_session
-        original_precheck = worker.precheck
-        original_delete = worker.delete_member
-        http_client.create_http_session = lambda *args, **kwargs: SimpleNamespace(oai_device_id="", headers={})
-        worker.precheck = lambda http: None
-        worker.delete_member = lambda *args, **kwargs: 200
-        worker._bound.http = None
-        try:
-            worker.open_session("socks5://127.0.0.1:1080")
-            self.assertIsNone(getattr(worker._bound, "http", None))
-            _status, payload = worker.team_kick({
-                "workspaceId": "ws-1",
-                "userId": "user-1",
-                "accessToken": "child-at",
-                "proxy": "socks5://127.0.0.1:1080",
-            })
-        finally:
-            http_client.create_http_session = original_create
-            worker.precheck = original_precheck
-            worker.delete_member = original_delete
-            worker._bound.http = None
-        self.assertTrue(payload["ok"])
-        self.assertIsNone(getattr(worker._bound, "http", None))
 
     def test_cookie_items_keeps_every_set_cookie(self):
         class MultiHeaders:
@@ -1851,6 +538,79 @@ class ExtractFlowTest(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertEqual(result["code"], "PLAN_MISMATCH")
         self.assertNotIn("access_token", result)
+
+    def test_reclaim_missing_plan_keeps_tokens(self):
+        from app.extract import run_extract
+
+        def login(email, password, totp, proxy):
+            return {"tokens": {"access_token": self.token({"email": email}), "refresh_token": "kept-refresh"}}
+
+        result = run_extract({
+            "email": "a@b.c", "password": "pw", "totp": "JBSWY3DPEHPK3PXP",
+            "proxy": "socks5://127.0.0.1:1080", "subscriptionTag": "Plus",
+            "otpPolicy": "reclaim",
+        }, login, lambda *args: (_ for _ in ()).throw(AssertionError("reclaim must not list workspaces")), lambda *args: {})
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["refreshToken"], "kept-refresh")
+        self.assertTrue(result["accessToken"])
+
+    def test_reclaim_explicit_bad_plan_still_drops_tokens(self):
+        from app.extract import run_extract
+
+        def run(plan):
+            def login(email, password, totp, proxy):
+                return {"tokens": {"access_token": self.token({"chatgpt_plan_type": plan, "email": email}), "refresh_token": "dropped"}}
+
+            return run_extract({
+                "email": "a@b.c", "password": "pw", "totp": "JBSWY3DPEHPK3PXP",
+                "proxy": "socks5://127.0.0.1:1080", "subscriptionTag": "Plus",
+                "otpPolicy": "reclaim",
+            }, login, lambda *args: {}, lambda *args: {})
+
+        for plan in ("free", "team", "self_serve_business_prolite"):
+            result = run(plan)
+            self.assertFalse(result["ok"], plan)
+            self.assertEqual(result["code"], "PLAN_MISMATCH", plan)
+            self.assertNotIn("accessToken", result, plan)
+            self.assertNotIn("refreshToken", result, plan)
+
+    def test_reclaim_missing_plan_rejects_workspace_conflict(self):
+        from app.extract import run_extract
+
+        def login(email, password, totp, proxy):
+            return {"tokens": {
+                "access_token": self.token({"chatgpt_account_id": "personal", "chatgpt_workspace_id": "other"}),
+                "refresh_token": "dropped",
+            }}
+
+        result = run_extract({
+            "email": "a@b.c", "password": "pw", "totp": "JBSWY3DPEHPK3PXP",
+            "proxy": "socks5://127.0.0.1:1080", "subscriptionTag": "Plus",
+            "otpPolicy": "reclaim",
+        }, login, lambda *args: {}, lambda *args: {})
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["code"], "PLAN_MISMATCH")
+        self.assertNotIn("accessToken", result)
+
+    def test_mailbox_callback_waits_longer_than_reclaim_pickup(self):
+        import app.mailbox_callback as callback
+
+        seen = []
+
+        def fake_urlopen(request, timeout=0):
+            seen.append(timeout)
+            raise TimeoutError("stop")
+
+        original = callback.urllib.request.urlopen
+        callback.urllib.request.urlopen = fake_urlopen
+        try:
+            box = callback.NestMailbox(1, "a@b.c", "http://nest", "token")
+            self.assertIsNone(box._post_ids())
+            self.assertIsNone(box._post(set()))
+        finally:
+            callback.urllib.request.urlopen = original
+        self.assertEqual(len(seen), 2)
+        self.assertGreaterEqual(min(seen), 45)
 
     def test_totp_rate_limit_is_temporary_and_wrong_code_is_not(self):
         from app.extract import classify_login_failure
@@ -1997,6 +757,334 @@ class ExtractFlowTest(unittest.TestCase):
         self.assertNotIn("password", payload)
         self.assertNotIn("sessionUpdate", payload)
         self.assertIsNone(getattr(worker._bound, "http", None))
+
+
+    def test_reclaim_bare_401_is_not_password_failure(self):
+        from app.extract import note_reclaim_bare_401, password_rejected, set_otp_policy, reset_otp_policy
+        client = SimpleNamespace(last_oauth_error="")
+        token = set_otp_policy("reclaim")
+        try:
+            self.assertTrue(note_reclaim_bare_401(client, 401, None))
+            self.assertEqual(client.last_oauth_error, "email_verification_required")
+            self.assertFalse(password_rejected(401, None))
+        finally:
+            reset_otp_policy(token)
+        self.assertTrue(password_rejected(401, None))
+
+    def test_mailbox_callback_drops_secret_fields(self):
+        from app.mailbox_callback import NestMailbox
+        import threading
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+        seen = {}
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length") or 0)
+                seen["body"] = self.rfile.read(length).decode("utf-8")
+                seen["auth"] = self.headers.get("Authorization")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b'{"id":"m1","code":"123456","refreshToken":"secret"}')
+
+            def log_message(self, fmt, *args):
+                return
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            port = server.server_address[1]
+            mailbox = NestMailbox(9, "a@b.c", f"http://127.0.0.1:{port}", "token")
+            self.assertEqual(mailbox.wait_for_verification_code("a@b.c", timeout=1), "")
+            self.assertNotIn("password", seen["body"])
+            self.assertNotIn("clientId", seen["body"])
+            self.assertEqual(seen["auth"], "Bearer token")
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_client_gone_stops_wrapped_request(self):
+        import socket
+        from app.cancel import CancelState, install_cancel, wrap_session, client_gone, reset_cancel, ExtractCancelled
+
+        left, right = socket.socketpair()
+        left.close()
+        self.assertTrue(client_gone(SimpleNamespace(connection=right)))
+        right.close()
+
+        class Boom(Exception):
+            pass
+
+        class Session:
+            def request(self, *args, **kwargs):
+                raise Boom("should not run")
+
+        state = CancelState()
+        token = install_cancel(state)
+        state.stop.set()
+        session = wrap_session(Session())
+        try:
+            with self.assertRaises(ExtractCancelled):
+                session.request("GET", "https://example.invalid")
+        finally:
+            reset_cancel(token)
+
+    def test_account_extract_keeps_tokens_after_disconnect(self):
+        import internal_server
+        from app.cancel import CancelState, install_cancel, reset_cancel
+        from app import extract
+
+        def fake_run(body, login, list_workspaces, exchange):
+            return {
+                "ok": True,
+                "accessToken": "kept-access",
+                "refreshToken": "kept-refresh",
+                "password": "secret",
+            }
+
+        original = extract.run_extract
+        extract.run_extract = fake_run
+        state = CancelState()
+        state.stop.set()
+        token = install_cancel(state)
+        try:
+            status, payload = internal_server.account_extract({"email": "a@b.c", "password": "x", "totp": "y"})
+        finally:
+            reset_cancel(token)
+            extract.run_extract = original
+        self.assertEqual(status, 200)
+        self.assertEqual(payload.get("accessToken"), "kept-access")
+        self.assertEqual(payload.get("refreshToken"), "kept-refresh")
+        self.assertNotIn("password", payload)
+
+    def test_mailbox_baseline_excludes_existing_ids(self):
+        import json
+        import threading
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        from app.mailbox_callback import NestMailbox
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length") or 0)
+                body = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                if body.get("baseline"):
+                    self.wfile.write(b'{"ok":true,"ids":["old-mail"]}')
+                    return
+                excluded = set(body.get("excludeIds") or [])
+                if "old-mail" in excluded:
+                    self.wfile.write(b'{"ok":true,"id":"new-mail","code":"654321"}')
+                else:
+                    self.wfile.write(b'{"ok":true,"id":"old-mail","code":"111111"}')
+
+            def log_message(self, fmt, *args):
+                return
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            port = server.server_address[1]
+            mailbox = NestMailbox(9, "a@b.c", f"http://127.0.0.1:{port}", "token")
+            ids = mailbox.snapshot_openai_message_ids("a@b.c")
+            self.assertIn("old-mail", ids)
+            self.assertEqual(mailbox.capture_openai_baseline("a@b.c", quiet=False), ids)
+            self.assertEqual(mailbox.wait_for_verification_code("a@b.c", timeout=2), "654321")
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_reclaim_mailbox_401_cools_down_after_otp_exhausted(self):
+        from app.extract import note_reclaim_password_exhausted, set_otp_policy, reset_otp_policy
+        client = SimpleNamespace(last_oauth_error="")
+        token = set_otp_policy("reclaim")
+        try:
+            note_reclaim_password_exhausted(client, 401, object())
+            self.assertEqual(client.last_oauth_error, "invalid_username_or_password")
+            client.last_oauth_error = "email_otp_rejected_401"
+            note_reclaim_password_exhausted(client, 401, object())
+            self.assertEqual(client.last_oauth_error, "email_otp_rejected_401")
+            client.last_oauth_error = ""
+            note_reclaim_password_exhausted(client, 409, object())
+            self.assertEqual(client.last_oauth_error, "")
+            note_reclaim_password_exhausted(client, 401, None)
+            self.assertEqual(client.last_oauth_error, "")
+        finally:
+            reset_otp_policy(token)
+        fresh = SimpleNamespace(last_oauth_error="")
+        note_reclaim_password_exhausted(fresh, 401, object())
+        self.assertEqual(fresh.last_oauth_error, "")
+        with open("vendor/lib/oauth_client.py", encoding="utf-8") as handle:
+            source = handle.read()
+        self.assertGreaterEqual(source.count("note_reclaim_password_exhausted"), 2)
+
+    def test_reclaim_mint_keeps_mailbox_client(self):
+        import os
+        import sys
+        from app import mailbox_callback
+
+        captured = []
+
+        class FakeMailbox:
+            def __init__(self, account_id, email, base, token):
+                self.account_id = account_id
+
+        def fake_authorize(account, settings, workspace_id="", mail_client=None, **kwargs):
+            captured.append(mail_client)
+            return object(), {"access_token": "mint-access", "refresh_token": "mint-refresh"}
+
+        original_engine = sys.modules.get("app.engine")
+        original_mailbox = mailbox_callback.NestMailbox
+        original_token = worker.TOKEN
+        original_url = os.environ.get("PROTOCOL_MAILBOX_URL")
+        sys.modules["app.engine"] = SimpleNamespace(authorize_account=fake_authorize)
+        mailbox_callback.NestMailbox = FakeMailbox
+        worker.TOKEN = "worker-token"
+        os.environ["PROTOCOL_MAILBOX_URL"] = "http://server:3000"
+        try:
+            session = worker.real_login(
+                "a@b.c", "pw", "JBSWY3DPEHPK3PXP", "socks5://127.0.0.1:1080", 9,
+            )
+            self.assertIsInstance(session.get("mail_client"), FakeMailbox)
+            tokens = worker.mint_workspace_oauth(session, "ws-1", "socks5://127.0.0.1:1080")
+        finally:
+            mailbox_callback.NestMailbox = original_mailbox
+            worker.TOKEN = original_token
+            if original_engine is None:
+                sys.modules.pop("app.engine", None)
+            else:
+                sys.modules["app.engine"] = original_engine
+            if original_url is None:
+                os.environ.pop("PROTOCOL_MAILBOX_URL", None)
+            else:
+                os.environ["PROTOCOL_MAILBOX_URL"] = original_url
+        self.assertEqual(len(captured), 2)
+        self.assertIs(captured[1], session["mail_client"])
+        self.assertEqual(tokens.get("refresh_token"), "mint-refresh")
+        self.assertNotIn("mail_client", tokens)
+
+    def test_reclaim_otp_failure_does_not_follow_continue_url(self):
+        from app.extract import (
+            note_reclaim_otp_exhausted,
+            reclaim_follow_after_otp,
+            reset_otp_policy,
+            set_otp_policy,
+        )
+        self.assertEqual(reclaim_follow_after_otp("https://next.example/ok", "https://cont.example/otp", True), "https://next.example/ok")
+        self.assertEqual(reclaim_follow_after_otp("", "https://cont.example/otp", True), "")
+        self.assertEqual(reclaim_follow_after_otp("", "https://cont.example/consent", False), "https://cont.example/consent")
+        client = SimpleNamespace(last_oauth_error="")
+        token = set_otp_policy("reclaim")
+        try:
+            note_reclaim_otp_exhausted(client, object())
+            self.assertEqual(client.last_oauth_error, "email_otp_exhausted")
+            client.last_oauth_error = "email_otp_rejected_401"
+            note_reclaim_otp_exhausted(client, object())
+            self.assertEqual(client.last_oauth_error, "email_otp_rejected_401")
+            client.last_oauth_error = ""
+            note_reclaim_otp_exhausted(client, None)
+            self.assertEqual(client.last_oauth_error, "")
+        finally:
+            reset_otp_policy(token)
+        fresh = SimpleNamespace(last_oauth_error="")
+        note_reclaim_otp_exhausted(fresh, object())
+        self.assertEqual(fresh.last_oauth_error, "")
+        with open("vendor/lib/oauth_client.py", encoding="utf-8") as handle:
+            source = handle.read()
+        self.assertIn("reclaim_follow_after_otp(", source)
+        self.assertGreaterEqual(source.count("note_reclaim_otp_exhausted("), 2)
+        self.assertNotIn("if pwdless_continue_url:", source)
+
+    def test_reclaim_otp_rate_limit_keeps_code_and_same_page_is_not_a_next_hop(self):
+        from app.extract import preserve_login_code, reclaim_otp_next_url
+        reason = preserve_login_code("email_otp_rejected_429", "邮箱验证码被限流，请稍后重试")
+        self.assertIn("email_otp_rejected_429", reason)
+        self.assertIn("邮箱验证码被限流", reason)
+        self.assertEqual(
+            reclaim_otp_next_url(
+                "https://auth.openai.com/api/accounts/consent",
+                "https://auth.openai.com/email-verification",
+            ),
+            "https://auth.openai.com/api/accounts/consent",
+        )
+        self.assertEqual(reclaim_otp_next_url("", "https://auth.openai.com/email-verification"), "")
+        self.assertEqual(
+            reclaim_otp_next_url(
+                "https://auth.openai.com/email-verification",
+                "https://auth.openai.com/email-verification",
+            ),
+            "",
+        )
+        self.assertEqual(
+            reclaim_otp_next_url(
+                "https://auth.openai.com/email-otp/send?x=1",
+                "https://auth.openai.com/log-in",
+            ),
+            "",
+        )
+        with open("vendor/lib/oauth_client.py", encoding="utf-8") as handle:
+            source = handle.read()
+        self.assertIn("reclaim_otp_next_url(", source)
+        self.assertNotIn('return next_url or continue_url or ""', source)
+        self.assertGreaterEqual(source.count("note_reclaim_otp_exhausted("), 3)
+        with open("app/engine.py", encoding="utf-8") as handle:
+            engine = handle.read()
+        self.assertIn("preserve_login_code(", engine)
+
+    def test_reclaim_otp_send_failure_is_not_password(self):
+        from app.extract import (
+            note_reclaim_otp_send_failure,
+            note_reclaim_password_exhausted,
+            reset_otp_policy,
+            set_otp_policy,
+        )
+        client = SimpleNamespace(last_oauth_error="")
+        token = set_otp_policy("reclaim")
+        try:
+            note_reclaim_otp_send_failure(client, 500, object())
+            self.assertEqual(client.last_oauth_error, "email_otp_rejected_500")
+            note_reclaim_password_exhausted(client, 401, object())
+            self.assertEqual(client.last_oauth_error, "email_otp_rejected_500")
+            client.last_oauth_error = ""
+            note_reclaim_otp_send_failure(client, 0, object())
+            self.assertEqual(client.last_oauth_error, "email_otp_exhausted")
+            client.last_oauth_error = "email_otp_rejected_429"
+            note_reclaim_otp_send_failure(client, 500, object())
+            self.assertEqual(client.last_oauth_error, "email_otp_rejected_429")
+            client.last_oauth_error = ""
+            note_reclaim_otp_send_failure(client, 429, None)
+            self.assertEqual(client.last_oauth_error, "")
+        finally:
+            reset_otp_policy(token)
+        fresh = SimpleNamespace(last_oauth_error="")
+        note_reclaim_otp_send_failure(fresh, 500, object())
+        self.assertEqual(fresh.last_oauth_error, "")
+        with open("vendor/lib/oauth_client.py", encoding="utf-8") as handle:
+            source = handle.read()
+        self.assertGreaterEqual(source.count("note_reclaim_otp_send_failure("), 2)
+
+    def test_success_keeps_tokens_when_cancelled(self):
+        from app.cancel import CancelState, install_cancel, reset_cancel
+        from app.extract import success
+        state = CancelState()
+        state.stop.set()
+        token = install_cancel(state)
+        try:
+            result = success(
+                {"access_token": "kept-access", "refresh_token": "kept-refresh", "id_token": "kept-id"},
+                {},
+                None,
+                "a@b.c",
+            )
+        finally:
+            reset_cancel(token)
+        self.assertTrue(result.get("ok"))
+        self.assertEqual(result.get("accessToken"), "kept-access")
+        self.assertEqual(result.get("refreshToken"), "kept-refresh")
 
 
 if __name__ == "__main__":

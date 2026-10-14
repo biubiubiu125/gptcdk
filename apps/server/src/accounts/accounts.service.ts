@@ -23,6 +23,7 @@ import { credentialMatchesSellerTag, looksLikeLoginImport, normalizeSubscription
 import { postAccountExtract, type AccountExtractClient } from './extract-client';
 import {
   enqueueLoginImport,
+  ensureStockedEmail,
   listExtractJobs,
   pumpExtractQueue,
   recoverInterruptedExtracts,
@@ -33,11 +34,15 @@ import {
   type ExtractHost,
 } from './extract-runner';
 import { FORMAT_META, isDeliverFormat, type DeliverFormat } from '../common/error-codes';
-import { withReclaimLock } from '../public/reclaim-lock';
+
+function creditStatusOf(account: { credits: number; subscriptionTag?: string | null }): 'pending' | 'ready' {
+  return account.subscriptionTag ? 'ready' : isPendingTier(account.credits) ? 'pending' : 'ready';
+}
+import { withAccountRefreshLocks, withReclaimLock } from '../public/reclaim-lock';
 import { acceptedStagedCredential, serializeStagedCredential, stagedExpiresAt, stagedForAccount } from '../public/staged-credential';
 import { expiresAtFromJwt } from '../common/jwt-expiry';
 import { formatLoginLine } from '../common/login-line';
-import { decryptSecret, teamSecretReady } from '../team/team-crypto';
+import { decryptSecret, teamSecretReady } from '../common/secret-box';
 import { zipStored } from '../common/zip-store';
 import type { Account } from '@prisma/client';
 
@@ -58,6 +63,7 @@ const SORTABLE_FIELDS = new Set([
   'redeemStatus',
   'redeemedAt',
   'planType',
+  'subscriptionTag',
 ]);
 
 /** 「批量复制卡密」单次上限：防止一次超大筛选把内存 / 剪贴板拉爆 */
@@ -71,6 +77,11 @@ export interface AccountFilter {
   redeemStatus?: unknown;
   cardKey?: string;
   batchId?: string;
+  batchRemark?: string;
+  subscriptionTag?: unknown;
+  subscriptionTagEmpty?: unknown;
+  createdFrom?: string;
+  createdTo?: string;
   /** 卡密状态：active | disabled（后台卡密管理页使用） */
   status?: unknown;
 }
@@ -96,10 +107,6 @@ export interface AccountRow {
   accountId: string | null;
   createdAt: string;
   updatedAt: string;
-  banStatus: string;
-  banReason: string | null;
-  banKeywords: string[];
-  banCheckedAt: string | null;
   redeemStatus: string;
   redeemedAt: string | null;
   redeemCount: number;
@@ -108,11 +115,42 @@ export interface AccountRow {
   mailboxEmail: string | null;
   batchId: string | null;
   remark: string | null;
+  batchRemark: string | null;
 }
 
 type AccountWithMailbox = Account & {
   mailbox: { email: string; clientId: string | null; refreshToken: string | null } | null;
+  batch?: { remark: string | null } | null;
 };
+
+function requireBatchRemark(value: unknown): string {
+  const remark = String(value ?? '').trim();
+  if (!remark) bizError('BAD_INPUT', '请填写批次备注');
+  if (remark.length > 200) bizError('BAD_INPUT', '批次备注不能超过 200 字');
+  return remark;
+}
+
+function dayBound(value: unknown, end: boolean): Date | null {
+  const text = String(value ?? '').trim();
+  if (!text) return null;
+  if (/^\d{4}-\d{2}-\d{2}$/.test(text)) {
+    const [year, month, day] = text.split('-').map(Number);
+    const date = new Date(year, month - 1, day, end ? 23 : 0, end ? 59 : 0, end ? 59 : 0, end ? 999 : 0);
+    return Number.isNaN(date.getTime()) ? null : date;
+  }
+  const date = new Date(text);
+  return Number.isNaN(date.getTime()) ? null : date;
+}
+
+function becameSold(account: { redeemStatus?: string | null; redeemedByCard?: string | null } | null): boolean {
+  return Boolean(account && (account.redeemStatus === 'redeemed' || account.redeemedByCard));
+}
+
+function flagOn(value: unknown): boolean {
+  if (value === true || value === 1) return true;
+  const text = String(value ?? '').trim().toLowerCase();
+  return text === '1' || text === 'true' || text === 'yes';
+}
 
 @Injectable()
 export class AccountsService implements OnModuleInit, OnModuleDestroy {
@@ -168,6 +206,10 @@ export class AccountsService implements OnModuleInit, OnModuleDestroy {
     const rejected: Array<{ id: number; reason: string }> = [];
     const accepted: Array<{ id: number; planType: string | null; remoteWorkspaceId: string | null }> = [];
     for (const row of rows) {
+      if (row.redeemStatus === 'redeemed' || row.redeemedByCard) {
+        rejected.push({ id: row.id, reason: '已兑换账号不能改标记' });
+        continue;
+      }
       const proof = sellerTokenFields(tag, row.accessToken);
       if (!proof.ok) {
         rejected.push({ id: row.id, reason: proof.reason });
@@ -176,15 +218,20 @@ export class AccountsService implements OnModuleInit, OnModuleDestroy {
       accepted.push({ id: row.id, planType: proof.planType, remoteWorkspaceId: proof.remoteWorkspaceId });
     }
     if (!accepted.length) bizError('BAD_INPUT', rejected[0]?.reason || '没有可更新的账号');
-    await this.prisma.$transaction(accepted.map((item) => this.prisma.account.update({
-      where: { id: item.id },
-      data: {
-        subscriptionTag: tag,
-        planType: item.planType,
-        remoteWorkspaceId: item.remoteWorkspaceId,
-      },
-    })));
-    return { updated: accepted.length, rejected };
+    let updated = 0;
+    for (const item of accepted) {
+      const changed = await this.prisma.account.updateMany({
+        where: { id: item.id, redeemStatus: 'unredeemed', redeemedByCard: null },
+        data: {
+          subscriptionTag: tag,
+          planType: item.planType,
+          remoteWorkspaceId: item.remoteWorkspaceId,
+        },
+      });
+      if (changed.count) updated += 1;
+      else rejected.push({ id: item.id, reason: '已兑换账号不能改标记' });
+    }
+    return { updated, rejected };
   }
 
   // -------------------------------------------------------------------------
@@ -194,14 +241,46 @@ export class AccountsService implements OnModuleInit, OnModuleDestroy {
   private buildWhere(filter: AccountFilter): Prisma.AccountWhereInput {
     const and: Prisma.AccountWhereInput[] = [{ stockKind: { not: 'team' } }];
     const credits = toIntArray(filter.credits);
-    const banStatus = toStringArray(filter.banStatus);
     const redeemStatus = toStringArray(filter.redeemStatus);
     const status = toStringArray(filter.status);
 
     if (credits.length) and.push({ credits: { in: credits } });
-    if (banStatus.length) and.push({ banStatus: { in: banStatus } });
     if (redeemStatus.length) and.push({ redeemStatus: { in: redeemStatus } });
     if (filter.batchId) and.push({ batchId: filter.batchId });
+    const batchRemark = String(filter.batchRemark ?? '').trim();
+    if (batchRemark) {
+      and.push({
+        OR: [
+          { remark: { contains: batchRemark } },
+          { batch: { remark: { contains: batchRemark } } },
+        ],
+      });
+    }
+    const tags = toStringArray(filter.subscriptionTag);
+    const emptyTag = flagOn(filter.subscriptionTagEmpty);
+    if (tags.length && emptyTag) {
+      and.push({
+        OR: [
+          { subscriptionTag: { in: tags } },
+          { subscriptionTag: null },
+          { subscriptionTag: '' },
+        ],
+      });
+    } else if (tags.length) {
+      and.push({ subscriptionTag: { in: tags } });
+    } else if (emptyTag) {
+      and.push({ OR: [{ subscriptionTag: null }, { subscriptionTag: '' }] });
+    }
+    const createdFrom = dayBound(filter.createdFrom, false);
+    const createdTo = dayBound(filter.createdTo, true);
+    if (createdFrom || createdTo) {
+      and.push({
+        createdAt: {
+          ...(createdFrom ? { gte: createdFrom } : {}),
+          ...(createdTo ? { lte: createdTo } : {}),
+        },
+      });
+    }
     if (status.length) {
       const only = status.filter((item) => item === 'active' || item === 'disabled');
       if (only.length === 1) and.push({ cardDisabled: only[0] === 'disabled' });
@@ -215,6 +294,7 @@ export class AccountsService implements OnModuleInit, OnModuleDestroy {
           { email: { contains: keyword } },
           { cardKey: { contains: keyword } },
           { remark: { contains: keyword } },
+          { batch: { remark: { contains: keyword } } },
         ],
       });
     }
@@ -226,21 +306,12 @@ export class AccountsService implements OnModuleInit, OnModuleDestroy {
   }
 
   private toRow(account: AccountWithMailbox): AccountRow {
-    let banKeywords: string[] = [];
-    if (account.banKeywords) {
-      try {
-        const parsed = JSON.parse(account.banKeywords);
-        if (Array.isArray(parsed)) banKeywords = parsed.map((item) => String(item));
-      } catch {
-        banKeywords = [];
-      }
-    }
     return {
       id: account.id,
       name: account.name,
       email: account.email,
       credits: account.credits,
-      creditStatus: account.subscriptionTag ? 'ready' : isPendingTier(account.credits) ? 'pending' : 'ready',
+      creditStatus: creditStatusOf(account),
       subscriptionTag: account.subscriptionTag || null,
       cardKey: account.cardKey,
       cardDisabled: account.cardDisabled,
@@ -248,10 +319,6 @@ export class AccountsService implements OnModuleInit, OnModuleDestroy {
       accountId: account.accountId,
       createdAt: account.createdAt.toISOString(),
       updatedAt: account.updatedAt.toISOString(),
-      banStatus: account.banStatus,
-      banReason: account.banReason,
-      banKeywords,
-      banCheckedAt: account.banCheckedAt ? account.banCheckedAt.toISOString() : null,
       redeemStatus: account.redeemStatus,
       redeemedAt: account.redeemedAt ? account.redeemedAt.toISOString() : null,
       redeemCount: account.redeemCount,
@@ -260,19 +327,17 @@ export class AccountsService implements OnModuleInit, OnModuleDestroy {
       mailboxEmail: account.mailbox?.email ?? null,
       batchId: account.batchId,
       remark: account.remark,
+      batchRemark: account.batch?.remark?.trim() || account.remark?.trim() || null,
     };
   }
 
   private async computeSummary(filter: AccountFilter) {
     const base = this.buildWhere(filter);
-    const [total, unredeemed, redeemed, banned, invalid, unknown, pending, grouped] =
+    const [total, unredeemed, redeemed, pending, grouped] =
       await Promise.all([
         this.prisma.account.count({ where: base }),
         this.prisma.account.count({ where: { AND: [base, { redeemStatus: 'unredeemed' }] } }),
         this.prisma.account.count({ where: { AND: [base, { redeemStatus: 'redeemed' }] } }),
-        this.prisma.account.count({ where: { AND: [base, { banStatus: 'banned' }] } }),
-        this.prisma.account.count({ where: { AND: [base, { banStatus: 'invalid' }] } }),
-        this.prisma.account.count({ where: { AND: [base, { banStatus: 'unknown' }] } }),
         this.prisma.account.count({
           where: {
             AND: [
@@ -283,7 +348,7 @@ export class AccountsService implements OnModuleInit, OnModuleDestroy {
           },
         }),
         this.prisma.account.groupBy({
-          by: ['credits', 'redeemStatus', 'banStatus'],
+          by: ['credits', 'redeemStatus'],
           where: base,
           _count: { _all: true },
         }),
@@ -292,11 +357,11 @@ export class AccountsService implements OnModuleInit, OnModuleDestroy {
     // 档位完全由账号实际额度派生（0 = 待定档），没有手工维护的档位字典
     const byCreditsMap = new Map<
       number,
-      { credits: number; total: number; unredeemed: number; redeemed: number; banned: number }
+      { credits: number; total: number; unredeemed: number; redeemed: number }
     >();
     const ensure = (credits: number) => {
       if (!byCreditsMap.has(credits)) {
-        byCreditsMap.set(credits, { credits, total: 0, unredeemed: 0, redeemed: 0, banned: 0 });
+        byCreditsMap.set(credits, { credits, total: 0, unredeemed: 0, redeemed: 0 });
       }
       return byCreditsMap.get(credits)!;
     };
@@ -306,16 +371,12 @@ export class AccountsService implements OnModuleInit, OnModuleDestroy {
       entry.total += count;
       if (group.redeemStatus === 'redeemed') entry.redeemed += count;
       else entry.unredeemed += count;
-      if (group.banStatus === 'banned') entry.banned += count;
     }
 
     return {
       total,
       unredeemed,
       redeemed,
-      banned,
-      invalid,
-      unknown,
       /** 待定档账号数（额度还没从邮件里定出来） */
       pending,
       byCredits: [...byCreditsMap.values()].sort((a, b) => a.credits - b.credits),
@@ -346,7 +407,6 @@ export class AccountsService implements OnModuleInit, OnModuleDestroy {
         accounts: number;
         available: number;
         redeemed: number;
-        banned: number;
         disabled: number;
       }
     >();
@@ -358,7 +418,6 @@ export class AccountsService implements OnModuleInit, OnModuleDestroy {
           accounts: 0,
           available: 0,
           redeemed: 0,
-          banned: 0,
           disabled: 0,
         });
       }
@@ -370,7 +429,6 @@ export class AccountsService implements OnModuleInit, OnModuleDestroy {
       const count = group._count._all;
       entry.accounts += count;
       if (group.redeemStatus === 'redeemed') entry.redeemed += count;
-      if (group.banStatus === 'banned') entry.banned += count;
       if (group.cardDisabled) entry.disabled += count;
       const usable =
         group.redeemStatus === 'unredeemed' &&
@@ -395,16 +453,24 @@ export class AccountsService implements OnModuleInit, OnModuleDestroy {
         : 'desc';
 
     const where = this.buildWhere(query);
-    const [items, total, summary] = await Promise.all([
+    const [items, total, summary, tagRows] = await Promise.all([
       this.prisma.account.findMany({
         where,
-        include: { mailbox: { select: { email: true, clientId: true, refreshToken: true } } },
+        include: {
+          mailbox: { select: { email: true, clientId: true, refreshToken: true } },
+          batch: { select: { remark: true } },
+        },
         orderBy: [{ [sortField]: sortOrder } as Prisma.AccountOrderByWithRelationInput, { id: 'desc' }],
         skip: (page - 1) * pageSize,
         take: pageSize,
       }),
       this.prisma.account.count({ where }),
       this.computeSummary(query),
+      this.prisma.account.findMany({
+        where: { stockKind: { not: 'team' }, subscriptionTag: { not: null } },
+        distinct: ['subscriptionTag'],
+        select: { subscriptionTag: true },
+      }),
     ]);
 
     return {
@@ -413,6 +479,7 @@ export class AccountsService implements OnModuleInit, OnModuleDestroy {
       page,
       pageSize,
       summary,
+      subscriptionTags: tagRows.map((row) => row.subscriptionTag).filter((tag): tag is string => Boolean(tag)),
     };
   }
 
@@ -463,6 +530,7 @@ export class AccountsService implements OnModuleInit, OnModuleDestroy {
       }
     }
     if (!sources.length) bizError('BAD_INPUT', '请粘贴 JSON 内容或上传文件');
+    const remark = requireBatchRemark(payload?.remark);
     const subscriptionTag = normalizeSubscriptionTag(payload?.subscriptionTag);
     if (!subscriptionTag) bizError('BAD_INPUT', '请选择订阅标记');
 
@@ -513,7 +581,7 @@ export class AccountsService implements OnModuleInit, OnModuleDestroy {
         keyGroups,
         keyLength,
         source,
-        remark: payload?.remark,
+        remark,
       });
     }
     if (!parsedItems.length) {
@@ -591,7 +659,7 @@ export class AccountsService implements OnModuleInit, OnModuleDestroy {
         batchId,
         credits: PENDING_TIER,
         count: 0,
-        remark: payload?.remark || null,
+        remark,
         source,
         subscriptionTag,
         createdAt: now,
@@ -611,7 +679,8 @@ export class AccountsService implements OnModuleInit, OnModuleDestroy {
       }
       try {
         const cardKey = await this.uniqueCardKey(prefix, keyGroups, keyLength);
-        const created = await this.prisma.account.create({
+        const created = await this.prisma.$transaction(async (tx) => {
+          const row = await tx.account.create({
           data: {
             name: account.name,
             email: account.email || account.mailbox?.email || null,
@@ -632,7 +701,7 @@ export class AccountsService implements OnModuleInit, OnModuleDestroy {
             banStatus: 'unknown',
             redeemStatus: 'unredeemed',
             batchId,
-            remark: payload?.remark || null,
+            remark,
             mailbox: account.mailbox?.email
               ? {
                   create: {
@@ -649,6 +718,9 @@ export class AccountsService implements OnModuleInit, OnModuleDestroy {
                 }
               : undefined,
           },
+          });
+          await ensureStockedEmail(tx, row.email);
+          return row;
         });
         imported++;
         cards.push(cardKey);
@@ -732,15 +804,6 @@ export class AccountsService implements OnModuleInit, OnModuleDestroy {
       if (!Number.isFinite(credits) || credits < 0) bizError('BAD_INPUT', '额度必须是非负整数（0 = 待定档）');
       data.credits = Math.trunc(credits);
     }
-    if (patch.banStatus !== undefined) {
-      const status = String(patch.banStatus);
-      if (!['unknown', 'normal', 'banned', 'invalid'].includes(status)) {
-        bizError('BAD_INPUT', `不支持的封禁状态：${status}`);
-      }
-      data.banStatus = status;
-      data.banCheckedAt = new Date();
-      data.banReason = status === 'banned' ? String(patch.banReason || '管理员手动标记') : null;
-    }
     if (patch.redeemStatus !== undefined) {
       const status = String(patch.redeemStatus);
       if (!['unredeemed', 'redeemed'].includes(status)) {
@@ -751,6 +814,7 @@ export class AccountsService implements OnModuleInit, OnModuleDestroy {
       if (status === 'redeemed' && !current.redeemedByCard) data.redeemedByCard = current.cardKey;
     }
 
+    if (!Object.keys(data).length) return this.toRow(await this.getById(id, true));
     const changed = await this.prisma.account.updateMany({
       where: { id, ...(data.redeemStatus === 'unredeemed' ? { redeemedByCard: null } : {}) },
       data,
@@ -759,11 +823,31 @@ export class AccountsService implements OnModuleInit, OnModuleDestroy {
     return this.toRow(await this.getById(id, true));
   }
 
-  async batchDelete(ids: number[]) {
+  async batchDelete(ids: number[], confirmRedeemed = false) {
     const list = (ids || []).map((id) => Number(id)).filter((id) => Number.isFinite(id));
     if (!list.length) bizError('BAD_INPUT', '请选择要删除的账号');
-    const result = await this.prisma.account.deleteMany({ where: { id: { in: list } } });
-    return { deleted: result.count };
+    const rows = await this.prisma.account.findMany({
+      where: { id: { in: list } },
+      select: { redeemStatus: true, redeemedByCard: true },
+    });
+    const redeemed = rows.filter((row) => row.redeemStatus === 'redeemed' || row.redeemedByCard).length;
+    if (redeemed && !confirmRedeemed) {
+      bizError('CONFLICT', `选中包含 ${redeemed} 个已兑换账号，未删除。确认后才会连已兑换一起删除`, 409, { redeemed });
+    }
+    const victimWhere = confirmRedeemed
+      ? { id: { in: list } }
+      : { id: { in: list }, redeemStatus: { not: 'redeemed' }, redeemedByCard: null };
+    const deleted = await this.prisma.$transaction(async (tx) => {
+      const victims = await tx.account.findMany({
+        where: victimWhere,
+        select: { email: true },
+      });
+      for (const victim of victims) await ensureStockedEmail(tx, victim.email);
+      const result = await tx.account.deleteMany({ where: victimWhere });
+      return result.count;
+    });
+    const kept = await this.prisma.account.count({ where: { id: { in: list } } });
+    return { deleted, redeemed, kept };
   }
 
   async copyCard(id: number) {
@@ -1050,10 +1134,10 @@ export class AccountsService implements OnModuleInit, OnModuleDestroy {
   }
 
   /**
-   * 取件（后台侧）：一次取件同时产出「封禁状态」和「额度档位」。
+   * 取件（后台侧）：额度只认邮件命中的关键字。
    *
-   * 额度只认邮件命中的关键字，命中即写回 `Account.credits`（档位 = 命中 credits ÷ 25）；
-   * 没有命中就保持原值（导入时为 0 = 待定档），不会覆盖已有档位。
+   * 未标记账号命中后写回 `Account.credits`（档位 = 命中 credits ÷ 25）。
+   * 已有订阅标记的账号按标记售卖，不写额度。没命中不覆盖已有档位。不写封禁字段。
    */
   private async pickupAccount(
     account: Account & { mailbox?: any },
@@ -1082,14 +1166,6 @@ export class AccountsService implements OnModuleInit, OnModuleDestroy {
           result.error || '',
         );
       if (invalid) {
-        await this.prisma.account.update({
-          where: { id: account.id },
-          data: {
-            banStatus: 'invalid',
-            banReason: result.error,
-            banCheckedAt: new Date(),
-          },
-        });
         return {
           ok: false,
           banStatus: 'invalid',
@@ -1100,11 +1176,6 @@ export class AccountsService implements OnModuleInit, OnModuleDestroy {
           error: null,
         };
       }
-      // 网络/上游问题：保持原状态
-      await this.prisma.account.update({
-        where: { id: account.id },
-        data: { banReason: result.error, banCheckedAt: new Date() },
-      });
       return {
         ok: false,
         banStatus: account.banStatus,
@@ -1118,18 +1189,7 @@ export class AccountsService implements OnModuleInit, OnModuleDestroy {
 
     const banStatus = result.banned ? 'banned' : 'normal';
     const banReason = result.banned ? result.banReason : null;
-    // 命中额度 → 自动定档（待定档 0 表示还没定出来）
     const tier = tierFromMailCredits(result.credits);
-
-    await this.prisma.account.update({
-      where: { id: account.id },
-      data: {
-        banStatus,
-        banReason,
-        banKeywords: result.banned ? JSON.stringify(result.banKeywords) : null,
-        banCheckedAt: new Date(),
-      },
-    });
     await this.prisma.pickupLog.create({
       data: {
         accountId: account.id,
@@ -1141,6 +1201,17 @@ export class AccountsService implements OnModuleInit, OnModuleDestroy {
         error: null,
       },
     });
+
+    const tag = String(account.subscriptionTag || '').trim();
+    if (tier > PENDING_TIER && !tag) {
+      await this.prisma.account.updateMany({
+        where: {
+          id: account.id,
+          OR: [{ subscriptionTag: null }, { subscriptionTag: '' }],
+        },
+        data: { credits: tier },
+      });
+    }
 
     this.logger.log(
       `取件定档 #${account.id} ${account.name}：邮件命中 ${result.credits ?? '无'} credits → 档位 ${
@@ -1181,10 +1252,57 @@ export class AccountsService implements OnModuleInit, OnModuleDestroy {
   }> {
     let account = await this.prisma.account.findUnique({ where: { id: accountId } });
     if (!account) return { redeemStatus: 'unredeemed', redeemedAt: null, error: '账号不存在' };
+    if (account.redeemStatus === 'redeemed' || account.redeemedByCard) {
+      const blocked = (error: string | null = null) => ({
+        redeemStatus: account!.redeemStatus,
+        redeemedAt: account!.redeemedAt?.toISOString() || null,
+        error,
+      });
+      let expiresAt = account.expiresAt?.getTime();
+      if (!Number.isFinite(expiresAt)) {
+        try {
+          const claims = JSON.parse(Buffer.from(account.accessToken.split('.')[1], 'base64url').toString());
+          if (Number.isFinite(claims.exp)) expiresAt = claims.exp * 1000;
+        } catch {
+          expiresAt = undefined;
+        }
+      }
+      if (Number.isFinite(expiresAt) && expiresAt! <= Date.now()) return blocked('已兑换账号不在后台轮换凭据');
+      return blocked();
+    }
+    return withAccountRefreshLocks(this.prisma, [account.id], () => this.refreshUnsoldAccount(accountId));
+  }
+
+  /** 未兑换账号的暂存提交和 OpenAI 轮换都在账号锁内完成，其他卡要等写回后再领取。 */
+  private async refreshUnsoldAccount(accountId: number) {
+    let account = await this.prisma.account.findUnique({ where: { id: accountId } });
+    if (!account) return { redeemStatus: 'unredeemed', redeemedAt: null, error: '账号不存在' };
+    if (account.redeemStatus === 'redeemed' || account.redeemedByCard) {
+      let expiresAt = account.expiresAt?.getTime();
+      if (!Number.isFinite(expiresAt)) {
+        try {
+          const claims = JSON.parse(Buffer.from(account.accessToken.split('.')[1], 'base64url').toString());
+          if (Number.isFinite(claims.exp)) expiresAt = claims.exp * 1000;
+        } catch {
+          expiresAt = undefined;
+        }
+      }
+      return {
+        redeemStatus: account.redeemStatus,
+        redeemedAt: account.redeemedAt?.toISOString() || null,
+        error: Number.isFinite(expiresAt) && expiresAt! <= Date.now() ? '已兑换账号不在后台轮换凭据' : null,
+      };
+    }
     const staged = stagedForAccount(account);
+    const unsold = (refreshToken: string) => ({
+      id: account.id,
+      refreshToken,
+      redeemStatus: 'unredeemed' as const,
+      redeemedByCard: null,
+    });
     if (staged && account.refreshToken && !acceptedStagedCredential(account)) {
       await this.prisma.account.updateMany({
-        where: { id: account.id, refreshToken: account.refreshToken },
+        where: unsold(account.refreshToken),
         data: { stagedCredential: null },
       });
     } else if (staged && account.refreshToken) {
@@ -1193,7 +1311,7 @@ export class AccountsService implements OnModuleInit, OnModuleDestroy {
         where: { redeemedByCard: owner, refreshHeld: true },
       });
       const applied = await this.prisma.account.updateMany({
-        where: { id: account.id, refreshToken: account.refreshToken },
+        where: unsold(account.refreshToken),
         data: {
           accessToken: staged.accessToken,
           refreshToken: staged.refreshToken,
@@ -1204,14 +1322,22 @@ export class AccountsService implements OnModuleInit, OnModuleDestroy {
         },
       });
       if (!applied.count) {
+        const current = await this.prisma.account.findUnique({ where: { id: accountId } });
         return {
-          redeemStatus: account.redeemStatus,
-          redeemedAt: account.redeemedAt?.toISOString() || null,
-          error: '凭据已被其他操作更新，未写入',
+          redeemStatus: current?.redeemStatus || account.redeemStatus,
+          redeemedAt: (current?.redeemedAt || account.redeemedAt)?.toISOString() || null,
+          error: becameSold(current) ? '已兑换账号不在后台轮换凭据' : '凭据已被其他操作更新，未写入',
         };
       }
       account = await this.prisma.account.findUnique({ where: { id: accountId } });
       if (!account) return { redeemStatus: 'unredeemed', redeemedAt: null, error: '账号不存在' };
+      if (becameSold(account)) {
+        return {
+          redeemStatus: account.redeemStatus,
+          redeemedAt: account.redeemedAt?.toISOString() || null,
+          error: '已兑换账号不在后台轮换凭据',
+        };
+      }
     }
     const result = (
       error: string | null = null,
@@ -1236,14 +1362,49 @@ export class AccountsService implements OnModuleInit, OnModuleDestroy {
 
     // MailCredential.refreshToken 属于微软 OAuth，绝不能发送给 OpenAI。
     if (!account.refreshToken) return result('缺少 OpenAI refresh_token，无法刷新过期凭据');
+    return this.refreshUnsoldOpenAiToken(account, unsold);
+  }
+
+  /** 持有账号锁后再读库、请求 OpenAI 和写回，避免其他卡在轮换期间把旧凭据领走。 */
+  private async refreshUnsoldOpenAiToken(
+    account: Account,
+    unsold: (refreshToken: string) => { id: number; refreshToken: string; redeemStatus: 'unredeemed'; redeemedByCard: null },
+  ) {
+    const result = (
+      error: string | null = null,
+      unsavedCredential: { accessToken: string; refreshToken: string; idToken: string | null; expiresAt: string | null } | null = null,
+    ) => ({
+      redeemStatus: account.redeemStatus,
+      redeemedAt: account.redeemedAt?.toISOString() || null,
+      error,
+      unsavedCredential,
+    });
+    const latest = await this.prisma.account.findUnique({ where: { id: account.id } });
+    if (!latest) return { redeemStatus: 'unredeemed', redeemedAt: null, error: '账号不存在' };
+    if (becameSold(latest) || latest.refreshToken !== account.refreshToken) {
+      account = latest;
+      return result(becameSold(latest) ? '已兑换账号不在后台轮换凭据' : '凭据已被其他操作更新，未写入');
+    }
     const previousRefreshToken = account.refreshToken;
     const refreshed = await this.mailbox.refreshOpenAiToken(previousRefreshToken);
     if (!refreshed.ok) {
       if (refreshed.invalidCredential) {
-        await this.prisma.account.updateMany({
-          where: { id: account.id, refreshToken: previousRefreshToken, banStatus: { not: 'banned' } },
-          data: { banStatus: 'invalid', banReason: refreshed.error, banCheckedAt: new Date() },
+        const disabled = await this.prisma.account.updateMany({
+          where: { ...unsold(previousRefreshToken), banStatus: { not: 'banned' } },
+          data: {
+            cardDisabled: true,
+            banStatus: 'invalid',
+            banReason: refreshed.error,
+            banCheckedAt: new Date(),
+          },
         });
+        if (!disabled.count) {
+          const current = await this.prisma.account.findUnique({ where: { id: account.id } });
+          if (becameSold(current)) {
+            account = current!;
+            return result('已兑换账号不在后台轮换凭据');
+          }
+        }
       }
       return result(refreshed.error || '刷新失败');
     }
@@ -1261,7 +1422,7 @@ export class AccountsService implements OnModuleInit, OnModuleDestroy {
     for (let attempt = 0; attempt < 2 && !persisted && !stagedAside; attempt += 1) {
       try {
         const changed = await this.prisma.account.updateMany({
-          where: { id: account.id, refreshToken: previousRefreshToken },
+          where: unsold(previousRefreshToken),
           data: {
             accessToken: nextAccessToken,
             refreshToken: nextRefreshToken,
@@ -1279,15 +1440,19 @@ export class AccountsService implements OnModuleInit, OnModuleDestroy {
       }
       try {
         const current = await this.prisma.account.findUnique({ where: { id: account.id } });
-        if (current?.refreshToken === nextRefreshToken && current.accessToken === nextAccessToken) {
+        if (current?.refreshToken === nextRefreshToken && current.accessToken === nextAccessToken && !becameSold(current)) {
           persisted = true;
           break;
+        }
+        if (becameSold(current)) {
+          account = current!;
+          return result('已兑换账号不在后台轮换凭据');
         }
         if (current?.refreshToken !== previousRefreshToken) {
           return result('凭据已被其他操作更新，未写入');
         }
         const saved = await this.prisma.account.updateMany({
-          where: { id: account.id, refreshToken: previousRefreshToken },
+          where: unsold(previousRefreshToken),
           data: {
             stagedCredential: serializeStagedCredential({
               accessToken: nextAccessToken,
@@ -1298,6 +1463,16 @@ export class AccountsService implements OnModuleInit, OnModuleDestroy {
             }),
           },
         });
+        if (!saved.count) {
+          const after = await this.prisma.account.findUnique({ where: { id: account.id } });
+          if (becameSold(after)) {
+            account = after!;
+            return result('已兑换账号不在后台轮换凭据');
+          }
+          if (after?.refreshToken !== previousRefreshToken) {
+            return result('凭据已被其他操作更新，未写入');
+          }
+        }
         if (saved.count) stagedAside = true;
       } catch {
         // 暂存也失败就再试一次，仍然不请求 OpenAI。
@@ -1333,15 +1508,18 @@ export class AccountsService implements OnModuleInit, OnModuleDestroy {
     /** 只处理 id > cursor 的账号（配合响应里的 nextCursor 循环调用） */
     cursor?: number;
   }) {
-    const targets = toStringArray(payload?.targets).filter(
+    const requestedTargets = toStringArray(payload?.targets).filter(
       (item) => item === 'ban' || item === 'redeem' || item === 'credits',
     );
-    const effectiveTargets = targets.length ? targets : ['ban', 'redeem'];
+    const effectiveTargets = (requestedTargets.length ? requestedTargets : ['redeem']).filter((item) => item !== 'ban');
     const limit = Math.min(500, Math.max(1, toPositiveInt(payload?.limit, 100)));
     const ids = (payload?.ids || []).map((id) => Number(id)).filter((id) => Number.isFinite(id));
     const cursor = Number(payload?.cursor);
     const hasCursor = Number.isFinite(cursor) && cursor > 0;
-    const needPickup = effectiveTargets.includes('ban') || effectiveTargets.includes('credits');
+    const needPickup = effectiveTargets.includes('credits');
+    if (!effectiveTargets.length) {
+      return { requested: 0, processed: 0, nextCursor: null, items: [] };
+    }
 
     const base = ids.length ? { id: { in: ids } } : this.buildWhere(payload?.filter || {});
     const where = hasCursor ? { AND: [base, { id: { gt: cursor } }] } : base;
@@ -1364,7 +1542,7 @@ export class AccountsService implements OnModuleInit, OnModuleDestroy {
         banStatus: account.banStatus,
         banReason: account.banReason,
         credits: account.credits,
-        creditStatus: isPendingTier(account.credits) ? 'pending' : 'ready',
+        creditStatus: creditStatusOf(account),
         redeemStatus: account.redeemStatus,
         redeemedAt: account.redeemedAt ? account.redeemedAt.toISOString() : null,
         error: null,
@@ -1402,11 +1580,11 @@ export class AccountsService implements OnModuleInit, OnModuleDestroy {
               // 取件本身失败（凭据失效 / 网络）：不是「没收到额度邮件」，单独计数
               creditsCounter.failed++;
               entry.credits = account.credits;
-              entry.creditStatus = isPendingTier(account.credits) ? 'pending' : 'ready';
+              entry.creditStatus = creditStatusOf(account);
             } else {
               creditsCounter.pending++;
               entry.credits = account.credits;
-              entry.creditStatus = isPendingTier(account.credits) ? 'pending' : 'ready';
+              entry.creditStatus = creditStatusOf(account);
             }
           }
         } catch (error) {
@@ -1441,7 +1619,7 @@ export class AccountsService implements OnModuleInit, OnModuleDestroy {
           redeemStatus: fresh.redeemStatus,
           redeemedAt: fresh.redeemedAt?.toISOString() || null,
           credits: fresh.credits,
-          creditStatus: isPendingTier(fresh.credits) ? 'pending' : 'ready',
+          creditStatus: creditStatusOf(fresh),
         });
       }
       if (effectiveTargets.includes('ban')) {
@@ -1515,19 +1693,6 @@ export class AccountsService implements OnModuleInit, OnModuleDestroy {
           error: pickup.error,
         },
       });
-      if (pickup.ok) {
-        // 取件即定档：邮件命中额度关键字 → 写回账号档位（0 表示仍未命中）
-        const tier = tierFromMailCredits(pickup.credits);
-        await this.prisma.account.update({
-          where: { id: account.id },
-          data: {
-            banStatus: pickup.banned ? 'banned' : 'normal',
-            banReason: pickup.banned ? pickup.banReason : null,
-            banKeywords: pickup.banned ? JSON.stringify(pickup.banKeywords) : null,
-            banCheckedAt: new Date(),
-          },
-        });
-      }
     }
 
     const fresh = await this.prisma.account.findUnique({
@@ -1700,9 +1865,6 @@ export class AccountsService implements OnModuleInit, OnModuleDestroy {
         total: summary.total,
         unredeemed: summary.unredeemed,
         redeemed: summary.redeemed,
-        banned: summary.banned,
-        invalid: summary.invalid,
-        unknown: summary.unknown,
         pending: summary.pending,
       },
       cards: {

@@ -690,7 +690,9 @@ class OAuthClient:
                 self._log(f"/password/verify(重试) -> {r.status_code}")
 
             if r.status_code in (401, 409):
-                from app.extract import note_password_verify_failure
+                from app.extract import note_password_verify_failure, note_reclaim_bare_401
+                if note_reclaim_bare_401(self, r.status_code, mail_client):
+                    return None
                 if note_password_verify_failure(self, r.status_code, mail_client):
                     return None
                 if r.status_code == 401 and mail_client is not None:
@@ -767,6 +769,8 @@ class OAuthClient:
                         return tokens
             
             if r.status_code != 200:
+                from app.extract import note_reclaim_password_exhausted
+                note_reclaim_password_exhausted(self, r.status_code, mail_client)
                 self._log(f"密码验证失败: {r.text[:180]}")
                 return None
             
@@ -1895,6 +1899,8 @@ class OAuthClient:
                         )
                     )
                     if not next_url:
+                        from app.extract import note_reclaim_otp_exhausted
+                        note_reclaim_otp_exhausted(self, mail_client)
                         return _failure(
                             self.last_oauth_error
                             or "email_otp_verification_failed",
@@ -2481,7 +2487,9 @@ class OAuthClient:
             self._log(f"log-in password/verify -> {getattr(resp_pwd, 'status_code', 0)}")
             if getattr(resp_pwd, "status_code", 0) != 200:
                 self._log(f"log-in password/verify 失败: {getattr(resp_pwd, 'text', '')[:160]}")
-                from app.extract import note_password_verify_failure
+                from app.extract import note_password_verify_failure, note_reclaim_bare_401
+                if note_reclaim_bare_401(self, getattr(resp_pwd, "status_code", 0), mail_client):
+                    return ""
                 if note_password_verify_failure(self, getattr(resp_pwd, "status_code", 0), mail_client):
                     return ""
                 if getattr(resp_pwd, "status_code", 0) == 401 and mail_client:
@@ -2520,7 +2528,10 @@ class OAuthClient:
                             pwdless_continue_url = self._normalize_continue_url(self._extract_continue_url_from_json(pwdless_data), password_page_url)
                             pwdless_page_type = str(((pwdless_data.get("page") or {}) if isinstance(pwdless_data, dict) else {}).get("type") or "").strip()
                             pwdless_low = (pwdless_continue_url or "").lower()
+                            otp_attempted = False
+                            next_url = ""
                             if pwdless_page_type.lower() in {"email_otp_verification", "contact_verification"} or "email-verification" in pwdless_low or "email-otp" in pwdless_low:
+                                otp_attempted = True
                                 next_url = self._oauth_complete_email_otp_for_continue(
                                     email=email,
                                     device_id=device_id,
@@ -2532,12 +2543,21 @@ class OAuthClient:
                                     page_type=pwdless_page_type,
                                     baseline_message_ids=baseline_ids,
                                 )
-                                if next_url:
-                                    return next_url
-                            if pwdless_continue_url:
-                                return pwdless_continue_url
+                            from app.extract import note_reclaim_otp_exhausted, reclaim_follow_after_otp
+                            followed = reclaim_follow_after_otp(next_url, pwdless_continue_url, otp_attempted)
+                            if followed:
+                                return followed
+                            if otp_attempted:
+                                note_reclaim_otp_exhausted(self, mail_client)
+                        else:
+                            from app.extract import note_reclaim_otp_send_failure
+                            note_reclaim_otp_send_failure(self, getattr(resp_pwdless, "status_code", 0), mail_client)
                     except Exception as exc:
                         self._log(f"log-in passwordless/send-otp 异常: {type(exc).__name__}")
+                        from app.extract import note_reclaim_otp_send_failure
+                        note_reclaim_otp_send_failure(self, 0, mail_client)
+                from app.extract import note_reclaim_password_exhausted
+                note_reclaim_password_exhausted(self, getattr(resp_pwd, "status_code", 0), mail_client)
                 return ""
             try:
                 data = resp_pwd.json()
@@ -2570,7 +2590,7 @@ class OAuthClient:
                     baseline_ids = set(mail_client.snapshot_openai_message_ids(email) or set())
                 except Exception:
                     baseline_ids = set()
-            return self._oauth_complete_email_otp_for_continue(
+            completed = self._oauth_complete_email_otp_for_continue(
                 email=email,
                 device_id=device_id,
                 user_agent=user_agent,
@@ -2581,6 +2601,11 @@ class OAuthClient:
                 page_type=page_type,
                 baseline_message_ids=baseline_ids,
             )
+            if completed:
+                return completed
+            from app.extract import note_reclaim_otp_exhausted
+            note_reclaim_otp_exhausted(self, mail_client)
+            return ""
 
         if ("add_phone" in page_low or "phone" in page_low or "add-phone" in url_low or "phone-verification" in url_low):
             return self._oauth_complete_add_phone_for_continue(email, device_id, user_agent, impersonate, sms_client, continue_url or current_url)
@@ -2791,7 +2816,8 @@ class OAuthClient:
                     current_url=next_url or continue_url,
                     response_data=data,
                 )
-            return next_url or continue_url or ""
+            from app.extract import reclaim_otp_next_url
+            return reclaim_otp_next_url(next_url, continue_url)
         self._log(f"log-in OTP 验证失败，已尝试 {attempt} 个 6 位验证码")
         return ""
 

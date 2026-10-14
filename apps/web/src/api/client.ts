@@ -343,8 +343,8 @@ export function redeemCards(payload: RedeemRequest): Promise<RedeemResponse> {
 }
 
 /** `POST /api/public/reclaim` */
-export function reclaimCards(payload: ReclaimRequest): Promise<RedeemResponse> {
-  return request<RedeemResponse>('/public/reclaim', { method: 'POST', body: payload });
+export function reclaimCards(payload: ReclaimRequest, signal?: AbortSignal): Promise<RedeemResponse> {
+  return request<RedeemResponse>('/public/reclaim', { method: 'POST', body: payload, signal });
 }
 
 /** `POST /api/public/pickup/resolve` */
@@ -400,8 +400,12 @@ export function listAccounts(query: AccountListQuery = {}): Promise<AccountListR
       pageSize: query.pageSize,
       keyword: query.keyword,
       credits: query.credits,
-      banStatus: query.banStatus,
       redeemStatus: query.redeemStatus,
+      batchRemark: query.batchRemark,
+      subscriptionTag: query.subscriptionTag,
+      subscriptionTagEmpty: query.subscriptionTagEmpty ? 'true' : undefined,
+      createdFrom: query.createdFrom,
+      createdTo: query.createdTo,
       cardKey: query.cardKey,
       sortField: query.sortField,
       sortOrder: query.sortOrder,
@@ -418,8 +422,8 @@ export function importAccounts(payload: ImportRequest): Promise<ImportResponse> 
   return request<ImportResponse>('/admin/accounts/import', { method: 'POST', body: payload });
 }
 
-export function listExtractJobs(): Promise<{ items: ExtractJobRow[] }> {
-  return request('/admin/accounts/extract-jobs');
+export function listExtractJobs(batchId?: string): Promise<{ items: ExtractJobRow[] }> {
+  return request('/admin/accounts/extract-jobs', { query: batchId ? { batchId } : undefined });
 }
 
 export function extractProxyReady(): Promise<{ ready: boolean }> {
@@ -448,8 +452,8 @@ export function updateAccount(id: number, payload: UpdateAccountRequest): Promis
 }
 
 /** `POST /api/admin/accounts/batch-delete` */
-export function batchDeleteAccounts(ids: number[]): Promise<BatchDeleteAccountsResponse> {
-  const payload: BatchDeleteAccountsRequest = { ids };
+export function batchDeleteAccounts(ids: number[], confirmRedeemed = false): Promise<BatchDeleteAccountsResponse> {
+  const payload: BatchDeleteAccountsRequest = { ids, confirmRedeemed };
   return request<BatchDeleteAccountsResponse>('/admin/accounts/batch-delete', {
     method: 'POST',
     body: payload,
@@ -593,135 +597,4 @@ export const MAIL_CREDITS_PER_TIER = 25;
 export function formatTierLabel(credits: number | null | undefined): string {
   const value = Number(credits);
   return !Number.isFinite(value) || value <= 0 ? '待定档' : `${Math.trunc(value)} 额度`;
-}
-
-export interface TeamWorkspaceRow {
-  id: number;
-  email: string | null;
-  displayName: string | null;
-  workspaceId: string | null;
-  sessionStatus: string;
-  lastSuccessAt: string | null;
-  lastError: string | null;
-  hasSocks: boolean;
-  seatsEntitled: number | null;
-  memberCount: number | null;
-  emptySeats: number | null;
-  snapshotComplete: boolean;
-  canAutoRenew?: boolean;
-  willRenew?: boolean | null;
-  activeUntil?: string | null;
-  subscriptionRead?: boolean | null;
-  inviteHold?: string | null;
-}
-
-export interface TeamMemberRow {
-  id: number;
-  email: string | null;
-  cardKey: string | null;
-  teamStatus: string | null;
-  redeemStatus: string | null;
-  userId: string | null;
-  priorUserId?: string | null;
-  priorRemoteWorkspaceId?: string | null;
-  workspaceId: number | null;
-  usage: { label: string; pct5h: number | null; pct7d: number | null; reset5h?: number | null; reset7d?: number | null };
-}
-
-export function getTeamStatus(): Promise<{ secretReady: boolean; workerReady: boolean }> {
-  return request('/admin/team/status');
-}
-
-export function listTeamWorkspaces(): Promise<{ items: TeamWorkspaceRow[] }> {
-  return request('/admin/team/workspaces');
-}
-
-export function createTeamWorkspace(body: { session: string; socks?: string; workspaceId?: string }): Promise<unknown> {
-  return request('/admin/team/workspaces', { method: 'POST', body });
-}
-
-export function updateTeamWorkspace(id: number, body: { session?: string; socks?: string; workspaceId?: string }): Promise<unknown> {
-  return request(`/admin/team/workspaces/${id}`, { method: 'PATCH', body });
-}
-
-export function revealTeamSession(id: number): Promise<{ session: string }> {
-  return request(`/admin/team/workspaces/${id}/session`);
-}
-
-export function previewTeamSession(id: number): Promise<{ id: number; email: string; preview: string; canAutoRenew: boolean }> {
-  return request(`/admin/team/workspaces/${id}/session-preview`);
-}
-
-export interface RemoteMemberRow {
-  key: string;
-  workspaceRowId: number;
-  workspaceName: string;
-  motherEmail: string;
-  snapshotComplete: boolean;
-  id: string;
-  email: string;
-  role: string;
-  cardKey: string;
-  redeemStatus: string;
-  local: boolean;
-}
-
-export function listTeamMembers(): Promise<{ items: TeamMemberRow[] }> {
-  return request('/admin/team/members');
-}
-
-export function listRemoteMembers(): Promise<{ items: RemoteMemberRow[] }> {
-  return request('/admin/team/remote-members');
-}
-
-export function refreshTeam(workspaceId: number): Promise<{ ok?: boolean; message?: string }> {
-  return request(`/admin/team/workspaces/${workspaceId}/refresh`, { method: 'POST' });
-}
-
-export function kickSelectedTeam(workspaceId: number, userIds: string[]): Promise<{ ok?: boolean; message?: string }> {
-  return request(`/admin/team/workspaces/${workspaceId}/kick-selected`, { method: 'POST', body: { confirm: '踢出选中', userIds } });
-}
-
-export function listTeamWaiting(): Promise<{ items: Array<{ id: number; cardKey: string | null; email: string | null; teamStatus: string | null }> }> {
-  return request('/admin/team/waiting');
-}
-
-export function listTeamJobs(): Promise<{ items: Array<{ id: number; workspaceRowId: number; kind: string; status: string; message: string; createdAt: string }> }> {
-  return request('/admin/team/jobs');
-}
-
-export function importTeamLines(text: string): Promise<{ created: Array<{ email: string; cardKey: string }>; errors: string[]; assignError?: string }> {
-  return request('/admin/team/import', { method: 'POST', body: { text } });
-}
-
-export function revealChildSecret(id: number): Promise<{ email: string; password: string; totp: string; socks?: string }> {
-  return request(`/admin/team/children/${id}/secret`);
-}
-
-export function patchChildProxy(id: number, socks: string): Promise<unknown> {
-  return request(`/admin/team/children/${id}/proxy`, { method: 'PATCH', body: { socks } });
-}
-
-export function assignTeam(workspaceId: number): Promise<unknown> {
-  return request(`/admin/team/workspaces/${workspaceId}/assign`, { method: 'POST' });
-}
-
-export function probeTeam(workspaceId: number): Promise<unknown> {
-  return request(`/admin/team/workspaces/${workspaceId}/probe`, { method: 'POST' });
-}
-
-export function kickTeamMember(accountId: number): Promise<unknown> {
-  return request(`/admin/team/children/${accountId}/kick`, { method: 'POST' });
-}
-
-export function previewKickAllTeam(workspaceId: number): Promise<{ userIds: string[]; members: Array<{ id: string; email: string; role: string; cardKey?: string; redeemStatus?: string }> }> {
-  return request(`/admin/team/workspaces/${workspaceId}/kick-preview`);
-}
-
-export function kickAllTeam(workspaceId: number, userIds: string[]): Promise<unknown> {
-  return request(`/admin/team/workspaces/${workspaceId}/kick-all`, { method: 'POST', body: { confirm: '退出全部', userIds } });
-}
-
-export function revokeTeamInvites(workspaceId: number): Promise<unknown> {
-  return request(`/admin/team/workspaces/${workspaceId}/revoke-invites`, { method: 'POST' });
 }

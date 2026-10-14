@@ -11,6 +11,7 @@ import {
 } from '../common/utils';
 import { MailAnalyzerService } from './mail-analyzer.service';
 import { expiresAtFromJwt } from '../common/jwt-expiry';
+import { refreshSessionEnded } from '../common/subscription';
 import type {
   MailMessage,
   MailboxCredential,
@@ -37,10 +38,14 @@ const INVALID_CREDENTIAL_CODES = [
   'interaction_required',
 ];
 
+export const RECLAIM_MAILBOX_BUDGET_MS = 40_000;
+
 export interface PickupOptions {
   maxMessages?: number;
   timeoutMs?: number;
   query?: string;
+  /** 换 token 耗掉的时间从同一次拉信预算里扣掉。管理员取件不传。 */
+  sharedDeadline?: boolean;
 }
 
 @Injectable()
@@ -219,50 +224,76 @@ export class MailboxService {
   // 取件
   // -------------------------------------------------------------------------
 
+  private nextMessageUrl(link: unknown): string | null {
+    if (typeof link !== 'string' || !link.trim()) return null;
+    try {
+      const parsed = new URL(link);
+      if (parsed.protocol !== 'https:' || parsed.hostname !== 'outlook.office.com') return null;
+      return parsed.toString();
+    } catch {
+      return null;
+    }
+  }
+
   private async fetchMessages(
     accessToken: string,
     maxMessages: number,
     timeoutMs: number,
     query: string,
   ): Promise<{ ok: boolean; messages?: MailMessage[]; error?: string }> {
+    const wanted = Math.max(1, maxMessages);
     const params = new URLSearchParams({
-      $top: String(Math.max(1, Math.min(maxMessages, 50))),
-      $orderby: 'ReceivedDateTime desc',
+      $top: String(Math.min(wanted, 50)),
       $select: 'Id,Subject,From,ReceivedDateTime,BodyPreview,Body,IsRead',
     });
     if (query) params.set('$search', `"${query.replace(/"/g, '')}"`);
-
-    let response: Response;
-    try {
-      response = await fetch(`${MESSAGES_URL}?${params.toString()}`, {
-        headers: {
-          authorization: `Bearer ${accessToken}`,
-          accept: 'application/json',
-          prefer: 'outlook.body-content-type=html',
-        },
-        signal: AbortSignal.timeout(timeoutMs),
-      });
-    } catch (error) {
-      return {
-        ok: false,
-        error: `官方邮件接口请求失败：${error instanceof Error ? error.message : String(error)}`,
-      };
+    else params.set('$orderby', 'ReceivedDateTime desc');
+    const messages: MailMessage[] = [];
+    let nextUrl: string | null = `${MESSAGES_URL}?${params.toString()}`;
+    const deadline = Date.now() + timeoutMs;
+    const maxPages = query ? 1 : Math.min(4, Math.ceil(wanted / 50));
+    let pages = 0;
+    while (nextUrl && messages.length < wanted && pages < maxPages) {
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) {
+        if (messages.length) break;
+        return { ok: false, error: '官方邮件接口请求失败：超时' };
+      }
+      pages += 1;
+      let response: Response;
+      try {
+        response = await fetch(nextUrl, {
+          headers: {
+            authorization: `Bearer ${accessToken}`,
+            accept: 'application/json',
+            prefer: 'outlook.body-content-type=html',
+          },
+          signal: AbortSignal.timeout(remaining),
+        });
+      } catch (error) {
+        if (messages.length) break;
+        return {
+          ok: false,
+          error: `官方邮件接口请求失败：${error instanceof Error ? error.message : String(error)}`,
+        };
+      }
+      if (!response.ok) {
+        if (messages.length) break;
+        const text = await response.text().catch(() => '');
+        const hint =
+          response.status === 401
+            ? '（access_token 无权读取邮件，refresh_token 可能已失效）'
+            : '';
+        return { ok: false, error: `官方邮件接口 HTTP ${response.status}${hint}：${text.slice(0, 160)}` };
+      }
+      const data = (await response.json().catch(() => ({}))) as { value?: unknown[]; '@odata.nextLink'?: unknown };
+      const batch = (Array.isArray(data.value) ? data.value : []).map((raw, index) =>
+        this.normalizeMessage(raw, messages.length + index),
+      );
+      messages.push(...batch);
+      nextUrl = messages.length >= wanted ? null : this.nextMessageUrl(data['@odata.nextLink']);
     }
-
-    if (!response.ok) {
-      const text = await response.text().catch(() => '');
-      const hint =
-        response.status === 401
-          ? '（access_token 无权读取邮件，refresh_token 可能已失效）'
-          : '';
-      return { ok: false, error: `官方邮件接口 HTTP ${response.status}${hint}：${text.slice(0, 160)}` };
-    }
-
-    const data = (await response.json().catch(() => ({}))) as { value?: unknown[] };
-    const messages = (Array.isArray(data.value) ? data.value : []).map((raw, index) =>
-      this.normalizeMessage(raw, index),
-    );
-    return { ok: true, messages };
+    return { ok: true, messages: messages.slice(0, wanted) };
   }
 
   private normalizeMessage(raw: unknown, index: number): MailMessage {
@@ -320,10 +351,13 @@ export class MailboxService {
       return failResult('凭据不完整，需要 邮箱----密码----clientid----refresh_token');
     }
 
+    const started = Date.now();
     const token = await this.exchangeMsToken(credential, timeoutMs);
     if (!token.ok) return failResult(token.error || '换 token 失败');
+    const elapsed = Date.now() - started;
+    const fetchTimeout = options.sharedDeadline ? Math.max(1, timeoutMs - elapsed) : timeoutMs;
 
-    const fetched = await this.fetchMessages(token.accessToken!, maxMessages, timeoutMs, query);
+    const fetched = await this.fetchMessages(token.accessToken!, maxMessages, fetchTimeout, query);
     if (!fetched.ok) return failResult(fetched.error || '邮件接口返回异常');
     const messages = fetched.messages || [];
     const ban = this.analyzer.detectBanned(messages);
@@ -413,6 +447,7 @@ export class MailboxService {
         error: `刷新失败（${code}）：${description || 'refresh_token 可能已失效'}`,
         // 只有 refresh token 本身作废才标失效。400/401、invalid_client 是请求或客户端配置错误。
         invalidCredential: code === 'invalid_grant',
+        sessionEnded: refreshSessionEnded(code, description),
       };
     }
 

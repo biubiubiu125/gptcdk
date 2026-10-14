@@ -31,6 +31,71 @@ export function postgresUrlForLock(databaseUrl: string): string {
   return url.toString();
 }
 
+type SchemaReader = {
+  $queryRaw<T = unknown>(query: TemplateStringsArray, ...values: unknown[]): Promise<T>;
+};
+
+async function currentSchema(prisma: SchemaReader): Promise<string> {
+  const rows = await prisma.$queryRaw<Array<{ schema: string }>>`SELECT current_schema() AS schema`;
+  const schema = rows[0]?.schema;
+  if (!schema || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(schema)) {
+    throw new Error('无法确认当前数据库 schema，账号刷新锁不可用');
+  }
+  return schema;
+}
+
+async function withNamedAdvisoryLocks<T>(databaseUrl: string, names: string[], fn: () => Promise<T>): Promise<T> {
+  const client = new Client({ connectionString: databaseUrl });
+  await client.connect();
+  try {
+    for (const name of names) {
+      await client.query('SELECT pg_advisory_lock(hashtextextended($1::text, 0))', [name]);
+    }
+    try {
+      return await fn();
+    } finally {
+      for (const name of [...names].reverse()) {
+        await client.query('SELECT pg_advisory_unlock(hashtextextended($1::text, 0))', [name]).catch(() => undefined);
+      }
+    }
+  } finally {
+    await client.end().catch(() => undefined);
+  }
+}
+
+/**
+ * 按账号 id 持有咨询锁，直到 fn 结束。
+ * 后台刷新未售出账号和另一张卡领取附加账号必须用同一把锁：
+ * 卡密锁只挡住同一张卡，挡不住附加账号被其他卡领走后仍去轮换提供商凭据。
+ * 不占用找回连接槽，避免持卡锁的一方再等槽位时互相堵住。
+ */
+export async function withAccountRefreshLocks<T>(
+  prisma: SchemaReader,
+  accountIds: number[],
+  fn: () => Promise<T>,
+): Promise<T> {
+  const ids = [...new Set(accountIds.map((id) => Number(id)).filter((id) => Number.isInteger(id) && id > 0))].sort((a, b) => a - b);
+  if (!ids.length) return fn();
+  const databaseUrl = process.env.DATABASE_URL || '';
+  if (!databaseUrl) throw new Error('DATABASE_URL 缺失，账号刷新锁不可用');
+  const schema = await currentSchema(prisma);
+  const names = ids.map((id) => `gptcdk-account-refresh:${schema}:${id}`);
+  return withNamedAdvisoryLocks(postgresUrlForLock(databaseUrl), names, fn);
+}
+
+/** 同一邮箱的提取任务串行。不占用找回连接槽。账号已入库后，等待中的任务不得再密码登录。 */
+export async function withExtractEmailLock<T>(
+  prisma: SchemaReader,
+  email: string,
+  fn: () => Promise<T>,
+): Promise<T> {
+  const databaseUrl = process.env.DATABASE_URL || '';
+  if (!databaseUrl) throw new Error('DATABASE_URL 缺失，提取锁不可用');
+  const schema = await currentSchema(prisma);
+  const name = `gptcdk-extract-email:${schema}:${email.trim().toLowerCase()}`;
+  return withNamedAdvisoryLocks(postgresUrlForLock(databaseUrl), [name], fn);
+}
+
 /**
  * 按「当前 schema + 卡密」持有会话级咨询锁，直到 fn 结束。
  * 刷新和写库重试都在锁内，另一张找回不能读到同一个旧凭据。
