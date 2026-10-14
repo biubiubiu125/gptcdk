@@ -167,6 +167,7 @@ async function main() {
     }
     const dup = await call('POST', '/admin/accounts/import', {
       content,
+      remark: '冒烟测试批次',
       skipDuplicate: true,
       source: 'paste',
       subscriptionTag: 'Plus',
@@ -179,9 +180,10 @@ async function main() {
   const list = await call('GET', `/admin/accounts?page=1&pageSize=5&sortField=createdAt&sortOrder=descend`);
   assert(list.json?.items?.length > 0, '列表返回数据', `total=${list.json?.total}`);
   const first = list.json.items[0];
-  for (const field of ['id', 'name', 'credits', 'cardKey', 'createdAt', 'banStatus', 'redeemStatus']) {
+  for (const field of ['id', 'name', 'credits', 'cardKey', 'createdAt', 'redeemStatus']) {
     assert(first[field] !== undefined && first[field] !== null, `字段存在：${field}`, String(first[field]).slice(0, 48));
   }
+  assert(first.banStatus === undefined, '账号列表不再返回封禁字段');
   assert(first.hasMailbox === true, '解析出邮箱取件凭据');
   assert(
     first.creditStatus === 'ready' && first.credits === 0 && first.subscriptionTag === 'Plus',
@@ -446,7 +448,11 @@ async function main() {
     targets: ['ban', 'redeem'],
   });
   assert(refresh.json?.processed === 1, '刷新接口处理了 1 条');
-  assert(refresh.json?.ban && refresh.json?.redeem, '返回封禁/兑换双维度统计', JSON.stringify(refresh.json?.ban) + ' ' + JSON.stringify(refresh.json?.redeem));
+  assert(
+    refresh.json?.ban === undefined && refresh.json?.redeem,
+    '封禁检查被忽略，只返回凭据检查',
+    JSON.stringify(refresh.json?.redeem),
+  );
 
   // 定档：只处理待定档账号，带 cursor 分批推进（返回 credits 计数与 nextCursor）
   const tierJob = await call('POST', '/admin/accounts/refresh-status', {
@@ -564,8 +570,11 @@ async function main() {
   console.log('\n[12] 账号更新 / 额度归零仍按标记可售 / 清理');
   const patchedAccount = await call('PATCH', `/admin/accounts/${first.id}`, { remark: '冒烟测试备注' });
   assert(patchedAccount.json?.remark === '冒烟测试备注', '更新账号备注成功');
-  const marked = await call('PATCH', `/admin/accounts/${first.id}`, { banStatus: 'normal' });
-  assert(marked.json?.banStatus === 'normal', '手动标记封禁状态成功');
+  const marked = await call('PATCH', `/admin/accounts/${first.id}`, { banStatus: 'banned' });
+  assert(
+    marked.status === 200 && marked.json?.id === first.id && marked.json?.banStatus === undefined,
+    '手动封禁字段被忽略',
+  );
   await call('PATCH', `/admin/accounts/${first.id}`, { remark: '' });
 
   const reset = await call('PATCH', `/admin/accounts/${first.id}`, { credits: 0 });
